@@ -303,6 +303,18 @@ fn emit_progress(app: &AppHandle, event: ProxyProgressEvent) {
     let _ = app.emit("proxy:progress", event);
 }
 
+fn cancelled_outcome() -> CheckOutcome {
+    CheckOutcome {
+        live: false,
+        latency_ms: 0,
+        message: "cancelled".to_string(),
+        ip: String::new(),
+        country: String::new(),
+        country_code: String::new(),
+        city: String::new(),
+    }
+}
+
 fn check_one(
     proxy: &StoredProxy,
     timeout: Duration,
@@ -324,11 +336,12 @@ fn check_one(
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
     {
-        let secure_timeout = if remaining > Duration::from_secs(2) {
-            (remaining / 2).min(Duration::from_secs(6))
-        } else {
-            remaining
-        };
+        if cancellation.load(Ordering::Acquire) {
+            return cancelled_outcome();
+        }
+        // Always reserve budget for the plain-HTTP/SOCKS probes so the HTTPS attempt cannot
+        // consume the entire deadline and starve the only path some proxies can pass.
+        let secure_timeout = (remaining / 2).min(Duration::from_secs(6));
         let secure_judge = SECURE_JUDGES[start % SECURE_JUDGES.len()];
         last = probe_https(proxy, secure_judge, secure_timeout);
         if last.live {
@@ -339,15 +352,7 @@ fn check_one(
     for attempt in 0..ATTEMPTS {
         for offset in 0..JUDGES.len() {
             if cancellation.load(Ordering::Acquire) {
-                return CheckOutcome {
-                    live: false,
-                    latency_ms: 0,
-                    message: "cancelled".to_string(),
-                    ip: String::new(),
-                    country: String::new(),
-                    country_code: String::new(),
-                    city: String::new(),
-                };
+                return cancelled_outcome();
             }
             let judge = JUDGES[(start + attempt + offset) % JUDGES.len()];
             let Some(remaining) = deadline
@@ -759,7 +764,9 @@ fn read_ip_response(stream: &mut TcpStream) -> io::Result<String> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?;
-    if !(200..400).contains(&status) {
+    // Require an exact 200: a 3xx redirect to a captive portal is not a working exit, and
+    // its body must not be mined for an incidental IP-looking token.
+    if status != 200 {
         return Err(io::Error::other(format!("HTTP {status}")));
     }
     extract_ip(body).ok_or_else(|| {
@@ -782,10 +789,37 @@ fn extract_ip(body: &str) -> Option<String> {
         let token = token.trim_matches(|character: char| {
             !character.is_ascii_hexdigit() && character != '.' && character != ':'
         });
-        token.parse::<IpAddr>().ok()
+        token.parse::<IpAddr>().ok().filter(is_public_ip)
     })
     .next()
     .map(|address| address.to_string())
+}
+
+// Only a routable public address is a plausible proxy exit IP. Private, loopback,
+// link-local, carrier-grade-NAT and other reserved ranges typically come from a captive
+// portal or gateway error page returned by a proxy that does not actually forward traffic.
+fn is_public_ip(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_unspecified()
+                && !v4.is_multicast()
+                && octets[0] != 0
+                && !(octets[0] == 100 && (64..128).contains(&octets[1]))
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (first & 0xfe00) != 0xfc00
+                && (first & 0xffc0) != 0xfe80
+        }
+    }
 }
 
 fn base64(input: &[u8]) -> String {
@@ -846,6 +880,62 @@ mod tests {
             Some("2001:db8::1")
         );
         assert!(extract_ip("not an ip").is_none());
+    }
+
+    #[test]
+    fn extract_ip_rejects_private_and_reserved_addresses() {
+        for reserved in [
+            "10.0.0.138",
+            "192.168.1.1",
+            "172.16.5.4",
+            "127.0.0.1",
+            "169.254.10.10",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
+            assert!(
+                extract_ip(reserved).is_none(),
+                "{reserved} must not be accepted as a public exit IP"
+            );
+        }
+        assert_eq!(extract_ip("8.8.8.8").as_deref(), Some("8.8.8.8"));
+        assert_eq!(
+            extract_ip("Access blocked by gateway 203.0.113.9").as_deref(),
+            Some("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn non_200_status_is_not_treated_as_live() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock proxy");
+        let address = listener.local_addr().expect("mock address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _ = read_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://portal.example/\r\nContent-Length: 10\r\n\r\n203.0.113.5",
+                )
+                .expect("send redirect");
+        });
+        let proxy = mock_proxy("http", address.port());
+
+        let result = request_through_http_proxy(
+            &proxy,
+            Judge {
+                host: "example.test",
+                path: "/ip",
+            },
+            Duration::from_secs(2),
+        );
+        assert!(
+            result.is_err(),
+            "a 3xx redirect must not be reported as a live proxy"
+        );
+        server.join().expect("mock proxy");
     }
 
     #[test]

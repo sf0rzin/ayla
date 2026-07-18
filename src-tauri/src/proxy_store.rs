@@ -435,9 +435,13 @@ fn persist(path: &Path, items: &[StoredProxy]) -> Result<(), String> {
 
     let mut file = fs::File::create(&temporary)
         .map_err(|error| format!("unable to create the temporary proxy store: {error}"))?;
-    file.write_all(&data)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("unable to write the temporary proxy store: {error}"))?;
+    if let Err(error) = file.write_all(&data).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "unable to write the temporary proxy store: {error}"
+        ));
+    }
     drop(file);
 
     match fs::rename(&temporary, path) {
