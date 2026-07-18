@@ -1,68 +1,68 @@
 # Ayla
 
-Aplicativo desktop em Rust, Tauri 2 e React/TypeScript. O projeto está sendo reconstruído de forma incremental, mantendo o núcleo Rust separado da interface para permitir a substituição completa do design.
+Desktop application built with Rust, Tauri 2, and React/TypeScript. The project is being rebuilt incrementally, keeping the Rust core separate from the interface so the design can be replaced entirely.
 
-## Estado atual
+## Current state
 
-- Estrutura desktop Tauri 2.
-- Catálogo dos 13 módulos originais.
-- Configurações locais validadas e persistidas pelo backend.
-- Parser de proxies em Rust com deduplicação e suporte a HTTP(S), SOCKS4 e SOCKS5.
-- Gerenciador de proxies com importação, persistência, remoção e limpeza.
-- Verificação concorrente com progresso em tempo real, timeout e cancelamento.
-- Motor de tarefas em Rust executado em background, com progresso agregado, cancelamento seletivo e histórico seguro.
-- MVP ChatGPT: filtro local de artefatos, validação autenticada de sessão/plano e proxy opcional.
-- Página `Tarefas` para preparar execuções, acompanhar o trabalho ativo e consultar resumos anteriores.
-- Interface desktop baseada no Grafite DS fornecido pelo usuário.
-- Barra de janela própria, navegação em três painéis, Geist e ícones Lucide locais.
-- Testes unitários e servidores locais simulados para HTTP, SOCKS4a e SOCKS5.
+- Tauri 2 desktop shell.
+- Catalog of the 13 original modules.
+- Local settings validated and persisted by the backend.
+- Rust proxy parser with deduplication and support for HTTP(S), SOCKS4, and SOCKS5.
+- Proxy manager with import, persistence, removal, and clearing.
+- Concurrent checking with real-time progress, timeout, and cancellation.
+- Rust task engine running in the background, with aggregated progress, selective cancellation, and a safe history.
+- ChatGPT MVP: local artifact filtering, authenticated session/plan validation, and optional proxy.
+- `Tasks` page to prepare runs, follow the active work, and review previous summaries.
+- Desktop interface based on the Grafite DS provided by the user.
+- Custom window bar, three-pane navigation, Geist, and local Lucide icons.
+- Unit tests and simulated local servers for HTTP, SOCKS4a, and SOCKS5.
 
-Os proxies que não respondem são removidos depois da verificação, seguindo o comportamento do projeto de referência. A atualização de cada proxy agora é O(1), com persistência única ao final da rodada, distribuição de trabalho por cursor atômico, canal limitado e timeout total por proxy.
+Proxies that do not respond are removed after the check, following the behavior of the reference project. Each proxy update is now O(1), with a single persistence at the end of the round, work distribution by atomic cursor, a bounded channel, and a total per-proxy timeout.
 
-O motor aceita uma execução global por vez nesta etapa. Antes de iniciar, remove vazios e duplicados em O(n) preservando a ordem e limita a execução a 10.000 arquivos únicos, 20.000 linhas brutas, 32 KiB por linha, 32 MiB de caminhos, 512 MiB de artefatos e 32 workers. Caminhos existem apenas no payload IPC e na memória transitória da execução: nunca entram em eventos, logs ou histórico e não são persistidos.
+The engine accepts one global run at a time in this stage. Before starting, it removes blanks and duplicates in O(n) while preserving order, and limits the run to 10,000 unique files, 20,000 raw lines, 32 KiB per line, 32 MiB of paths, 512 MiB of artifacts, and 32 workers. Paths exist only in the IPC payload and in the run's transient memory: they never enter events, logs, or history, and are not persisted.
 
-O adaptador ChatGPT lê no máximo 2 MiB por arquivo, valida domínio, expiração, valores, fan-out JSON e chunks e então confirma a sessão e o plano nos endpoints autenticados. O cliente preserva timeout, tentativas, concorrência e proxies HTTP/SOCKS ativos. Caminhos, cookies e tokens não entram em eventos, logs ou histórico; a interface recebe somente contagens agregadas.
+The ChatGPT adapter reads at most 2 MiB per file, validates domain, expiration, values, JSON fan-out, and chunks, and then confirms the session and plan against the authenticated endpoints. The client preserves timeout, retries, concurrency, and active HTTP/SOCKS proxies. Paths, cookies, and tokens do not enter events, logs, or history; the interface receives only aggregated counts.
 
-## Desenvolvimento
+## Development
 
-Pré-requisitos: Node.js, Rust estável com alvo MSVC, Visual Studio C++ Build Tools e WebView2.
+Prerequisites: Node.js, stable Rust with the MSVC target, Visual Studio C++ Build Tools, and WebView2.
 
 ```powershell
 npm install
 npm run tauri dev
 ```
 
-Validação completa:
+Full validation:
 
 ```powershell
 npm run check
 ```
 
-## Estrutura
+## Structure
 
 ```text
-src/                    interface desktop em React
-src-tauri/src/catalog.rs catálogo de módulos
-src-tauri/src/auth_artifact.rs parser local e classificação estrutural ChatGPT
-src-tauri/src/proxy.rs   parser e normalização de proxies
-src-tauri/src/proxy_store.rs persistência e operações da lista
-src-tauri/src/proxy_checker.rs verificação concorrente e protocolos
-src-tauri/src/task_engine.rs motor de tarefas, progresso, cancelamento e histórico
-src-tauri/src/settings.rs configurações e persistência
-src-tauri/src/lib.rs     comandos expostos à interface
+src/                    React desktop interface
+src-tauri/src/catalog.rs module catalog
+src-tauri/src/auth_artifact.rs local parser and structural ChatGPT classification
+src-tauri/src/proxy.rs   proxy parser and normalization
+src-tauri/src/proxy_store.rs list persistence and operations
+src-tauri/src/proxy_checker.rs concurrent checking and protocols
+src-tauri/src/task_engine.rs task engine, progress, cancellation, and history
+src-tauri/src/settings.rs settings and persistence
+src-tauri/src/lib.rs     commands exposed to the interface
 ```
 
 ## Interface
 
-O visual usa como base o pacote `# Ayla.zip`: superfícies grafite em camadas, acento índigo, controles com raios generosos e ação primária clara. Os componentes foram reescritos em React e ligados ao backend existente; o protótipo HTML não é necessário durante a execução.
+The look builds on the `# Ayla.zip` package: layered graphite surfaces, indigo accent, controls with generous radii, and a clear primary action. The components were rewritten in React and wired to the existing backend; the HTML prototype is not needed at runtime.
 
-## Segurança
+## Security
 
-Cookies, sessões, licenças, proxies reais, resultados e pastas `tdata` não devem ser adicionados ao repositório. A suíte normal usa somente dados sintéticos. Exemplos externos permanecem fora do projeto: o app lê apenas caminhos fornecidos explicitamente e o teste ignorado exige opt-in; ambos retornam somente totais agregados. O histórico de tarefas armazena exclusivamente resumos: nenhuma entrada, caminho ou credencial é gravada.
+Cookies, sessions, licenses, real proxies, results, and `tdata` folders must not be added to the repository. The normal suite uses only synthetic data. External examples stay outside the project: the app reads only explicitly provided paths and the ignored test requires opt-in; both return only aggregated totals. The task history stores summaries exclusively: no entry, path, or credential is recorded.
 
-## Próximas etapas
+## Next steps
 
-1. Migrar os próximos módulos individualmente, mantendo cada integração isolada e testada.
-2. Autenticação/licenciamento com armazenamento seguro.
-3. Evoluir o agendamento para múltiplas execuções globais, quando necessário.
-4. Migração isolada do suporte a Telegram `tdata`.
+1. Migrate the next modules individually, keeping each integration isolated and tested.
+2. Authentication/licensing with secure storage.
+3. Evolve scheduling toward multiple global runs, when needed.
+4. Isolated migration of Telegram `tdata` support.
