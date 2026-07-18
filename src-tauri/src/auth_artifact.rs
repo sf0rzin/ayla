@@ -34,6 +34,15 @@ pub(crate) enum InspectionResult {
 pub(crate) struct PreparedChatGptAuth {
     cookie_header: String,
     device_id: Option<String>,
+    artifact_bytes: Vec<u8>,
+}
+
+pub(crate) enum ChatGptArtifactPreparation {
+    Ready(PreparedChatGptAuth),
+    Rejected {
+        reason: InspectionResult,
+        artifact_bytes: Option<Vec<u8>>,
+    },
 }
 
 impl PreparedChatGptAuth {
@@ -43,6 +52,10 @@ impl PreparedChatGptAuth {
 
     pub(crate) fn device_id(&self) -> Option<&str> {
         self.device_id.as_deref()
+    }
+
+    pub(crate) fn into_artifact_bytes(self) -> Vec<u8> {
+        self.artifact_bytes
     }
 }
 
@@ -63,11 +76,19 @@ enum CredentialState {
     Invalid,
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_chatgpt_path_with_budget(
     path: &Path,
     remaining_bytes: &AtomicU64,
 ) -> Result<PreparedChatGptAuth, InspectionResult> {
     prepare_chatgpt_path_at_with_budget(path, now_seconds(), Some(remaining_bytes))
+}
+
+pub(crate) fn load_chatgpt_path_with_budget(
+    path: &Path,
+    remaining_bytes: &AtomicU64,
+) -> ChatGptArtifactPreparation {
+    load_chatgpt_path_at_with_budget(path, now_seconds(), Some(remaining_bytes))
 }
 
 pub(crate) fn inspect_chatgpt_path_with_budget(
@@ -78,6 +99,34 @@ pub(crate) fn inspect_chatgpt_path_with_budget(
         Ok(_) => InspectionResult::Ready,
         Err(result) => result,
     }
+}
+
+pub(crate) fn output_directory_is_local(path: &Path) -> bool {
+    path.is_absolute() && !has_disallowed_path_prefix(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn opened_file_is_within_local_directory(file: &File, trusted_directory: &Path) -> bool {
+    let Some(file_path) = windows_handle_target_path(file) else {
+        return false;
+    };
+    if !windows_handle_path_is_local(&file_path) {
+        return false;
+    }
+    let file_components: Vec<_> = Path::new(&file_path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let directory_components: Vec<_> = trusted_directory
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    file_components.starts_with(&directory_components)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn opened_file_is_within_local_directory(_file: &File, _directory: &Path) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -102,24 +151,66 @@ fn prepare_chatgpt_path_at_with_budget(
     now: i64,
     remaining_bytes: Option<&AtomicU64>,
 ) -> Result<PreparedChatGptAuth, InspectionResult> {
-    let data = read_limited(path, remaining_bytes)?;
+    match load_chatgpt_path_at_with_budget(path, now, remaining_bytes) {
+        ChatGptArtifactPreparation::Ready(auth) => Ok(auth),
+        ChatGptArtifactPreparation::Rejected { reason, .. } => Err(reason),
+    }
+}
+
+fn load_chatgpt_path_at_with_budget(
+    path: &Path,
+    now: i64,
+    remaining_bytes: Option<&AtomicU64>,
+) -> ChatGptArtifactPreparation {
+    let data = match read_limited(path, remaining_bytes) {
+        Ok(data) => data,
+        Err(reason) => {
+            return ChatGptArtifactPreparation::Rejected {
+                reason,
+                artifact_bytes: None,
+            };
+        }
+    };
     let text = match std::str::from_utf8(&data) {
         Ok(text) => text.trim().trim_start_matches('\u{feff}').trim(),
-        Err(_) => return Err(InspectionResult::Invalid),
+        Err(_) => {
+            return ChatGptArtifactPreparation::Rejected {
+                reason: InspectionResult::Invalid,
+                artifact_bytes: Some(data),
+            };
+        }
     };
     if text.is_empty() {
-        return Err(InspectionResult::Invalid);
+        return ChatGptArtifactPreparation::Rejected {
+            reason: InspectionResult::Invalid,
+            artifact_bytes: Some(data),
+        };
     }
 
     let cookies = match parse_document(text) {
         Ok(cookies) if !cookies.is_empty() => cookies,
-        _ => return Err(InspectionResult::Invalid),
+        _ => {
+            return ChatGptArtifactPreparation::Rejected {
+                reason: InspectionResult::Invalid,
+                artifact_bytes: Some(data),
+            };
+        }
     };
     let result = classify_chatgpt(&cookies, now);
     if result != InspectionResult::Ready {
-        return Err(result);
+        return ChatGptArtifactPreparation::Rejected {
+            reason: result,
+            artifact_bytes: Some(data),
+        };
     }
-    prepared_auth(&cookies, now).ok_or(InspectionResult::Invalid)
+    let Some(mut auth) = prepared_auth(&cookies, now) else {
+        return ChatGptArtifactPreparation::Rejected {
+            reason: InspectionResult::Invalid,
+            artifact_bytes: Some(data),
+        };
+    };
+    auth.artifact_bytes = data;
+    ChatGptArtifactPreparation::Ready(auth)
 }
 
 fn read_limited(
@@ -295,6 +386,11 @@ fn windows_drive_is_local(path: &Path) -> bool {
 // non-local drive.
 #[cfg(windows)]
 fn windows_handle_target_is_local(file: &File) -> bool {
+    windows_handle_target_path(file).is_some_and(|path| windows_handle_path_is_local(&path))
+}
+
+#[cfg(windows)]
+fn windows_handle_target_path(file: &File) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
 
     #[link(name = "kernel32")]
@@ -317,7 +413,7 @@ fn windows_handle_target_is_local(file: &File) -> bool {
             get_final_path_name_by_handle_w(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
         };
         if length == 0 {
-            return false;
+            return None;
         }
         let length = length as usize;
         if length < buffer.len() {
@@ -325,13 +421,17 @@ fn windows_handle_target_is_local(file: &File) -> bool {
             break;
         }
         if length > 66_000 {
-            return false;
+            return None;
         }
         buffer = vec![0u16; length + 1];
     }
 
-    let path = String::from_utf16_lossy(&buffer);
-    let stripped = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    Some(String::from_utf16_lossy(&buffer))
+}
+
+#[cfg(windows)]
+fn windows_handle_path_is_local(path: &str) -> bool {
+    let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
     if stripped
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
@@ -855,6 +955,7 @@ fn prepared_auth(cookies: &[CookieMeta], now: i64) -> Option<PreparedChatGptAuth
     (!cookie_header.is_empty()).then_some(PreparedChatGptAuth {
         cookie_header,
         device_id,
+        artifact_bytes: Vec::new(),
     })
 }
 

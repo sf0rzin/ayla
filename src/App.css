@@ -485,6 +485,13 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 .task-source-summary { justify-self: end; display: flex; align-items: center; gap: 16px; }
 .task-source-summary > span { display: grid; justify-items: end; gap: 2px; color: var(--text-tertiary); font-size: 10px; }
 .task-source-summary strong { color: var(--text-primary); font-size: 16px; font-weight: 400; }
+.task-output-row { grid-template-columns: minmax(0, 1fr) minmax(140px, 210px); }
+.task-output-row .optional-label { margin-left: 5px; color: var(--text-disabled); font-size: 9px; font-weight: 400; text-transform: uppercase; letter-spacing: 0.035em; }
+.task-output-control { min-width: 0; justify-self: stretch; display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
+.task-output-picker { min-width: 0; flex: 1; justify-content: flex-start; }
+.task-output-picker > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-output-clear { width: 28px; height: 28px; border-radius: var(--radius-sm); }
+.task-export-error { color: var(--danger); }
 .inline-action { width: max-content; margin-top: 2px; padding: 0; border: 0; color: var(--text-primary); background: transparent; cursor: pointer; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
 .task-proxy-setting .switch-control { justify-self: end; }
 .task-create-footer { min-height: 48px; margin-top: 10px; padding-top: 8px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--border-subtle); }

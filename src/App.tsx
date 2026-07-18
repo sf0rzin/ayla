@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity,
@@ -22,6 +23,7 @@ import {
   Ellipsis,
   FileUp,
   Flower2,
+  FolderOpen,
   Gem,
   Gift,
   Headphones,
@@ -182,6 +184,10 @@ interface TaskSnapshot {
   startedAt: string | number;
   finishedAt: string | number | null;
   historyPersisted?: boolean | null;
+  resultsExportEnabled?: boolean;
+  exportedActive?: number;
+  exportedFailed?: number;
+  exportErrors?: number;
   chatgpt?: ChatGptTaskSummary | null;
 }
 
@@ -203,6 +209,10 @@ interface TaskHistoryEntry {
   startedAt: string | number;
   finishedAt: string | number | null;
   durationMs?: number;
+  resultsExportEnabled?: boolean;
+  exportedActive?: number;
+  exportedFailed?: number;
+  exportErrors?: number;
 }
 
 const nav: Array<{ id: Page; label: string; icon: LucideIcon }> = [
@@ -1057,6 +1067,8 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
   const [concurrency, setConcurrency] = useState(Math.max(1, Math.min(32, defaultConcurrency)));
   const [delayMs, setDelayMs] = useState(defaultDelayMs);
   const [useProxy, setUseProxy] = useState(false);
+  const [outputDirectory, setOutputDirectory] = useState("");
+  const [selectingOutputDirectory, setSelectingOutputDirectory] = useState(false);
   const [activeTask, setActiveTask] = useState<TaskSnapshot | null>(null);
   const [history, setHistory] = useState<TaskHistoryEntry[]>([]);
   const [starting, setStarting] = useState(false);
@@ -1071,6 +1083,10 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
   const duplicateEntryCount = Math.max(0, entryCount - uniqueEntryCount);
   const entryLimitExceeded = entryCount > 10_000;
   const selectedModule = moduleById.get(moduleId);
+  const outputFolderName = useMemo(() => {
+    const normalized = outputDirectory.replace(/[\\/]+$/, "");
+    return normalized.split(/[\\/]/).filter(Boolean).pop() ?? normalized;
+  }, [outputDirectory]);
   const requestedConcurrency = Math.max(1, Math.min(32, Math.trunc(concurrency || 1)));
   const effectiveConcurrency = useProxy ? Math.min(requestedConcurrency, Math.max(1, proxiesLive)) : requestedConcurrency;
   const activeRunning = taskIsRunning(activeTask);
@@ -1098,6 +1114,23 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
       if (current?.runId === next.runId && current.sequence > next.sequence) return current;
       return next;
     });
+  }
+
+  async function chooseOutputDirectory() {
+    setSelectingOutputDirectory(true);
+    setMessage("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose results folder",
+      });
+      if (typeof selected === "string") setOutputDirectory(selected);
+    } catch {
+      setMessage("Ayla could not open the folder picker. Try again.");
+    } finally {
+      setSelectingOutputDirectory(false);
+    }
   }
 
   async function reloadHistory() {
@@ -1143,6 +1176,12 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
           setCancelling(false);
           if (payload.historyPersisted === false) {
             setMessage("The task finished, but its summary could not be saved.");
+          } else if (payload.resultsExportEnabled) {
+            const exported = (payload.exportedActive ?? 0) + (payload.exportedFailed ?? 0);
+            const exportErrors = payload.exportErrors ?? 0;
+            setMessage(exportErrors > 0
+              ? `${exported.toLocaleString("en-US")} result file(s) copied · ${exportErrors.toLocaleString("en-US")} could not be copied.`
+              : `${exported.toLocaleString("en-US")} result file(s) copied to the selected folder.`);
           }
           void reloadHistory();
         }),
@@ -1194,7 +1233,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
     setMessage("");
     try {
       const snapshot = await invoke<TaskSnapshot>("start_task", {
-        request: { moduleId, entries, concurrency: safeConcurrency, delayMs: safeDelayMs, useProxy },
+        request: { moduleId, entries, concurrency: safeConcurrency, delayMs: safeDelayMs, useProxy, outputDirectory: outputDirectory || null },
       });
       acceptSnapshot(snapshot);
       setRawEntries("");
@@ -1205,6 +1244,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
         `${snapshot.total.toLocaleString("en-US")} structurally usable authentication ${snapshot.total === 1 ? "file" : "files"} found`,
         snapshot.locallyFiltered > 0 ? `${snapshot.locallyFiltered.toLocaleString("en-US")} unrelated or unusable ${snapshot.locallyFiltered === 1 ? "file" : "files"} ignored locally` : "",
         duplicates > 0 ? `${duplicates} duplicate source ${duplicates === 1 ? "path" : "paths"} removed` : "",
+        outputDirectory ? `Results will be copied to ${outputFolderName}` : "",
       ].filter(Boolean);
       setMessage(`${preparationNotes.join(" · ")}. Authenticated validation started.`);
       setTaskView("history");
@@ -1262,7 +1302,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
               </div>
               <div className="task-active-progress"><div><span>{Math.max(0, activeTask.total - activeTask.queued - activeTask.running)} of {activeTask.total}</span><strong>{Math.round(progress)}%</strong></div><progress className="task-progress" value={progress} max="100" /></div>
               <div className="task-active-stats">
-                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{chatgptSummary?.active ?? activeTask.succeeded} succeeded</span><span>{chatgptSummary?.dead ?? activeTask.failed} failed</span>{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>
+                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{chatgptSummary?.active ?? activeTask.succeeded} succeeded</span><span>{chatgptSummary?.dead ?? activeTask.failed} failed</span>{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
               </div>
               <button className="button danger task-active-cancel" type="button" onClick={cancel} disabled={cancelling}><StopCircle size={14} />{cancelling ? "Cancelling…" : "Cancel"}</button>
             </article>
@@ -1280,7 +1320,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
                   <article className="task-history-row" key={task.runId}>
                     <span className="task-history-module"><ModuleBrandIcon id={task.moduleId} /></span>
                     <div className="task-history-copy"><strong>{moduleById.get(task.moduleId)?.name ?? task.moduleId}</strong><small>{formatTaskDate(task.finishedAt ?? task.startedAt)} · {task.runId.slice(0, 8)} · {task.useProxy ? `${task.proxyCount ?? 0} proxies` : "Direct"} · {task.concurrency} workers</small></div>
-                    <div className="task-history-metrics"><span>{task.total} candidates</span><span>{task.succeeded} active</span><span>{task.failed} failed</span>{(task.locallyFiltered ?? 0) > 0 && <span>{task.locallyFiltered} ignored locally</span>}<span>{task.skipped} skipped</span></div>
+                    <div className="task-history-metrics"><span>{task.total} candidates</span><span>{task.succeeded} active</span><span>{task.failed} failed</span>{(task.locallyFiltered ?? 0) > 0 && <span>{task.locallyFiltered} ignored locally</span>}<span>{task.skipped} skipped</span>{task.resultsExportEnabled && <span>{(task.exportedActive ?? 0) + (task.exportedFailed ?? 0)} copied{(task.exportErrors ?? 0) > 0 ? ` · ${task.exportErrors} errors` : ""}</span>}</div>
                     <span className={`task-status ${taskTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
                   </article>
                 ))}
@@ -1312,6 +1352,13 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
                   <textarea className={`field-input task-entry-input${entryLimitExceeded ? " invalid" : ""}`} id="task-entries" value={rawEntries} onChange={(event) => setRawEntries(event.target.value)} placeholder={"C:\\Ayla\\examples"} disabled={starting} spellCheck={false} aria-invalid={entryLimitExceeded} />
                 </div>
                 <div className="settings-row task-source-row"><div className="settings-copy"><strong>Source preview</strong><small>{entryLimitExceeded ? "The 10,000-path limit has been exceeded." : duplicateEntryCount ? `${duplicateEntryCount} duplicate path(s) will be removed.` : "Cookie totals are calculated after the local scan starts."}</small></div><div className="task-source-summary"><span><strong>{uniqueEntryCount.toLocaleString("en-US")}</strong>Paths</span><span><strong>—</strong>Cookies</span></div></div>
+                <div className="settings-row task-output-row">
+                  <div className="settings-copy"><strong>Results folder <span className="optional-label">Optional</span></strong><small>{`Copies results into ${selectedModule?.name ?? "Module"}/active and ${selectedModule?.name ?? "Module"}/failed. Original files stay untouched.`}</small></div>
+                  <div className="task-output-control">
+                    <button className="button outline small task-output-picker" type="button" onClick={() => void chooseOutputDirectory()} disabled={starting || selectingOutputDirectory} title={outputDirectory || undefined}><FolderOpen size={13} /><span>{selectingOutputDirectory ? "Opening…" : outputFolderName || "Choose folder"}</span></button>
+                    {outputDirectory && <button className="icon-button ghost task-output-clear" type="button" onClick={() => { setOutputDirectory(""); setMessage(""); }} disabled={starting || selectingOutputDirectory} aria-label="Clear results folder" title="Clear results folder"><X size={14} /></button>}
+                  </div>
+                </div>
               </div>
             </section>
 
@@ -1325,7 +1372,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
             </section>
           </div>
 
-          <footer className="task-create-footer"><div className="task-create-summary" aria-live="polite">{selectedModule && <span className="task-create-summary-icon"><ModuleBrandIcon id={selectedModule.id} /></span>}<span><strong>{message || selectedModule?.name || "Select a module"}</strong><small>{entryCount ? `${uniqueEntryCount.toLocaleString("en-US")} unique path(s) · ${useProxy ? `${effectiveConcurrency} workers across ${proxiesLive} live proxies` : `${effectiveConcurrency} workers · Direct connection`}` : "Add at least one authorized path"}</small></span></div><button className="button outline" type="button" onClick={() => setTaskView("history")} disabled={starting}>Cancel</button><button className="button primary" type="button" onClick={start} disabled={!moduleId || starting || entryCount === 0 || entryLimitExceeded}><Play size={14} />{starting ? "Preparing…" : "Start task"}</button></footer>
+          <footer className="task-create-footer"><div className="task-create-summary" aria-live="polite">{selectedModule && <span className="task-create-summary-icon"><ModuleBrandIcon id={selectedModule.id} /></span>}<span><strong>{message || selectedModule?.name || "Select a module"}</strong><small>{entryCount ? `${uniqueEntryCount.toLocaleString("en-US")} unique path(s) · ${useProxy ? `${effectiveConcurrency} workers across ${proxiesLive} live proxies` : `${effectiveConcurrency} workers · Direct connection`}${outputDirectory ? ` · Save to ${outputFolderName}` : ""}` : "Add at least one authorized path"}</small></span></div><button className="button outline" type="button" onClick={() => setTaskView("history")} disabled={starting}>Cancel</button><button className="button primary" type="button" onClick={start} disabled={!moduleId || starting || entryCount === 0 || entryLimitExceeded}><Play size={14} />{starting ? "Preparing…" : "Start task"}</button></footer>
         </div>
       )}
     </section>
