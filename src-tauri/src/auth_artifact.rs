@@ -8,12 +8,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_COOKIES: usize = 10_000;
 const MAX_TOKEN_CHUNKS: usize = 20;
 const MAX_JSON_DEPTH: usize = 128;
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
-const MAX_JSON_STRUCTURAL_TOKENS: usize = 50_000;
+// Bounded by MAX_COOKIES with a generous per-cookie structural-token allowance so a
+// legitimate multi-thousand-cookie export is not rejected before serde parses it. The
+// 2 MiB artifact cap already bounds the absolute amount of work regardless of this value.
+const MAX_JSON_STRUCTURAL_TOKENS: usize = MAX_COOKIES * 64;
 
 const SESSION_COOKIE: &str = "__Secure-next-auth.session-token";
 const LEGACY_SESSION_COOKIE: &str = "next-auth.session-token";
@@ -101,7 +104,7 @@ fn prepare_chatgpt_path_at_with_budget(
 ) -> Result<PreparedChatGptAuth, InspectionResult> {
     let data = read_limited(path, remaining_bytes)?;
     let text = match std::str::from_utf8(&data) {
-        Ok(text) => text.trim_start_matches('\u{feff}').trim(),
+        Ok(text) => text.trim().trim_start_matches('\u{feff}').trim(),
         Err(_) => return Err(InspectionResult::Invalid),
     };
     if text.is_empty() {
@@ -132,28 +135,68 @@ fn read_limited(
     if !metadata.is_file() {
         return Err(InspectionResult::Unreadable);
     }
+    #[cfg(windows)]
+    if !windows_handle_target_is_local(&file) {
+        return Err(InspectionResult::Unreadable);
+    }
     if metadata.len() > MAX_ARTIFACT_BYTES {
         return Err(InspectionResult::TooLarge);
     }
-    if remaining_bytes.is_some_and(|remaining| {
-        remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(metadata.len())
-            })
-            .is_err()
-    }) {
+
+    // Reserve the declared size up front so an exhausted shared budget stops the read
+    // before any bytes are consumed; the reservation is reconciled with the bytes
+    // actually read and refunded in full on every failure path.
+    let reserved = metadata.len();
+    if !charge_budget(remaining_bytes, reserved) {
         return Err(InspectionResult::TooLarge);
     }
 
     let mut reader = file.take(MAX_ARTIFACT_BYTES + 1);
-    let mut data = Vec::with_capacity(metadata.len().min(MAX_ARTIFACT_BYTES) as usize);
-    reader
-        .read_to_end(&mut data)
-        .map_err(|_| InspectionResult::Unreadable)?;
-    if data.len() as u64 > MAX_ARTIFACT_BYTES {
-        return Err(InspectionResult::TooLarge);
+    let mut data = Vec::with_capacity(reserved.min(MAX_ARTIFACT_BYTES) as usize);
+    let outcome = match reader.read_to_end(&mut data) {
+        Ok(_) if data.len() as u64 > MAX_ARTIFACT_BYTES => Err(InspectionResult::TooLarge),
+        Ok(_) => Ok(()),
+        Err(_) => Err(InspectionResult::Unreadable),
+    };
+
+    match outcome {
+        Ok(()) => {
+            // Reconcile the reservation with the bytes actually read: refund the surplus
+            // if the file shrank, or charge the difference if it grew, rejecting when the
+            // extra bytes would exceed the remaining budget.
+            let actual = data.len() as u64;
+            if actual < reserved {
+                refund_budget(remaining_bytes, reserved - actual);
+            } else if actual > reserved && !charge_budget(remaining_bytes, actual - reserved) {
+                refund_budget(remaining_bytes, reserved);
+                return Err(InspectionResult::TooLarge);
+            }
+            Ok(data)
+        }
+        Err(error) => {
+            refund_budget(remaining_bytes, reserved);
+            Err(error)
+        }
     }
-    Ok(data)
+}
+
+fn charge_budget(remaining_bytes: Option<&AtomicU64>, amount: u64) -> bool {
+    match remaining_bytes {
+        None => true,
+        Some(remaining) => remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(amount)
+            })
+            .is_ok(),
+    }
+}
+
+fn refund_budget(remaining_bytes: Option<&AtomicU64>, amount: u64) {
+    if let Some(remaining) = remaining_bytes
+        && amount > 0
+    {
+        remaining.fetch_add(amount, Ordering::AcqRel);
+    }
 }
 
 #[cfg(windows)]
@@ -185,6 +228,8 @@ fn has_disallowed_path_prefix(path: &Path) -> bool {
         matches!(
             stem.as_str(),
             "CON"
+                | "CONIN$"
+                | "CONOUT$"
                 | "PRN"
                 | "AUX"
                 | "NUL"
@@ -216,14 +261,22 @@ fn has_disallowed_path_prefix(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_drive_is_local(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-
+fn windows_drive_letter_is_local(letter: u8) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         #[link_name = "GetDriveTypeW"]
         fn get_drive_type_w(root_path_name: *const u16) -> u32;
     }
+
+    let root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
+    // SAFETY: `root` is a valid, nul-terminated `X:\` UTF-16 buffer.
+    let drive_type = unsafe { get_drive_type_w(root.as_ptr()) };
+    matches!(drive_type, 2 | 3 | 5 | 6)
+}
+
+#[cfg(windows)]
+fn windows_drive_is_local(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
 
     let Some(Component::Prefix(prefix)) = path.components().next() else {
         return false;
@@ -232,10 +285,64 @@ fn windows_drive_is_local(path: &Path) -> bool {
         Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
         _ => return false,
     };
-    let root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
-    // SAFETY: `root` is a valid, nul-terminated `X:\\` UTF-16 buffer.
-    let drive_type = unsafe { get_drive_type_w(root.as_ptr()) };
-    matches!(drive_type, 2 | 3 | 5 | 6)
+    windows_drive_letter_is_local(letter)
+}
+
+// Validates the volume the file handle actually resolved to, closing the gap between the
+// pre-open path walk in `has_disallowed_path_prefix` and `File::open` (which re-resolves
+// the path and follows any junction/symlink swapped in after the walk). The canonical path
+// reported by the open handle is rejected if it targets a network (UNC) share or a
+// non-local drive.
+#[cfg(windows)]
+fn windows_handle_target_is_local(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetFinalPathNameByHandleW"]
+        fn get_final_path_name_by_handle_w(
+            file: *mut core::ffi::c_void,
+            path: *mut u16,
+            path_len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+
+    let handle = file.as_raw_handle();
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: `handle` is a live, open file handle for the duration of the call and
+        // `buffer` is writable for `buffer.len()` UTF-16 code units.
+        let length = unsafe {
+            get_final_path_name_by_handle_w(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
+        if length == 0 {
+            return false;
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break;
+        }
+        if length > 66_000 {
+            return false;
+        }
+        buffer = vec![0u16; length + 1];
+    }
+
+    let path = String::from_utf16_lossy(&buffer);
+    let stripped = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    if stripped
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
+    {
+        return false;
+    }
+    let bytes = stripped.as_bytes();
+    bytes.len() >= 2
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && windows_drive_letter_is_local(bytes[0])
 }
 
 #[cfg(windows)]
@@ -593,13 +700,20 @@ fn parse_json(text: &str) -> Result<Vec<CookieMeta>, ()> {
             .flatten()
             {
                 let trimmed = token.trim();
+                // Mirror the plaintext and top-level JSON-string paths: store the value
+                // returned by token_only_value (with any `name=` prefix stripped) rather
+                // than the raw field, so an embedded cookie name is not sent twice.
+                let (value, value_valid) = match token_only_value(trimmed) {
+                    Some(stripped) => (stripped.to_string(), true),
+                    None => (trimmed.to_string(), trimmed.is_empty()),
+                };
                 cookies.push(CookieMeta {
                     domain: "chatgpt.com".to_string(),
                     name: SESSION_COOKIE.to_string(),
                     expires_at,
                     expiry_valid,
-                    value: trimmed.to_string(),
-                    value_valid: trimmed.is_empty() || token_only_value(trimmed).is_some(),
+                    value,
+                    value_valid,
                 });
                 if cookies.len() > MAX_COOKIES {
                     return Err(());
@@ -642,7 +756,15 @@ fn classify_chatgpt(cookies: &[CookieMeta], now: i64) -> InspectionResult {
         if !chatgpt_domain(&cookie.domain) {
             continue;
         }
-        let state = credential_state(cookie, now);
+        // A cookie whose name or value cannot be safely placed in a Cookie header is not
+        // usable, so classification treats it as Invalid. This keeps classify_chatgpt and
+        // prepared_auth in agreement about which credentials are eligible, so a Ready
+        // verdict can never rest on a cookie that prepared_auth would later drop.
+        let state = if safe_cookie_name(&cookie.name) && safe_cookie_value(&cookie.value) {
+            credential_state(cookie, now)
+        } else {
+            CredentialState::Invalid
+        };
         if cookie.name == SESSION_COOKIE || cookie.name == LEGACY_SESSION_COOKIE {
             direct.push(state);
             continue;
@@ -777,12 +899,24 @@ fn normalize_domain(domain: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| domain.strip_prefix("http://"))
         .unwrap_or(&domain);
-    domain
+    let host = domain
         .split('/')
         .next()
         .unwrap_or_default()
         .trim_start_matches('.')
-        .to_string()
+        .trim_end_matches('.');
+    // Strip a trailing `:port` (single colon, numeric) without disturbing IPv6 literals,
+    // which carry multiple colons in the host portion.
+    match host.rsplit_once(':') {
+        Some((head, port))
+            if !head.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            head.to_string()
+        }
+        _ => host.to_string(),
+    }
 }
 
 fn chatgpt_domain(domain: &str) -> bool {
@@ -1077,6 +1211,97 @@ mod tests {
         let path = directory.path().join("fanout.json");
         fs::write(&path, too_many_items).expect("write fixture");
         assert!(inspect_chatgpt_path_at(&path, NOW) == InspectionResult::Invalid);
+    }
+
+    #[test]
+    fn json_object_token_strips_embedded_session_cookie_prefix() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("object-token.json");
+        fs::write(
+            &path,
+            format!(r#"{{"token":"{SESSION_COOKIE}={SYNTHETIC_TOKEN}"}}"#),
+        )
+        .expect("write fixture");
+
+        let auth = prepare_chatgpt_path_at_with_budget(&path, NOW, None)
+            .unwrap_or_else(|_| panic!("prepared auth from prefixed object token"));
+        assert_eq!(
+            auth.cookie_header(),
+            format!("{SESSION_COOKIE}={SYNTHETIC_TOKEN}")
+        );
+    }
+
+    #[test]
+    fn bom_after_leading_whitespace_is_still_stripped() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("bom.json");
+        fs::write(
+            &path,
+            format!(
+                "\n\u{feff}[{{\"domain\":\".chatgpt.com\",\"name\":\"{SESSION_COOKIE}\",\"value\":\"{SYNTHETIC_TOKEN}\",\"expirationDate\":{FUTURE}}}]"
+            ),
+        )
+        .expect("write fixture");
+        assert!(inspect_chatgpt_path_at(&path, NOW) == InspectionResult::Ready);
+    }
+
+    #[test]
+    fn unsafe_direct_token_does_not_mask_expired_chunks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("unsafe-direct.json");
+        fs::write(
+            &path,
+            format!(
+                r#"[{{"domain":"chatgpt.com","name":"{SESSION_COOKIE}","value":"real;token","expirationDate":{FUTURE}}},{{"domain":"chatgpt.com","name":"{SESSION_COOKIE}.0","value":"AAAA","expirationDate":{FUTURE}}},{{"domain":"chatgpt.com","name":"{SESSION_COOKIE}.1","value":"BBBB","expirationDate":{PAST}}}]"#
+            ),
+        )
+        .expect("write fixture");
+        // The direct token carries a ';' that prepared_auth would drop, so it must not
+        // short-circuit classification to Ready while a later chunk is expired.
+        assert!(inspect_chatgpt_path_at(&path, NOW) == InspectionResult::Expired);
+    }
+
+    #[test]
+    fn domain_with_port_or_trailing_dot_is_accepted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for domain in [
+            "chatgpt.com:443",
+            ".chatgpt.com.",
+            "https://chatgpt.com:443/",
+        ] {
+            let path = directory.path().join("domain.json");
+            fs::write(
+                &path,
+                format!(
+                    r#"[{{"domain":"{domain}","name":"{SESSION_COOKIE}","value":"{SYNTHETIC_TOKEN}","expirationDate":{FUTURE}}}]"#
+                ),
+            )
+            .expect("write fixture");
+            assert!(
+                inspect_chatgpt_path_at(&path, NOW) == InspectionResult::Ready,
+                "domain {domain} should classify as Ready"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_charges_exactly_the_bytes_read() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("ready.json");
+        fs::write(
+            &path,
+            format!(
+                r#"[{{"domain":".chatgpt.com","name":"{SESSION_COOKIE}","value":"{SYNTHETIC_TOKEN}","expirationDate":{FUTURE}}}]"#
+            ),
+        )
+        .expect("write fixture");
+        let bytes = fs::metadata(&path).expect("fixture metadata").len();
+        let budget = AtomicU64::new(bytes + 100);
+        assert!(
+            inspect_chatgpt_path_at_with_budget(&path, NOW, Some(&budget))
+                == InspectionResult::Ready
+        );
+        assert_eq!(budget.load(Ordering::Acquire), 100);
     }
 
     #[test]
