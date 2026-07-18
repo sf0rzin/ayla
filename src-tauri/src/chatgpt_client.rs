@@ -2,6 +2,7 @@ use crate::{auth_artifact::PreparedChatGptAuth, proxy_store::StoredProxy};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    io::Read,
     sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::Duration,
@@ -322,11 +323,15 @@ fn get_once(
 
     let mut response = request.call().map_err(|_| FailureKind::Transient)?;
     let status = response.status().as_u16();
-    let body = response
+    // Cap the read with take() so an oversized body is truncated and rejected as a
+    // non-retryable Permanent failure, instead of surfacing as a Transient read error that
+    // would be retried and failed over across every proxy, re-downloading it each time.
+    let mut body = Vec::new();
+    response
         .body_mut()
-        .with_config()
-        .limit((MAX_RESPONSE_BYTES + 1) as u64)
-        .read_to_vec()
+        .as_reader()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
         .map_err(|_| FailureKind::Transient)?;
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(FailureKind::Permanent);
@@ -377,6 +382,11 @@ fn fetch_plan(
         match get_with_retry(agent, ME_URL, auth, bearer, retries) {
             Ok(response) => {
                 retried = retried.saturating_add(response.retries);
+                // The /me body may carry entitlement/account fields; derive the plan from
+                // it rather than assuming Free for an otherwise live account.
+                if let Ok(root) = serde_json::from_slice::<Value>(&response.body) {
+                    return (extract_plan(&root), retried);
+                }
                 return (ChatGptPlan::Free, retried);
             }
             Err(error) => retried = retried.saturating_add(error.retries),
@@ -419,12 +429,20 @@ fn plan_from_account(value: &Value) -> ChatGptPlan {
     let plan_type = account.and_then(|node| first_string(node, &["plan_type", "planType"]));
 
     if active == Some(false) {
-        let normalized = normalize_plan(plan_type.unwrap_or_default());
-        return if matches!(normalized, ChatGptPlan::Team | ChatGptPlan::Enterprise) {
-            normalized
-        } else {
-            ChatGptPlan::Free
-        };
+        // A seat-based Team/Enterprise member commonly reports has_active_subscription=false
+        // while the tier lives in subscription_plan, so consult both fields before Free.
+        for candidate in [
+            plan_type.map(normalize_plan),
+            subscription.map(normalize_plan),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if matches!(candidate, ChatGptPlan::Team | ChatGptPlan::Enterprise) {
+                return candidate;
+            }
+        }
+        return ChatGptPlan::Free;
     }
     if let Some(subscription) = subscription {
         return normalize_plan(subscription);
@@ -446,10 +464,9 @@ fn normalize_plan(raw: &str) -> ChatGptPlan {
         .chars()
         .filter(|character| !matches!(character, ' ' | '_' | '-'))
         .collect();
-    if normalized.contains("free") || matches!(normalized.as_str(), "" | "null" | "none" | "noplan")
-    {
-        ChatGptPlan::Free
-    } else if normalized.contains("team") {
+    // Paid tiers are matched before the generic "free" fallback so a plan string that
+    // merely contains "free" (e.g. a paid "free_trial") is not demoted to Free.
+    if normalized.contains("team") {
         ChatGptPlan::Team
     } else if normalized.contains("enterprise") {
         ChatGptPlan::Enterprise
@@ -485,7 +502,13 @@ fn is_cloudflare_body(status: u16, body: &[u8]) -> bool {
         || text.contains("cf-challenge")
         || text.contains("enable javascript and cookies")
         || text.contains("_cf_chl")
+        // Cloudflare edge/firewall blocks (e.g. "error code: 1020" for an IP/ASN block)
+        // arrive as a minimal plaintext 403 body. Treat them as a block/rate-limit so the
+        // check fails over to another proxy instead of condemning the account as Dead.
+        || text.contains("error code: 10")
+        || text.contains("attention required")
         || (text.contains("cloudflare") && text.contains("challenge"))
+        || (status == 403 && text.contains("cloudflare"))
         || (status == 403
             && text.contains("<html")
             && (text.contains("scale-appear") || text.contains("cf-")))
@@ -535,6 +558,64 @@ mod tests {
         assert!(extract_plan(&expired) == ChatGptPlan::Free);
         assert!(normalize_plan("chatgptprolite") == ChatGptPlan::Pro);
         assert!(normalize_plan("chatgptgoplan") == ChatGptPlan::Go);
+    }
+
+    #[test]
+    fn cloudflare_edge_block_is_treated_as_block_not_dead() {
+        // Minimal plaintext firewall blocks (1020 IP/ASN, 1015 rate limit) must be caught
+        // so the probe fails over instead of classifying the account Dead.
+        assert!(is_cloudflare_body(403, b"error code: 1020"));
+        assert!(is_cloudflare_body(403, b"error code: 1015"));
+        assert!(is_cloudflare_body(403, b"Attention Required! | Cloudflare"));
+        assert!(is_cloudflare_body(
+            403,
+            b"<html>Sorry, you have been blocked by Cloudflare"
+        ));
+        // A genuine authentication failure stays Dead rather than being misread as a block.
+        assert!(!is_cloudflare_body(
+            403,
+            br#"{"detail":"Could not parse token"}"#
+        ));
+        assert!(!is_cloudflare_body(200, br#"{"user":{"id":"abc"}}"#));
+    }
+
+    #[test]
+    fn paid_trial_plan_is_not_demoted_to_free() {
+        assert!(normalize_plan("chatgpt plus plan free trial") == ChatGptPlan::Plus);
+        assert!(normalize_plan("pro_free_trial") == ChatGptPlan::Pro);
+        assert!(normalize_plan("team free trial") == ChatGptPlan::Team);
+        assert!(normalize_plan("free") == ChatGptPlan::Free);
+        assert!(normalize_plan("") == ChatGptPlan::Free);
+    }
+
+    #[test]
+    fn inactive_seat_preserves_business_tier_from_subscription_plan() {
+        let team_seat = json!({
+            "accounts": {
+                "default": {
+                    "account": {"plan_type": "free"},
+                    "entitlement": {
+                        "has_active_subscription": false,
+                        "subscription_plan": "chatgptteamplan"
+                    }
+                }
+            }
+        });
+        assert!(extract_plan(&team_seat) == ChatGptPlan::Team);
+
+        // A lapsed personal subscription (no business tier) still demotes to Free.
+        let lapsed = json!({
+            "accounts": {
+                "default": {
+                    "account": {"plan_type": "plus"},
+                    "entitlement": {
+                        "has_active_subscription": false,
+                        "subscription_plan": "chatgptplusplan"
+                    }
+                }
+            }
+        });
+        assert!(extract_plan(&lapsed) == ChatGptPlan::Free);
     }
 
     #[test]
