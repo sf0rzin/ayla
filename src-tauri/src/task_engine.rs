@@ -261,6 +261,10 @@ impl CancellationToken {
     }
 
     fn cancel(&self) {
+        // Hold the wait lock across the state change and notification so a waiter that has
+        // evaluated the flag but not yet parked cannot miss the wake (a lost wakeup that
+        // would otherwise leave it sleeping for the full inter-item delay).
+        let _guard = lock_unpoison(&self.state.wait_lock);
         self.state.cancelled.store(true, Ordering::Release);
         self.state.wake.notify_all();
     }
@@ -290,7 +294,6 @@ impl CancellationToken {
 
 struct TaskContext {
     cancellation: CancellationToken,
-    remaining_artifact_bytes: Arc<AtomicU64>,
     chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
 }
 
@@ -330,10 +333,11 @@ impl TaskHandler for ModuleInspectionHandler {
         let path = Path::new(value.as_ref());
         let outcome = match module_id {
             "chatgpt" if path.is_absolute() => {
-                match auth_artifact::prepare_chatgpt_path_with_budget(
-                    path,
-                    &context.remaining_artifact_bytes,
-                ) {
+                // Each file is bounded independently by the per-file artifact cap. There is
+                // no shared aggregate budget at execution, so a structurally valid file is
+                // never failed merely because earlier files consumed a common allowance.
+                let budget = AtomicU64::new(auth_artifact::MAX_ARTIFACT_BYTES);
+                match auth_artifact::prepare_chatgpt_path_with_budget(path, &budget) {
                     Ok(auth) => context
                         .chatgpt_probe
                         .as_ref()
@@ -477,7 +481,6 @@ impl TaskEngine {
             requested_concurrency,
             delay_ms,
             use_proxy,
-            scan_budget_bytes,
         } = prepare_with_limits(request, discovery_limits)?;
 
         if use_proxy && proxy_count == 0 {
@@ -543,7 +546,6 @@ impl TaskEngine {
                     delay_ms,
                     chatgpt_probe,
                     cancellation,
-                    scan_budget_bytes,
                 );
             });
 
@@ -584,11 +586,16 @@ impl TaskEngine {
                 active.snapshot.sequence = active.snapshot.sequence.saturating_add(1);
             }
 
-            (active.cancellation.clone(), active.snapshot.clone())
+            let cancellation = active.cancellation.clone();
+            let snapshot = active.snapshot.clone();
+            // Emit while still holding the state lock so this Cancelling event is ordered
+            // before the terminal done event finish() emits once it takes `active`; a late
+            // Cancelling event could otherwise arrive after the run has completed.
+            self.inner.events.progress(snapshot.clone());
+            (cancellation, snapshot)
         };
 
         cancellation.cancel();
-        self.inner.events.progress(snapshot.clone());
         Some(snapshot)
     }
 
@@ -752,10 +759,12 @@ impl EngineInner {
             .skipped
             .saturating_add(active.snapshot.total.saturating_sub(accounted));
 
-        active.snapshot.status = if fatal_worker_error {
-            TaskStatus::Failed
-        } else if active.snapshot.processed == active.snapshot.total {
+        active.snapshot.status = if active.snapshot.processed == active.snapshot.total {
+            // Every input was processed, so the run succeeded even if a later worker thread
+            // failed to spawn: the surviving workers drained the shared queue to completion.
             TaskStatus::Completed
+        } else if fatal_worker_error {
+            TaskStatus::Failed
         } else if active.cancellation.is_cancelled() {
             TaskStatus::Cancelled
         } else if active.snapshot.skipped > 0 {
@@ -808,7 +817,6 @@ struct PreparedTask {
     requested_concurrency: usize,
     delay_ms: u64,
     use_proxy: bool,
-    scan_budget_bytes: u64,
 }
 
 struct SourceCandidate {
@@ -879,9 +887,13 @@ fn prepare_with_limits(
         };
 
         for candidate in expanded {
-            let value = candidate
-                .to_str()
-                .ok_or_else(|| "the directory contains an incompatible path".to_string())?;
+            let Some(value) = candidate.to_str() else {
+                // A scanned directory can surface a non-UTF-8 filename; skip it rather than
+                // aborting discovery of every other valid file in the batch. Explicit
+                // entries always originate from valid UTF-8 input, so this only drops
+                // unrepresentable discovered paths.
+                continue;
+            };
             let candidate_bytes = value.len();
             if candidate_bytes > MAX_ENTRY_BYTES {
                 return Err(format!(
@@ -938,7 +950,6 @@ fn prepare_with_limits(
         requested_concurrency: concurrency.min(MAX_WORKERS),
         delay_ms,
         use_proxy,
-        scan_budget_bytes: discovery_limits.scan_budget_bytes,
     })
 }
 
@@ -959,6 +970,12 @@ fn structurally_ready_candidates(
     let mut scan_bytes = 0u64;
     for index in &scan_indices {
         if let Ok(metadata) = fs::metadata(Path::new(candidates[*index].value.as_ref())) {
+            // Files above the per-file cap are rejected by the scan without consuming any
+            // budget, so counting them here would let a single large unrelated file falsely
+            // abort discovery of the whole batch.
+            if metadata.len() > auth_artifact::MAX_ARTIFACT_BYTES {
+                continue;
+            }
             scan_bytes = scan_bytes
                 .checked_add(metadata.len())
                 .filter(|total| *total <= scan_budget_bytes)
@@ -1124,10 +1141,8 @@ fn run_task(
     delay_ms: u64,
     chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
     cancellation: CancellationToken,
-    scan_budget_bytes: u64,
 ) {
     let module_id: Arc<str> = Arc::from(module_id);
-    let remaining_artifact_bytes = Arc::new(AtomicU64::new(scan_budget_bytes));
     let queue = Arc::new(Mutex::new(inputs));
     let worker_count = {
         let total = lock_unpoison(&queue).len();
@@ -1141,7 +1156,6 @@ fn run_task(
     for worker_index in 0..worker_count {
         let queue = Arc::clone(&queue);
         let module_id = Arc::clone(&module_id);
-        let remaining_artifact_bytes = Arc::clone(&remaining_artifact_bytes);
         let chatgpt_probe = chatgpt_probe.clone();
         let sender = sender.clone();
         let handler = Arc::clone(&inner.handler);
@@ -1152,7 +1166,6 @@ fn run_task(
                 worker_loop(
                     queue,
                     module_id,
-                    remaining_artifact_bytes,
                     chatgpt_probe,
                     sender,
                     handler,
@@ -1184,11 +1197,9 @@ fn run_task(
     inner.finish(&run_id, fatal_worker_error);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     queue: Arc<Mutex<VecDeque<TaskInput>>>,
     module_id: Arc<str>,
-    remaining_artifact_bytes: Arc<AtomicU64>,
     chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
     sender: mpsc::SyncSender<WorkerMessage>,
     handler: Arc<dyn TaskHandler>,
@@ -1216,7 +1227,6 @@ fn worker_loop(
 
         let context = TaskContext {
             cancellation: cancellation.clone(),
-            remaining_artifact_bytes: Arc::clone(&remaining_artifact_bytes),
             chatgpt_probe: chatgpt_probe.clone(),
         };
         let outcome = handler.process(module_id.as_ref(), input, &context);
@@ -1272,9 +1282,13 @@ fn persist_history_file(path: &Path, history: &VecDeque<TaskHistoryEntry>) -> Re
 
     let mut file = fs::File::create(&temporary)
         .map_err(|error| format!("unable to create the temporary task history: {error}"))?;
-    file.write_all(&data)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("unable to write the temporary task history: {error}"))?;
+    if let Err(error) = file.write_all(&data).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "unable to write the temporary task history: {error}"
+        ));
+    }
     drop(file);
 
     match fs::rename(&temporary, path) {
@@ -1793,10 +1807,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_scan_budget_is_reapplied_during_task_execution() {
+    fn per_file_cap_rejects_oversized_files_at_execution() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let oversized = directory.path().join("oversized.txt");
-        fs::write(&oversized, vec![b'x'; 1024 * 1024 + 1]).expect("write oversized fixture");
+        // Larger than the per-file artifact cap, so the read is rejected before the probe.
+        fs::write(&oversized, vec![b'x'; 2 * 1024 * 1024 + 1]).expect("write oversized fixture");
 
         let engine = test_engine(
             directory.path().join("task_history.json"),
@@ -1809,14 +1824,74 @@ mod tests {
                 request("chatgpt", [oversized.display().to_string()], 1, 0),
                 probe.clone(),
                 0,
-                DiscoveryLimits::new(10, 10, 1),
+                DiscoveryLimits::default(),
             )
-            .expect("start task with configured budget");
+            .expect("start task");
 
         let summary = wait_for_history(&engine, &started.run_id);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.succeeded, 0);
         assert_eq!(probe.calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn valid_explicit_files_are_not_failed_by_a_shared_execution_budget() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut entries = Vec::new();
+        for index in 0..4 {
+            let path = directory.path().join(format!("cookies-{index}.txt"));
+            let token = format!("synthetic_bulk_{index:04}_{}", "A".repeat(48));
+            let mut content = format!(
+                ".chatgpt.com\tTRUE\t/\tTRUE\t4102444800\t__Secure-next-auth.session-token\t{token}\n"
+            );
+            // ~360 KiB of ignored comment lines so the four files together exceed the 1 MiB
+            // discovery budget; each stays under the per-file cap and must still succeed.
+            content.push_str(&"#padding\n".repeat(40_000));
+            fs::write(&path, content).expect("write padded cookie");
+            entries.push(path.display().to_string());
+        }
+
+        let engine = test_engine(
+            directory.path().join("task_history.json"),
+            Arc::new(ModuleInspectionHandler),
+            Arc::new(RecordingEvents::default()),
+        );
+        let probe = Arc::new(CountingProber::default());
+        let started = engine
+            .start_with_chatgpt_probe(
+                request("chatgpt", entries, 4, 0),
+                probe.clone(),
+                0,
+                DiscoveryLimits::new(10, 10, 1),
+            )
+            .expect("start task");
+
+        let summary = wait_for_history(&engine, &started.run_id);
+        assert_eq!(summary.succeeded, 4);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn oversized_unrelated_file_does_not_abort_directory_discovery() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        write_ready_artifact(&directory.path().join("cookies.txt"), 1);
+        // A large unrelated file exceeding both the per-file cap and the scan budget must be
+        // skipped, not abort discovery of the valid cookie beside it.
+        fs::write(
+            directory.path().join("video.bin"),
+            vec![b'x'; 3 * 1024 * 1024],
+        )
+        .expect("write oversized file");
+
+        let prepared = prepare_with_limits(
+            request("chatgpt", [directory.path().display().to_string()], 4, 0),
+            DiscoveryLimits::new(10, 10, 1),
+        )
+        .expect("discovery should succeed despite the oversized file");
+        assert_eq!(prepared.discovered, 2);
+        assert_eq!(prepared.inputs.len(), 1);
+        assert!(prepared.inputs[0].0.ends_with("cookies.txt"));
     }
 
     #[test]
