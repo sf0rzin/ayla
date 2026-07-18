@@ -256,10 +256,10 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 .insight-empty { margin: 15px 0 0; color: var(--text-tertiary); font-size: 11px; }
 
 .modules-page { height: 100%; min-height: 0; padding: 2px 8px 36px 0; display: block; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent; }
-.modules-page::-webkit-scrollbar { width: 6px; }
-.modules-page::-webkit-scrollbar-track { background: transparent; }
-.modules-page::-webkit-scrollbar-thumb { border: 1px solid transparent; border-radius: 999px; background: rgba(255, 255, 255, 0.16); background-clip: padding-box; }
-.modules-page::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; }
+.modules-page::-webkit-scrollbar, .settings-page::-webkit-scrollbar { width: 6px; }
+.modules-page::-webkit-scrollbar-track, .settings-page::-webkit-scrollbar-track { background: transparent; }
+.modules-page::-webkit-scrollbar-thumb, .settings-page::-webkit-scrollbar-thumb { border: 1px solid transparent; border-radius: 999px; background: rgba(255, 255, 255, 0.16); background-clip: padding-box; }
+.modules-page::-webkit-scrollbar-thumb:hover, .settings-page::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; }
 .module-page-header h1 { margin: 0; font-size: clamp(27px, 3vw, 33px); font-weight: 400; letter-spacing: -0.025em; }
 .module-page-header p { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
 .module-search-shell { width: 100%; height: 42px; margin-top: 24px; padding: 0 6px 0 13px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--border-strong); border-radius: var(--radius-full); color: var(--text-tertiary); background: rgba(255, 255, 255, 0.035); transition: border-color 120ms var(--ease-out), box-shadow 120ms var(--ease-out); }
@@ -604,19 +604,19 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 .proxy-import-rejection { margin: 0; padding: 7px 11px; overflow: hidden; border-top: 1px solid var(--border-subtle); color: var(--danger); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .proxy-add-footer { min-height: 48px; margin-top: 10px; padding-top: 8px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--border-subtle); }
 .proxy-add-footer > span { min-width: 0; margin-right: auto; overflow: hidden; color: var(--text-tertiary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.settings-page { height: 100%; max-width: 920px !important; padding: 0; display: grid; grid-template-rows: auto auto auto; align-content: start; overflow: hidden; }
-.settings-page-header { padding: clamp(4px, 1vh, 10px) 0 clamp(14px, 2vh, 22px); border-bottom: 1px solid var(--border-subtle); }
+.settings-page { height: 100%; max-width: 960px !important; padding: 0 8px 40px 0; display: block; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent; }
+.settings-page-header { padding: clamp(8px, 1.4vh, 14px) 0 clamp(20px, 3vh, 30px); border-bottom: 1px solid var(--border-subtle); }
 .settings-kicker { display: block; margin-bottom: 12px; color: var(--text-tertiary); font-size: 10px; letter-spacing: 0.01em; }
 .settings-page-header h1 { margin: 0; font-size: clamp(27px, 3vw, 32px); font-weight: 400; line-height: 1.15; letter-spacing: -0.025em; }
 .settings-page-header p { max-width: 620px; margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
-.settings-sections { min-height: 0; margin-top: clamp(15px, 2.5vh, 25px); display: grid; align-content: start; gap: clamp(16px, 2.5vh, 26px); }
+.settings-sections { min-height: 0; margin-top: clamp(22px, 3.5vh, 34px); display: grid; align-content: start; gap: clamp(24px, 3.5vh, 34px); }
 .settings-section { min-width: 0; }
-.settings-section > h2 { margin: 0 0 8px; font-size: 14px; font-weight: 500; letter-spacing: -0.01em; }
+.settings-section > h2 { margin: 0 0 10px; font-size: 14px; font-weight: 500; letter-spacing: -0.01em; }
 .settings-section > .settings-module-title { display: flex; align-items: center; gap: 8px; }
 .settings-module-title > span { width: 24px; height: 24px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--border-subtle); border-radius: 7px; background: var(--bg-tertiary); }
 .settings-module-title .module-brand-img { width: 15px; height: 15px; }
 .settings-group { overflow: hidden; border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: rgba(255, 255, 255, 0.025); }
-.settings-row { min-height: clamp(54px, 8vh, 68px); padding: clamp(10px, 1.5vh, 14px) 18px; display: grid; grid-template-columns: minmax(0, 1fr) 132px; align-items: center; gap: 28px; border-bottom: 1px solid var(--border-subtle); }
+.settings-row { min-height: clamp(62px, 9vh, 74px); padding: clamp(13px, 2vh, 18px) 20px; display: grid; grid-template-columns: minmax(0, 1fr) 132px; align-items: center; gap: 30px; border-bottom: 1px solid var(--border-subtle); }
 .settings-row:last-child { border-bottom: 0; }
 .settings-row > .switch-control { justify-self: end; }
 .settings-copy { min-width: 0; display: grid; gap: 4px; }
@@ -625,7 +625,7 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 .number-input { width: 100%; height: 36px; padding: 0 11px; border-radius: 10px; appearance: textfield; -moz-appearance: textfield; text-align: right; }
 .number-input::-webkit-inner-spin-button,
 .number-input::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
-.settings-savebar { min-height: 48px; margin-top: 12px; padding: 8px 0 0; display: flex; align-items: center; justify-content: flex-end; gap: 14px; border-top: 1px solid var(--border-subtle); }
+.settings-savebar { min-height: 56px; margin-top: 20px; padding: 12px 0 0; display: flex; align-items: center; justify-content: flex-end; gap: 14px; border-top: 1px solid var(--border-subtle); }
 .settings-savebar span { margin-right: auto; color: var(--success); font-size: 10px; }
 
 .modal-backdrop { position: fixed; z-index: 200; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(0, 0, 0, 0.62); backdrop-filter: blur(6px); }
@@ -716,13 +716,14 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
   .task-metrics > div { min-height: 36px; padding: 5px 7px; }
   .task-metrics strong { font-size: 16px; }
   .task-history-row, .proxy-row { min-height: 42px; padding-block: 4px; }
-  .settings-page-header { padding-top: 2px; padding-bottom: 12px; }
+  .settings-page-header { padding-top: 4px; padding-bottom: 14px; }
   .settings-page-header h1 { font-size: 25px; }
   .settings-page-header p { display: none; }
-  .settings-sections { margin-top: 12px; gap: 12px; }
-  .settings-section > h2 { margin-bottom: 6px; }
-  .settings-row { min-height: 50px; padding-block: 8px; }
-  .settings-savebar { min-height: 42px; margin-top: 8px; }
+  .settings-sections { margin-top: 16px; gap: 18px; }
+  .settings-section > h2 { margin-bottom: 7px; }
+  .settings-row { min-height: 60px; padding-block: 10px; }
+  .settings-page .number-input { height: 36px; }
+  .settings-savebar { min-height: 48px; margin-top: 14px; }
   .task-page-header { min-height: 50px; padding-bottom: 9px; }
   .task-history-panel { margin-top: 7px; }
   .task-history-header { min-height: 40px; padding-block: 7px; }
@@ -740,46 +741,46 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 }
 
 @media (min-height: 761px) and (max-height: 900px) {
-  .settings-page .settings-page-header { padding-top: 4px; padding-bottom: 4px; }
+  .settings-page .settings-page-header { padding-top: 7px; padding-bottom: 10px; }
   .settings-page .settings-page-header p { display: none; }
-  .settings-page .settings-sections { margin-top: 10px; gap: 10px; }
-  .settings-page .settings-section > h2 { margin-bottom: 5px; }
-  .settings-page .settings-row { min-height: 60px; padding-block: 10px; }
-  .settings-page .number-input { height: 36px; }
-  .settings-page .settings-savebar { min-height: 48px; margin-top: 8px; }
+  .settings-page .settings-sections { margin-top: 18px; gap: 20px; }
+  .settings-page .settings-section > h2 { margin-bottom: 8px; }
+  .settings-page .settings-row { min-height: 68px; padding-block: 13px; }
+  .settings-page .number-input { height: 38px; }
+  .settings-page .settings-savebar { min-height: 52px; margin-top: 16px; }
 }
 
 @media (max-height: 700px) {
   .settings-page.has-module-settings .settings-page-header { padding-bottom: 8px; }
-  .settings-page.has-module-settings .settings-sections { margin-top: 8px; gap: 8px; }
-  .settings-page.has-module-settings .settings-section > h2 { margin-bottom: 4px; font-size: 13px; }
-  .settings-page.has-module-settings .settings-row { min-height: 40px; padding-block: 4px; }
-  .settings-page.has-module-settings .number-input { height: 32px; }
-  .settings-page.has-module-settings .settings-savebar { min-height: 38px; margin-top: 6px; }
+  .settings-page.has-module-settings .settings-sections { margin-top: 12px; gap: 12px; }
+  .settings-page.has-module-settings .settings-section > h2 { margin-bottom: 6px; font-size: 13px; }
+  .settings-page.has-module-settings .settings-row { min-height: 56px; padding-block: 9px; }
+  .settings-page.has-module-settings .number-input { height: 36px; }
+  .settings-page.has-module-settings .settings-savebar { min-height: 44px; margin-top: 10px; }
 }
 
 @media (min-width: 1500px) and (min-height: 901px) {
-  .settings-page { max-width: 1040px !important; }
-  .settings-page .settings-page-header { padding-top: 12px; padding-bottom: 24px; }
+  .settings-page { max-width: 1080px !important; }
+  .settings-page .settings-page-header { padding-top: 16px; padding-bottom: 30px; }
   .settings-page .settings-page-header p { margin-top: 10px; font-size: 13px; }
-  .settings-page .settings-sections { margin-top: 28px; gap: 30px; }
-  .settings-page .settings-section > h2 { margin-bottom: 10px; font-size: 15px; }
-  .settings-page .settings-row { min-height: 78px; padding: 16px 22px; grid-template-columns: minmax(0, 1fr) 160px; gap: 40px; }
+  .settings-page .settings-sections { margin-top: 34px; gap: 34px; }
+  .settings-page .settings-section > h2 { margin-bottom: 12px; font-size: 15px; }
+  .settings-page .settings-row { min-height: 84px; padding: 19px 24px; grid-template-columns: minmax(0, 1fr) 160px; gap: 44px; }
   .settings-page .settings-copy label,
   .settings-page .settings-copy strong,
   .settings-page .settings-row .field-label { font-size: 13px; }
   .settings-page .settings-copy p,
   .settings-page .settings-copy small,
   .settings-page .settings-row small { font-size: 12px; }
-  .settings-page .number-input { height: 40px; }
-  .settings-page .settings-savebar { min-height: 54px; margin-top: 16px; padding-top: 10px; }
+  .settings-page .number-input { height: 42px; }
+  .settings-page .settings-savebar { min-height: 60px; margin-top: 24px; padding-top: 14px; }
   .settings-page .settings-savebar span { font-size: 11px; }
 
-  .settings-page.has-module-settings .settings-page-header { padding-bottom: 16px; }
+  .settings-page.has-module-settings .settings-page-header { padding-bottom: 20px; }
   .settings-page.has-module-settings .settings-page-header p { display: none; }
-  .settings-page.has-module-settings .settings-sections { margin-top: 20px; gap: 20px; }
-  .settings-page.has-module-settings .settings-section > h2 { margin-bottom: 7px; }
-  .settings-page.has-module-settings .settings-row { min-height: 72px; padding-block: 13px; }
-  .settings-page.has-module-settings .number-input { height: 38px; }
-  .settings-page.has-module-settings .settings-savebar { min-height: 50px; margin-top: 12px; padding-top: 8px; }
+  .settings-page.has-module-settings .settings-sections { margin-top: 26px; gap: 28px; }
+  .settings-page.has-module-settings .settings-section > h2 { margin-bottom: 9px; }
+  .settings-page.has-module-settings .settings-row { min-height: 78px; padding-block: 16px; }
+  .settings-page.has-module-settings .number-input { height: 40px; }
+  .settings-page.has-module-settings .settings-savebar { min-height: 56px; margin-top: 20px; padding-top: 12px; }
 }
