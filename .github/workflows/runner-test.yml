@@ -1,0 +1,16 @@
+name: runner-test
+on: [push, workflow_dispatch]
+jobs:
+  t:
+    runs-on: [self-hosted, windows, rust]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          Write-Output "runner works"
