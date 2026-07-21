@@ -2,6 +2,7 @@ mod auth_artifact;
 mod catalog;
 mod chatgpt_client;
 mod cookie_artifact;
+mod max_client;
 mod module_probe;
 mod proxy;
 mod proxy_checker;
@@ -11,6 +12,7 @@ mod task_engine;
 mod twitch_client;
 
 use chatgpt_client::ChatGptProbePool;
+use max_client::MaxProbePool;
 use proxy_checker::{CheckProxiesRequest, CheckProxiesResponse};
 use proxy_store::{AddProxiesResult, ProxyItem, ProxyManager};
 use serde::Serialize;
@@ -198,6 +200,21 @@ async fn start_task(app: AppHandle, request: StartTaskRequest) -> Result<TaskSna
             }
             "twitch" => {
                 let probe = TwitchProbePool::new(
+                    current.timeout_ms,
+                    current.retries,
+                    request.delay_ms,
+                    &proxy_targets,
+                )?;
+                let proxy_count = probe.proxy_count();
+                engine.start_with_cookie_probe(
+                    request,
+                    Arc::new(probe),
+                    proxy_count,
+                    discovery_limits,
+                )
+            }
+            "max" => {
+                let probe = MaxProbePool::new(
                     current.timeout_ms,
                     current.retries,
                     request.delay_ms,

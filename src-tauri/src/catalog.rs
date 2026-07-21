@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-pub const MODULE_IDS: [&str; 14] = [
+pub const MODULE_IDS: [&str; 15] = [
     "chatgpt",
     "grok",
     "tiktok",
@@ -12,6 +12,7 @@ pub const MODULE_IDS: [&str; 14] = [
     "airbnb",
     "spotify",
     "twitch",
+    "max",
     "kick",
     "instagram",
     "reddit",
@@ -32,7 +33,7 @@ pub fn is_known_module(id: &str) -> bool {
 }
 
 pub fn is_enabled_module(id: &str) -> bool {
-    matches!(id, "chatgpt" | "twitch")
+    matches!(id, "chatgpt" | "twitch" | "max")
 }
 
 pub fn modules() -> Vec<ModuleInfo> {
@@ -104,6 +105,12 @@ pub fn modules() -> Vec<ModuleInfo> {
             "Live-streaming platform for gaming, creators, and communities",
         ),
         module(
+            "max",
+            "HBO Max",
+            "Entertainment",
+            "Streaming platform for HBO, Warner Bros., movies, series, and live events",
+        ),
+        module(
             "kick",
             "Kick",
             "Social",
@@ -154,11 +161,13 @@ mod tests {
         }
 
         let enabled: Vec<_> = modules.iter().filter(|item| item.enabled).collect();
-        assert_eq!(enabled.len(), 2);
+        assert_eq!(enabled.len(), 3);
         assert_eq!(enabled[0].id, "chatgpt");
         assert_eq!(enabled[1].id, "twitch");
+        assert_eq!(enabled[2].id, "max");
         assert!(is_enabled_module("chatgpt"));
         assert!(is_enabled_module("twitch"));
+        assert!(is_enabled_module("max"));
         assert!(!is_enabled_module("reddit"));
     }
 }

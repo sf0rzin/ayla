@@ -18,6 +18,7 @@ import {
   CircleHelp,
   CircleDot,
   CircleGauge,
+  Clapperboard,
   Clock3,
   Disc3,
   Ellipsis,
@@ -243,7 +244,7 @@ const pageMeta: Record<Page, { title: string; icon: LucideIcon }> = {
 
 const fallbackOverview: AppOverview = {
   version: "0.1.0",
-  modulesTotal: 14,
+  modulesTotal: 15,
   defaultThreads: 24,
   proxiesTotal: 0,
   proxiesLive: 0,
@@ -262,10 +263,11 @@ const fallbackModules: ModuleInfo[] = [
   ["airbnb", "Airbnb", "Marketplace", "Marketplace for stays and travel experiences"],
   ["spotify", "Spotify", "Entertainment", "Music, podcasts, and audio streaming platform"],
   ["twitch", "Twitch", "Entertainment", "Live streaming for gaming, creators, and communities"],
+  ["max", "HBO Max", "Entertainment", "HBO, Warner Bros., movies, series, and live events"],
   ["kick", "Kick", "Social", "Live-streaming and creator platform"],
   ["instagram", "Instagram", "Social", "Photo, video, and social networking platform"],
   ["reddit", "Reddit", "Social", "Community discussion and content-sharing platform"],
-].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" || id === "twitch" }));
+].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" || id === "twitch" || id === "max" }));
 
 function App() {
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
@@ -929,6 +931,7 @@ const moduleIcons: Record<string, LucideIcon> = {
   airbnb: House,
   spotify: Disc3,
   twitch: Radio,
+  max: Clapperboard,
 };
 
 const moduleFilters: Array<{ id: string; label: string; icon: LucideIcon }> = [
@@ -942,7 +945,7 @@ const moduleFilters: Array<{ id: string; label: string; icon: LucideIcon }> = [
 const moduleTopics: Array<{ id: string; title: string; modules: string[] }> = [
   { id: "featured", title: "Featured", modules: ["chatgpt", "grok", "tiktok", "zai"] },
   { id: "commerce", title: "Commerce & services", modules: ["doordash", "uber", "sephora", "stockx", "airbnb"] },
-  { id: "media", title: "Media & communities", modules: ["spotify", "twitch", "kick", "instagram", "reddit"] },
+  { id: "media", title: "Media & communities", modules: ["spotify", "twitch", "max", "kick", "instagram", "reddit"] },
 ];
 
 function Modules({ modules, preferences, onToggle, onConfigure }: { modules: ModuleInfo[]; preferences: Record<string, boolean>; onToggle: (id: string) => void; onConfigure: (id: string) => void }) {
@@ -1390,7 +1393,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
               <div className="settings-group task-create-group">
                 <div className="settings-row task-proxy-setting"><div className="settings-copy"><strong>Proxy routing</strong><small>{proxiesLive > 0 ? `${proxiesLive} live ${proxiesLive === 1 ? "proxy" : "proxies"} available` : "Add and check proxies before enabling this option."}</small>{proxiesLive === 0 && <button className="inline-action" type="button" onClick={onOpenProxies}>Manage proxies</button>}</div><button className={useProxy ? "switch-control active" : "switch-control"} type="button" role="switch" aria-checked={useProxy} onClick={() => setUseProxy((current) => !current)} disabled={starting || proxiesLive === 0}><span /></button></div>
                 <SettingNumberRow id="task-concurrency" label="Concurrency" description={useProxy && effectiveConcurrency < requestedConcurrency ? `${requestedConcurrency} requested · ${effectiveConcurrency} effective with the current proxy pool.` : "Parallel workers. Higher values use more CPU and network capacity."} min={1} max={32} value={concurrency} onChange={setConcurrency} disabled={starting} />
-                <SettingNumberRow id="task-delay" label={selectedModule?.id === "twitch" ? "Request spacing" : "Worker delay"} description={selectedModule?.id === "twitch" ? "Minimum global spacing between Twitch requests, including retries and proxy failover." : "Pause between entries per worker, in milliseconds."} min={0} max={60_000} value={delayMs} onChange={setDelayMs} disabled={starting} />
+                <SettingNumberRow id="task-delay" label={selectedModule && selectedModule.id !== "chatgpt" ? "Request spacing" : "Worker delay"} description={selectedModule && selectedModule.id !== "chatgpt" ? `Minimum global spacing between ${selectedModule.name} requests, including retries and proxy failover.` : "Pause between entries per worker, in milliseconds."} min={0} max={60_000} value={delayMs} onChange={setDelayMs} disabled={starting} />
               </div>
             </section>
           </div>

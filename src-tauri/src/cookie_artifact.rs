@@ -192,6 +192,65 @@ pub(crate) const TWITCH_COOKIE_POLICY: CookiePolicy = CookiePolicy::new(
     TWITCH_OUTBOUND_COOKIES,
 );
 
+const MAX_VALUE_PREFIXES: &[&str] = &["Bearer ", "Cookie "];
+const MAX_ALLOWED_DOMAINS: &[&str] = &["api.hbomax.com", "api.max.com", "api.discomax.com"];
+const MAX_REQUIRED_COOKIES: &[&str] = &["st"];
+const MAX_AUTH_TARGETS: &[CookieTarget] = &[
+    CookieTarget::new("default.any-any.prd.api.hbomax.com", "/", true),
+    CookieTarget::new("default.any-any.prd.api.max.com", "/", true),
+    CookieTarget::new("default.any-any.prd.api.discomax.com", "/", true),
+];
+const MAX_OUTBOUND_COOKIES: &[&str] = &["st"];
+const MAX_DIRECT_ALIASES: &[DirectCookieAlias] = &[
+    DirectCookieAlias::new(
+        "st",
+        "st",
+        "api.hbomax.com",
+        "/",
+        true,
+        true,
+        false,
+        false,
+        MAX_VALUE_PREFIXES,
+    ),
+    DirectCookieAlias::new(
+        "token",
+        "st",
+        "api.hbomax.com",
+        "/",
+        true,
+        true,
+        false,
+        true,
+        MAX_VALUE_PREFIXES,
+    ),
+    DirectCookieAlias::new(
+        "access_token",
+        "st",
+        "api.hbomax.com",
+        "/",
+        true,
+        true,
+        false,
+        true,
+        MAX_VALUE_PREFIXES,
+    ),
+];
+
+/// Strict HBO Max policy for the first-party API cookie used by the official web client.
+/// Legacy roots remain explicit so an older authorized export can be recognized without
+/// widening the boundary to domains that merely contain the word "max".
+pub(crate) const MAX_COOKIE_POLICY: CookiePolicy = CookiePolicy::new(
+    "max",
+    "api.hbomax.com",
+    false,
+    MAX_ALLOWED_DOMAINS,
+    MAX_DIRECT_ALIASES,
+    MAX_REQUIRED_COOKIES,
+    MAX_AUTH_TARGETS,
+    MAX_OUTBOUND_COOKIES,
+);
+
 /// Validated cookie metadata. Values remain private so callers use the request-aware API
 /// for outbound requests instead of assembling an unscoped header themselves.
 pub(crate) struct ArtifactCookie {
@@ -1277,9 +1336,60 @@ mod tests {
     const NOW: i64 = 2_000_000_000;
     const FUTURE: i64 = NOW + 86_400;
     const SYNTHETIC_TOKEN: &str = "synthetic-twitch-token-0001";
+    const SYNTHETIC_MAX_TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.eyJhbm9ueW1vdXMiOmZhbHNlfQ.signature";
 
     fn prepare(bytes: Vec<u8>) -> Result<PreparedCookieArtifact, CookieArtifactError> {
         prepare_cookie_artifact_at(bytes, TWITCH_COOKIE_POLICY, NOW)
+    }
+
+    fn prepare_max(bytes: Vec<u8>) -> Result<PreparedCookieArtifact, CookieArtifactError> {
+        prepare_cookie_artifact_at(bytes, MAX_COOKIE_POLICY, NOW)
+    }
+
+    #[test]
+    fn max_cookie_is_scoped_to_explicit_first_party_api_hosts() {
+        let bytes =
+            format!(".api.hbomax.com\tTRUE\t/\tTRUE\t{FUTURE}\tst\t{SYNTHETIC_MAX_TOKEN}\n")
+                .into_bytes();
+        let artifact = prepare_max(bytes.clone()).expect("prepare synthetic HBO Max artifact");
+
+        assert_eq!(artifact.module_id(), "max");
+        assert_eq!(artifact.artifact_bytes(), bytes);
+        assert_eq!(
+            artifact
+                .cookie_header_for(CookieRequest::new(
+                    "default.beam-emea.prd.api.hbomax.com",
+                    "/users/me",
+                    true,
+                    NOW,
+                ))
+                .expect("allowed HBO Max API target"),
+            Some(format!("st={SYNTHETIC_MAX_TOKEN}"))
+        );
+        assert!(matches!(
+            artifact.cookie_header_for(CookieRequest::new(
+                "api.hbomax.com.evil.invalid",
+                "/users/me",
+                true,
+                NOW,
+            )),
+            Err(CookieHeaderError::TargetNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn max_direct_token_alias_requires_module_context() {
+        let unrelated = format!(r#"{{"token":"{SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
+        assert!(matches!(
+            prepare_max(unrelated),
+            Err(CookieArtifactError::UnsupportedFormat)
+        ));
+
+        let scoped =
+            format!(r#"{{"module":"max","token":"Bearer {SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
+        let artifact = prepare_max(scoped).expect("prepare scoped HBO Max alias");
+        assert_eq!(artifact.cookies()[0].name(), "st");
+        assert_eq!(artifact.cookies()[0].value(), SYNTHETIC_MAX_TOKEN);
     }
 
     #[test]

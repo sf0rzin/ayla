@@ -35,6 +35,7 @@ pub(crate) enum ModuleProbeStatus {
 pub(crate) enum ModulePlan {
     ChatGpt(ChatGptPlan),
     Twitch(TwitchPlan),
+    Max(MaxPlan),
 }
 
 impl ModulePlan {
@@ -42,6 +43,7 @@ impl ModulePlan {
         match self {
             Self::ChatGpt(plan) => chatgpt_plan_label(plan).to_string(),
             Self::Twitch(plan) => plan.label(),
+            Self::Max(plan) => plan.label(),
         }
     }
 
@@ -49,7 +51,112 @@ impl ModulePlan {
         match self {
             Self::ChatGpt(plan) => chatgpt_plan_slug(plan).to_string(),
             Self::Twitch(plan) => plan.slug(),
+            Self::Max(plan) => plan.slug(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MaxTier {
+    BasicWithAds,
+    Mobile,
+    Standard,
+    AdFree,
+    Premium,
+    Platinum,
+    Legacy,
+    #[default]
+    Unknown,
+}
+
+impl MaxTier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BasicWithAds => "Basic with Ads",
+            Self::Mobile => "Mobile",
+            Self::Standard => "Standard",
+            Self::AdFree => "Ad-Free",
+            Self::Premium => "Premium",
+            Self::Platinum => "Platinum",
+            Self::Legacy => "Legacy",
+            Self::Unknown => "Unknown plan",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::BasicWithAds => "basic-with-ads",
+            Self::Mobile => "mobile",
+            Self::Standard => "standard",
+            Self::AdFree => "ad-free",
+            Self::Premium => "premium",
+            Self::Platinum => "platinum",
+            Self::Legacy => "legacy",
+            Self::Unknown => "unknown-plan",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MaxSubscriptionState {
+    Active,
+    InGracePeriod,
+    PreActive,
+    Paused,
+    Cancelled,
+    Expired,
+    NoSubscription,
+    #[default]
+    Unknown,
+}
+
+impl MaxSubscriptionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::InGracePeriod => "In grace period",
+            Self::PreActive => "Pre-active",
+            Self::Paused => "Paused",
+            Self::Cancelled => "Cancelled",
+            Self::Expired => "Expired",
+            Self::NoSubscription => "No subscription",
+            Self::Unknown => "Unknown status",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::InGracePeriod => "grace",
+            Self::PreActive => "pre-active",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::NoSubscription => "no-subscription",
+            Self::Unknown => "unknown-status",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaxPlan {
+    pub(crate) tier: MaxTier,
+    pub(crate) state: MaxSubscriptionState,
+}
+
+impl MaxPlan {
+    pub(crate) fn label(self) -> String {
+        if self.state == MaxSubscriptionState::NoSubscription {
+            return self.state.label().to_string();
+        }
+        format!("{} ({})", self.tier.label(), self.state.label())
+    }
+
+    pub(crate) fn slug(self) -> String {
+        if self.state == MaxSubscriptionState::NoSubscription {
+            return self.state.slug().to_string();
+        }
+        format!("{}-{}", self.tier.slug(), self.state.slug())
     }
 }
 
@@ -143,5 +250,22 @@ mod tests {
         let plan = ModulePlan::ChatGpt(ChatGptPlan::Plus);
         assert_eq!(plan.label(), "Plus");
         assert_eq!(plan.slug(), "plus");
+    }
+
+    #[test]
+    fn max_plan_names_include_subscription_state_without_sensitive_data() {
+        let plan = ModulePlan::Max(MaxPlan {
+            tier: MaxTier::Premium,
+            state: MaxSubscriptionState::InGracePeriod,
+        });
+        assert_eq!(plan.label(), "Premium (In grace period)");
+        assert_eq!(plan.slug(), "premium-grace");
+
+        let no_subscription = MaxPlan {
+            tier: MaxTier::Unknown,
+            state: MaxSubscriptionState::NoSubscription,
+        };
+        assert_eq!(no_subscription.label(), "No subscription");
+        assert_eq!(no_subscription.slug(), "no-subscription");
     }
 }

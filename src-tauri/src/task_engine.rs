@@ -1,7 +1,7 @@
 use crate::{
     auth_artifact, catalog,
     chatgpt_client::{ChatGptPlan, ChatGptProbeResult, ChatGptProbeStatus, ChatGptProber},
-    cookie_artifact::{self, CookiePolicy, TWITCH_COOKIE_POLICY},
+    cookie_artifact::{self, CookiePolicy, MAX_COOKIE_POLICY, TWITCH_COOKIE_POLICY},
     module_probe::{
         CookieModuleProber, ModulePlan, ModuleProbeResult, ModuleProbeStatus, ProbeControl,
     },
@@ -687,6 +687,7 @@ impl TaskHandler for ModuleInspectionHandler {
 fn cookie_policy_for_module(module_id: &str) -> Option<CookiePolicy> {
     match module_id {
         "twitch" => Some(TWITCH_COOKIE_POLICY),
+        "max" => Some(MAX_COOKIE_POLICY),
         _ => None,
     }
 }

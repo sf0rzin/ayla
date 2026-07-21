@@ -3,6 +3,7 @@ import doordashLogo from "./assets/logos/doordash.svg";
 import grokLogo from "./assets/logos/grok.svg";
 import instagramLogo from "./assets/logos/instagram.svg";
 import kickLogo from "./assets/logos/kick.svg";
+import maxLogo from "./assets/logos/max.svg";
 import openaiLogo from "./assets/logos/openai.svg";
 import redditLogo from "./assets/logos/reddit.svg";
 import sephoraLogo from "./assets/logos/sephora.png";
@@ -20,6 +21,7 @@ const brandLogos: Record<string, string> = {
   grok: grokLogo,
   instagram: instagramLogo,
   kick: kickLogo,
+  max: maxLogo,
   reddit: redditLogo,
   sephora: sephoraLogo,
   spotify: spotifyLogo,
