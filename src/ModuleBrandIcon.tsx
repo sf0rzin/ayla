@@ -9,6 +9,7 @@ import sephoraLogo from "./assets/logos/sephora.png";
 import spotifyLogo from "./assets/logos/spotify.svg";
 import stockxLogo from "./assets/logos/stockx.svg";
 import tiktokLogo from "./assets/logos/tiktok.svg";
+import twitchLogo from "./assets/logos/twitch.svg";
 import uberLogo from "./assets/logos/uber.svg";
 import zaiLogo from "./assets/logos/zai.svg";
 
@@ -24,6 +25,7 @@ const brandLogos: Record<string, string> = {
   spotify: spotifyLogo,
   stockx: stockxLogo,
   tiktok: tiktokLogo,
+  twitch: twitchLogo,
   uber: uberLogo,
   zai: zaiLogo,
 };

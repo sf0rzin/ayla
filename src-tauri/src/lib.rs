@@ -1,11 +1,14 @@
 mod auth_artifact;
 mod catalog;
 mod chatgpt_client;
+mod cookie_artifact;
+mod module_probe;
 mod proxy;
 mod proxy_checker;
 mod proxy_store;
 mod settings;
 mod task_engine;
+mod twitch_client;
 
 use chatgpt_client::ChatGptProbePool;
 use proxy_checker::{CheckProxiesRequest, CheckProxiesResponse};
@@ -16,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use task_engine::{DiscoveryLimits, StartTaskRequest, TaskEngine, TaskHistoryEntry, TaskSnapshot};
 use tauri::{AppHandle, Manager, State};
+use twitch_client::TwitchProbePool;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,15 +178,41 @@ async fn start_task(app: AppHandle, request: StartTaskRequest) -> Result<TaskSna
         } else {
             Vec::new()
         };
-        let probe = ChatGptProbePool::new(current.timeout_ms, current.retries, &proxy_targets)?;
-        let proxy_count = probe.proxy_count();
-        let probe = Arc::new(probe);
         let discovery_limits = DiscoveryLimits::new(
             current.max_scan_directories,
             current.max_scan_files,
             current.scan_budget_mib,
         );
-        engine.start_with_chatgpt_probe(request, probe, proxy_count, discovery_limits)
+        let module_id = request.module_id.trim().to_ascii_lowercase();
+        match module_id.as_str() {
+            "chatgpt" => {
+                let probe =
+                    ChatGptProbePool::new(current.timeout_ms, current.retries, &proxy_targets)?;
+                let proxy_count = probe.proxy_count();
+                engine.start_with_chatgpt_probe(
+                    request,
+                    Arc::new(probe),
+                    proxy_count,
+                    discovery_limits,
+                )
+            }
+            "twitch" => {
+                let probe = TwitchProbePool::new(
+                    current.timeout_ms,
+                    current.retries,
+                    request.delay_ms,
+                    &proxy_targets,
+                )?;
+                let proxy_count = probe.proxy_count();
+                engine.start_with_cookie_probe(
+                    request,
+                    Arc::new(probe),
+                    proxy_count,
+                    discovery_limits,
+                )
+            }
+            _ => Err("module has not been migrated yet".to_string()),
+        }
     })
     .await
     .map_err(|error| format!("the task preparation was interrupted: {error}"))?

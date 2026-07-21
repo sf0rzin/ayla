@@ -22,6 +22,10 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3.3", features = ["socks-proxy"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wreq = { version = "=6.0.0-rc.29", features = ["brotli", "cookies", "deflate", "gzip", "json", "socks", "stream", "zstd"] }
+wreq-util = { version = "=3.0.0-rc.14", features = ["emulation-compression", "tokio-rt"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tauri-plugin-dialog = "2"
 

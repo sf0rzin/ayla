@@ -101,6 +101,16 @@ pub(crate) fn inspect_chatgpt_path_with_budget(
     }
 }
 
+/// Reads one regular local artifact under the same path, size, reparse-point, and
+/// aggregate-budget checks used by the ChatGPT parser. Other module parsers consume the
+/// returned owned bytes, so every module shares the same filesystem security boundary.
+pub(crate) fn read_artifact_path_with_budget(
+    path: &Path,
+    remaining_bytes: &AtomicU64,
+) -> Result<Vec<u8>, InspectionResult> {
+    read_limited(path, Some(remaining_bytes))
+}
+
 pub(crate) fn output_directory_is_local(path: &Path) -> bool {
     path.is_absolute() && !has_disallowed_path_prefix(path)
 }

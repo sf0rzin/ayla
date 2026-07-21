@@ -17,7 +17,7 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROXY_ATTEMPTS: usize = 4;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatGptPlan {
     Free,
     Go,

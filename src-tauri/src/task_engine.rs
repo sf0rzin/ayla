@@ -1,10 +1,14 @@
 use crate::{
     auth_artifact, catalog,
     chatgpt_client::{ChatGptPlan, ChatGptProbeResult, ChatGptProbeStatus, ChatGptProber},
+    cookie_artifact::{self, CookiePolicy, TWITCH_COOKIE_POLICY},
+    module_probe::{
+        CookieModuleProber, ModulePlan, ModuleProbeResult, ModuleProbeStatus, ProbeControl,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -178,6 +182,25 @@ impl ChatGptTaskSummary {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleTaskSummary {
+    pub active: usize,
+    pub dead: usize,
+    pub rate_limited: usize,
+    pub errors: usize,
+    pub invalid: usize,
+    pub plans: BTreeMap<String, usize>,
+}
+
+impl ModuleTaskSummary {
+    fn record_active(&mut self, plan: ModulePlan) {
+        self.active = self.active.saturating_add(1);
+        let counter = self.plans.entry(plan.label()).or_default();
+        *counter = counter.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
@@ -209,6 +232,7 @@ pub struct TaskSnapshot {
     pub exported_failed: usize,
     pub export_errors: usize,
     pub chatgpt: Option<ChatGptTaskSummary>,
+    pub module_summary: Option<ModuleTaskSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,7 +339,7 @@ impl CancellationToken {
 #[derive(Clone)]
 struct TaskContext {
     cancellation: CancellationToken,
-    chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
+    probe: Option<TaskProbe>,
 }
 
 impl TaskContext {
@@ -324,12 +348,29 @@ impl TaskContext {
     }
 }
 
+impl ProbeControl for TaskContext {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    fn wait_cancelled(&self, duration: Duration) -> bool {
+        self.cancellation.wait_cancelled(duration)
+    }
+}
+
+#[derive(Clone)]
+enum TaskProbe {
+    ChatGpt(Arc<dyn ChatGptProber>),
+    Cookie(Arc<dyn CookieModuleProber>),
+}
+
 #[derive(Clone, Copy)]
 enum HandlerOutcome {
     Succeeded,
     Failed,
     Skipped,
     ChatGpt(ChatGptProbeResult),
+    Module(ModuleProbeResult),
 }
 
 struct HandlerResult {
@@ -436,30 +477,29 @@ impl ResultExporter {
     }
 }
 
-fn export_classification(
-    outcome: HandlerOutcome,
-) -> Option<(bool, &'static str, Option<&'static str>)> {
+fn export_classification(outcome: HandlerOutcome) -> Option<(bool, String, Option<&'static str>)> {
     match outcome {
-        HandlerOutcome::Succeeded => Some((true, "unknown-plan", None)),
-        HandlerOutcome::Failed => Some((false, "unknown-plan", Some("invalid"))),
+        HandlerOutcome::Succeeded => Some((true, "unknown-plan".to_string(), None)),
+        HandlerOutcome::Failed => Some((false, "unknown-plan".to_string(), Some("invalid"))),
         HandlerOutcome::Skipped => None,
         HandlerOutcome::ChatGpt(result) => match result.status {
-            ChatGptProbeStatus::Active(plan) => Some((true, chatgpt_plan_slug(plan), None)),
-            ChatGptProbeStatus::Dead => Some((false, "unknown-plan", Some("dead"))),
-            ChatGptProbeStatus::RateLimited => Some((false, "unknown-plan", Some("rate-limited"))),
-            ChatGptProbeStatus::Error => Some((false, "unknown-plan", Some("error"))),
+            ChatGptProbeStatus::Active(plan) => {
+                Some((true, ModulePlan::ChatGpt(plan).slug(), None))
+            }
+            ChatGptProbeStatus::Dead => Some((false, "unknown-plan".to_string(), Some("dead"))),
+            ChatGptProbeStatus::RateLimited => {
+                Some((false, "unknown-plan".to_string(), Some("rate-limited")))
+            }
+            ChatGptProbeStatus::Error => Some((false, "unknown-plan".to_string(), Some("error"))),
         },
-    }
-}
-
-fn chatgpt_plan_slug(plan: ChatGptPlan) -> &'static str {
-    match plan {
-        ChatGptPlan::Free => "free",
-        ChatGptPlan::Go => "go",
-        ChatGptPlan::Plus => "plus",
-        ChatGptPlan::Pro => "pro",
-        ChatGptPlan::Team => "team",
-        ChatGptPlan::Enterprise => "enterprise",
+        HandlerOutcome::Module(result) => match result.status {
+            ModuleProbeStatus::Active(plan) => Some((true, plan.slug(), None)),
+            ModuleProbeStatus::Dead => Some((false, "unknown-plan".to_string(), Some("dead"))),
+            ModuleProbeStatus::RateLimited => {
+                Some((false, "unknown-plan".to_string(), Some("rate-limited")))
+            }
+            ModuleProbeStatus::Error => Some((false, "unknown-plan".to_string(), Some("error"))),
+        },
     }
 }
 
@@ -577,12 +617,13 @@ impl TaskHandler for ModuleInspectionHandler {
                 let budget = AtomicU64::new(auth_artifact::MAX_ARTIFACT_BYTES);
                 match auth_artifact::load_chatgpt_path_with_budget(path, &budget) {
                     auth_artifact::ChatGptArtifactPreparation::Ready(auth) => {
-                        let outcome = context
-                            .chatgpt_probe
-                            .as_ref()
-                            .map_or(HandlerOutcome::Succeeded, |probe| {
+                        let outcome = match context.probe.as_ref() {
+                            Some(TaskProbe::ChatGpt(probe)) => {
                                 HandlerOutcome::ChatGpt(probe.check(&auth))
-                            });
+                            }
+                            None => HandlerOutcome::Succeeded,
+                            Some(TaskProbe::Cookie(_)) => HandlerOutcome::Failed,
+                        };
                         HandlerResult {
                             outcome,
                             artifact_bytes: Some(auth.into_artifact_bytes()),
@@ -596,6 +637,41 @@ impl TaskHandler for ModuleInspectionHandler {
                     },
                 }
             }
+            _ if path.is_absolute() && cookie_policy_for_module(module_id).is_some() => {
+                let budget = AtomicU64::new(auth_artifact::MAX_ARTIFACT_BYTES);
+                match auth_artifact::read_artifact_path_with_budget(path, &budget) {
+                    Ok(artifact_bytes) => {
+                        // Keep the bounded original available for failed-result export. The
+                        // parser intentionally owns successful artifacts so validated bytes
+                        // cannot be separated from their parsed cookie metadata.
+                        let rejected_artifact_bytes = artifact_bytes.clone();
+                        match cookie_artifact::prepare_cookie_artifact(
+                            artifact_bytes,
+                            cookie_policy_for_module(module_id)
+                                .expect("guarded module cookie policy"),
+                        ) {
+                            Ok(artifact) => {
+                                let outcome = match context.probe.as_ref() {
+                                    Some(TaskProbe::Cookie(probe)) => {
+                                        HandlerOutcome::Module(probe.check(&artifact, context))
+                                    }
+                                    None => HandlerOutcome::Succeeded,
+                                    Some(TaskProbe::ChatGpt(_)) => HandlerOutcome::Failed,
+                                };
+                                HandlerResult {
+                                    outcome,
+                                    artifact_bytes: Some(artifact.into_artifact_bytes()),
+                                }
+                            }
+                            Err(_) => HandlerResult {
+                                outcome: HandlerOutcome::Failed,
+                                artifact_bytes: Some(rejected_artifact_bytes),
+                            },
+                        }
+                    }
+                    Err(_) => HandlerResult::without_artifact(HandlerOutcome::Failed),
+                }
+            }
             _ => HandlerResult::without_artifact(HandlerOutcome::Failed),
         };
         drop(value);
@@ -605,6 +681,13 @@ impl TaskHandler for ModuleInspectionHandler {
         } else {
             result
         }
+    }
+}
+
+fn cookie_policy_for_module(module_id: &str) -> Option<CookiePolicy> {
+    match module_id {
+        "twitch" => Some(TWITCH_COOKIE_POLICY),
+        _ => None,
     }
 }
 
@@ -712,13 +795,33 @@ impl TaskEngine {
         proxy_count: usize,
         discovery_limits: DiscoveryLimits,
     ) -> Result<TaskSnapshot, String> {
-        self.start_with_probe(request, Some(probe), proxy_count, discovery_limits)
+        self.start_with_probe(
+            request,
+            Some(TaskProbe::ChatGpt(probe)),
+            proxy_count,
+            discovery_limits,
+        )
+    }
+
+    pub(crate) fn start_with_cookie_probe(
+        &self,
+        request: StartTaskRequest,
+        probe: Arc<dyn CookieModuleProber>,
+        proxy_count: usize,
+        discovery_limits: DiscoveryLimits,
+    ) -> Result<TaskSnapshot, String> {
+        self.start_with_probe(
+            request,
+            Some(TaskProbe::Cookie(probe)),
+            proxy_count,
+            discovery_limits,
+        )
     }
 
     fn start_with_probe(
         &self,
         request: StartTaskRequest,
-        chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
+        probe: Option<TaskProbe>,
         proxy_count: usize,
         discovery_limits: DiscoveryLimits,
     ) -> Result<TaskSnapshot, String> {
@@ -770,6 +873,7 @@ impl TaskEngine {
             exported_failed: 0,
             export_errors: 0,
             chatgpt: (module_id == "chatgpt").then(ChatGptTaskSummary::default),
+            module_summary: Some(ModuleTaskSummary::default()),
         };
 
         let result_exporter = {
@@ -792,6 +896,14 @@ impl TaskEngine {
 
         self.inner.events.progress(snapshot.clone());
 
+        // Cookie-backed network probes own their global request limiter so retries and
+        // proxy failover are spaced as well. Other handlers keep the existing per-worker
+        // delay. The requested value remains visible in the snapshot either way.
+        let worker_delay_ms = if matches!(&probe, Some(TaskProbe::Cookie(_))) {
+            0
+        } else {
+            delay_ms
+        };
         let inner = Arc::clone(&self.inner);
         let worker_run_id = run_id.clone();
         let spawn_result = thread::Builder::new()
@@ -803,8 +915,8 @@ impl TaskEngine {
                     module_id,
                     inputs,
                     concurrency,
-                    delay_ms,
-                    chatgpt_probe,
+                    worker_delay_ms,
+                    probe,
                     cancellation,
                     result_exporter,
                 );
@@ -906,6 +1018,9 @@ impl EngineInner {
                         HandlerOutcome::Failed => {
                             active.snapshot.failed = active.snapshot.failed.saturating_add(1);
                             active.snapshot.processed = active.snapshot.processed.saturating_add(1);
+                            if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                summary.invalid = summary.invalid.saturating_add(1);
+                            }
                             if let Some(summary) = active.snapshot.chatgpt.as_mut() {
                                 summary.invalid = summary.invalid.saturating_add(1);
                             }
@@ -924,11 +1039,17 @@ impl EngineInner {
                                     if let Some(summary) = active.snapshot.chatgpt.as_mut() {
                                         summary.record_active(plan);
                                     }
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.record_active(ModulePlan::ChatGpt(plan));
+                                    }
                                 }
                                 ChatGptProbeStatus::Dead => {
                                     active.snapshot.failed =
                                         active.snapshot.failed.saturating_add(1);
                                     if let Some(summary) = active.snapshot.chatgpt.as_mut() {
+                                        summary.dead = summary.dead.saturating_add(1);
+                                    }
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
                                         summary.dead = summary.dead.saturating_add(1);
                                     }
                                 }
@@ -939,11 +1060,54 @@ impl EngineInner {
                                         summary.rate_limited =
                                             summary.rate_limited.saturating_add(1);
                                     }
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.rate_limited =
+                                            summary.rate_limited.saturating_add(1);
+                                    }
                                 }
                                 ChatGptProbeStatus::Error => {
                                     active.snapshot.failed =
                                         active.snapshot.failed.saturating_add(1);
                                     if let Some(summary) = active.snapshot.chatgpt.as_mut() {
+                                        summary.errors = summary.errors.saturating_add(1);
+                                    }
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.errors = summary.errors.saturating_add(1);
+                                    }
+                                }
+                            }
+                        }
+                        HandlerOutcome::Module(result) => {
+                            active.snapshot.processed = active.snapshot.processed.saturating_add(1);
+                            active.snapshot.retried =
+                                active.snapshot.retried.saturating_add(result.retries);
+                            match result.status {
+                                ModuleProbeStatus::Active(plan) => {
+                                    active.snapshot.succeeded =
+                                        active.snapshot.succeeded.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.record_active(plan);
+                                    }
+                                }
+                                ModuleProbeStatus::Dead => {
+                                    active.snapshot.failed =
+                                        active.snapshot.failed.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.dead = summary.dead.saturating_add(1);
+                                    }
+                                }
+                                ModuleProbeStatus::RateLimited => {
+                                    active.snapshot.failed =
+                                        active.snapshot.failed.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.rate_limited =
+                                            summary.rate_limited.saturating_add(1);
+                                    }
+                                }
+                                ModuleProbeStatus::Error => {
+                                    active.snapshot.failed =
+                                        active.snapshot.failed.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
                                         summary.errors = summary.errors.saturating_add(1);
                                     }
                                 }
@@ -1380,7 +1544,9 @@ fn structurally_ready_candidates(
         .enumerate()
         .filter_map(|(index, candidate)| candidate.from_directory.then_some(index))
         .collect();
-    if module_id != "chatgpt" || scan_indices.is_empty() {
+    if (module_id != "chatgpt" && cookie_policy_for_module(module_id).is_none())
+        || scan_indices.is_empty()
+    {
         return Ok(vec![true; candidates.len()]);
     }
 
@@ -1431,9 +1597,19 @@ fn structurally_ready_candidates(
                         break;
                     };
                     let path = Path::new(candidates[candidate_index].value.as_ref());
-                    let is_ready =
+                    let is_ready = if module_id == "chatgpt" {
                         auth_artifact::inspect_chatgpt_path_with_budget(path, remaining_bytes)
-                            == auth_artifact::InspectionResult::Ready;
+                            == auth_artifact::InspectionResult::Ready
+                    } else if let Some(policy) = cookie_policy_for_module(module_id) {
+                        auth_artifact::read_artifact_path_with_budget(path, remaining_bytes)
+                            .ok()
+                            .and_then(|bytes| {
+                                cookie_artifact::prepare_cookie_artifact(bytes, policy).ok()
+                            })
+                            .is_some()
+                    } else {
+                        false
+                    };
                     ready[candidate_index].store(is_ready, Ordering::Release);
                 }
             });
@@ -1595,7 +1771,7 @@ fn run_task(
     inputs: VecDeque<TaskInput>,
     concurrency: usize,
     delay_ms: u64,
-    chatgpt_probe: Option<Arc<dyn ChatGptProber>>,
+    probe: Option<TaskProbe>,
     cancellation: CancellationToken,
     result_exporter: Option<Arc<ResultExporter>>,
 ) {
@@ -1617,7 +1793,7 @@ fn run_task(
         let handler = Arc::clone(&inner.handler);
         let context = TaskContext {
             cancellation: cancellation.clone(),
-            chatgpt_probe: chatgpt_probe.clone(),
+            probe: probe.clone(),
         };
         let result_exporter = result_exporter.clone();
         let result = thread::Builder::new()
@@ -1834,7 +2010,8 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use crate::module_probe::{TwitchPlan, TwitchRole};
+    use std::collections::{HashSet, VecDeque};
 
     #[derive(Default)]
     struct RecordingEvents {
@@ -1928,6 +2105,30 @@ mod tests {
         }
     }
 
+    struct SequencedCookieProber {
+        results: Mutex<VecDeque<ModuleProbeResult>>,
+    }
+
+    impl SequencedCookieProber {
+        fn new(results: impl IntoIterator<Item = ModuleProbeResult>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+
+    impl CookieModuleProber for SequencedCookieProber {
+        fn check(
+            &self,
+            _artifact: &cookie_artifact::PreparedCookieArtifact,
+            _control: &dyn ProbeControl,
+        ) -> ModuleProbeResult {
+            lock_unpoison(&self.results)
+                .pop_front()
+                .expect("one synthetic result per artifact")
+        }
+    }
+
     fn write_ready_artifact(path: &Path, index: usize) {
         let token = format!("synthetic_scan_{index:04}_{}", "A".repeat(48));
         fs::write(
@@ -1948,6 +2149,15 @@ mod tests {
             ),
         )
         .expect("write expired fixture");
+    }
+
+    fn write_twitch_artifact(path: &Path, index: usize) {
+        let token = format!("synthetic_twitch_{index:04}_{}", "T".repeat(48));
+        fs::write(
+            path,
+            format!(".twitch.tv\tTRUE\t/\tTRUE\t4102444800\tauth-token\t{token}\n"),
+        )
+        .expect("write structurally ready Twitch fixture");
     }
 
     fn request(
@@ -1987,6 +2197,21 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("task did not finish in time: {run_id}");
+    }
+
+    fn wait_for_done(events: &RecordingEvents, run_id: &str) -> TaskSnapshot {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if let Some(snapshot) = lock_unpoison(&events.done)
+                .iter()
+                .find(|snapshot| snapshot.run_id == run_id)
+                .cloned()
+            {
+                return snapshot;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("done event did not arrive: {run_id}");
     }
 
     #[test]
@@ -2556,6 +2781,101 @@ mod tests {
     }
 
     #[test]
+    fn twitch_probe_updates_generic_summary_without_chatgpt_regression() {
+        let source_directory = tempfile::tempdir().expect("temporary source directory");
+        let state_directory = tempfile::tempdir().expect("temporary state directory");
+        let mut entries = Vec::new();
+        for index in 0..4 {
+            let path = source_directory.path().join(format!("twitch-{index}.txt"));
+            write_twitch_artifact(&path, index);
+            entries.push(path.display().to_string());
+        }
+
+        let events = Arc::new(RecordingEvents::default());
+        let engine = test_engine(
+            state_directory.path().join("task_history.json"),
+            Arc::new(ModuleInspectionHandler),
+            events.clone(),
+        );
+        let probe = Arc::new(SequencedCookieProber::new([
+            ModuleProbeResult {
+                status: ModuleProbeStatus::Active(ModulePlan::Twitch(TwitchPlan {
+                    has_prime: true,
+                    has_turbo: false,
+                    role: TwitchRole::Affiliate,
+                })),
+                retries: 2,
+            },
+            ModuleProbeResult {
+                status: ModuleProbeStatus::Dead,
+                retries: 1,
+            },
+            ModuleProbeResult {
+                status: ModuleProbeStatus::RateLimited,
+                retries: 3,
+            },
+            ModuleProbeResult {
+                status: ModuleProbeStatus::Error,
+                retries: 0,
+            },
+        ]));
+
+        let started = engine
+            .start_with_cookie_probe(
+                request("twitch", entries, 1, 0),
+                probe,
+                0,
+                DiscoveryLimits::default(),
+            )
+            .expect("start Twitch task");
+        let history = wait_for_history(&engine, &started.run_id);
+        let done = wait_for_done(&events, &started.run_id);
+
+        assert_eq!(history.succeeded, 1);
+        assert_eq!(history.failed, 3);
+        assert_eq!(done.retried, 6);
+        assert!(done.chatgpt.is_none());
+        assert_eq!(
+            done.module_summary,
+            Some(ModuleTaskSummary {
+                active: 1,
+                dead: 1,
+                rate_limited: 1,
+                errors: 1,
+                invalid: 0,
+                plans: BTreeMap::from([("Prime + Affiliate".to_string(), 1)]),
+            })
+        );
+    }
+
+    #[test]
+    fn twitch_directory_prefilter_only_queues_endpoint_usable_auth() {
+        let source_directory = tempfile::tempdir().expect("temporary source directory");
+        write_twitch_artifact(&source_directory.path().join("valid.txt"), 1);
+        fs::write(
+            source_directory.path().join("wrong-scope.txt"),
+            format!(
+                "help.twitch.tv\tFALSE\t/\tTRUE\t4102444800\tauth-token\tsynthetic_twitch_wrong_scope_{}\n",
+                "W".repeat(48)
+            ),
+        )
+        .expect("write wrong-scope Twitch fixture");
+
+        let prepared = prepare(request(
+            "twitch",
+            [source_directory.path().display().to_string()],
+            1,
+            0,
+        ))
+        .expect("prepare Twitch directory");
+
+        assert_eq!(prepared.discovered, 2);
+        assert_eq!(prepared.locally_filtered, 1);
+        assert_eq!(prepared.inputs.len(), 1);
+        assert!(prepared.inputs[0].0.ends_with("valid.txt"));
+    }
+
+    #[test]
     fn result_exporter_routes_plan_results_without_overwriting() {
         let output_directory = tempfile::tempdir().expect("temporary output directory");
         let output_root = fs::canonicalize(output_directory.path()).expect("resolve output root");
@@ -2616,6 +2936,39 @@ mod tests {
         assert_eq!(
             fs::read(active_path).expect("read preserved copy"),
             b"active-cookie-bytes"
+        );
+    }
+
+    #[test]
+    fn result_exporter_uses_module_plan_slug_for_twitch() {
+        let output_directory = tempfile::tempdir().expect("temporary output directory");
+        let output_root = fs::canonicalize(output_directory.path()).expect("resolve output root");
+        let exporter = ResultExporter::new(&output_root, "twitch", "task_123456789abc0000_1")
+            .expect("create Twitch exporter");
+        let run_tag = format!("123456789abc-p{:x}", std::process::id());
+
+        assert_eq!(
+            exporter.export(
+                7,
+                HandlerOutcome::Module(ModuleProbeResult {
+                    status: ModuleProbeStatus::Active(ModulePlan::Twitch(TwitchPlan {
+                        has_prime: true,
+                        has_turbo: true,
+                        role: TwitchRole::Partner,
+                    })),
+                    retries: 0,
+                }),
+                Some(b"synthetic-twitch-cookie-bytes"),
+            ),
+            ExportRecord::Active
+        );
+
+        let exported = output_directory.path().join(format!(
+            "twitch/active/prime-turbo-partner__{run_tag}__000007.txt"
+        ));
+        assert_eq!(
+            fs::read(exported).expect("read Twitch result copy"),
+            b"synthetic-twitch-cookie-bytes"
         );
     }
 
