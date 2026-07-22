@@ -4,7 +4,7 @@ Before changing Ayla, read `README.md` and `docs/forge-build.md`. Never commit c
 
 The canonical validation command is `npm run check`. Windows release builds run on Forge; do not assume that a local Linux or macOS build proves the Tauri Windows package works.
 
-A push to `main` is detected by the Forge poller within two minutes and built automatically. To request or retry a build immediately, run this from the private Rindexx project:
+A push to `main` is normally detected by the Forge watcher within about 15 seconds and built automatically. To request or retry a build immediately, run this from the private Rindexx project:
 
 ```powershell
 & '.\infra\nyx\forge\Invoke-AylaBuild.ps1' -Ref main
