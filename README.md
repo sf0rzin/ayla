@@ -1,75 +1,92 @@
+<p align="center">
+  <img src="docs/assets/ayla-banner.png" alt="Ayla over an aurora-lit mountain landscape" width="100%" />
+</p>
+
 # Ayla
 
-Desktop application built with Rust, Tauri 2, and React/TypeScript. The project is being rebuilt incrementally, keeping the Rust core separate from the interface so the design can be replaced entirely.
+**A Windows desktop application for authorized session validation.**
 
-## Current state
+Ayla brings bounded Rust task execution, service-specific validation, optional proxy routing, and deterministic result export into one local workflow. Its interface is built with React and TypeScript; security-sensitive processing stays in the Tauri 2 backend.
 
-- Tauri 2 desktop shell.
-- Catalog of 15 modules, with ChatGPT, Twitch, and HBO Max available in the current MVP.
-- Local settings validated and persisted by the backend.
-- Rust proxy parser with deduplication and support for HTTP(S), SOCKS4, and SOCKS5.
-- Proxy manager with import, persistence, removal, and clearing.
-- Concurrent checking with real-time progress, timeout, and cancellation.
-- Rust task engine running in the background, with aggregated progress, selective cancellation, and a safe history.
-- ChatGPT MVP: local artifact filtering, authenticated session/plan validation, and optional proxy.
-- Twitch MVP: bounded Netscape/JSON parsing, authenticated GraphQL validation, Prime/Turbo/role classification, browser-compatible TLS transport, retry/rate limiting, and optional HTTP/SOCKS proxies with a bounded lazy client cache for large pools.
-- HBO Max MVP: bounded scoped-cookie parsing, authenticated user and subscription validation, plan/state classification, bounded retries, and optional HTTP/SOCKS proxies.
-- Module-neutral summaries and result export into `<module>/active` and `<module>/failed` without modifying the source files.
-- `Tasks` page to prepare runs, follow the active work, and review previous summaries.
-- Desktop interface based on the Grafite DS provided by the user.
-- Custom window bar, three-pane navigation, Geist, and local Lucide icons.
-- Unit tests and simulated local servers for HTTP, SOCKS4a, and SOCKS5.
+> [!IMPORTANT]
+> Ayla is an early-stage MVP. Use it only with accounts, session artifacts, proxies, and systems that you own or are explicitly authorized to test.
 
-Proxies that do not respond are removed after the check, following the behavior of the reference project. Each proxy update is now O(1), with a single persistence at the end of the round, work distribution by atomic cursor, a bounded channel, and a total per-proxy timeout.
+## Workflow
 
-The engine accepts one global run at a time in this stage. Before starting, it removes blanks and duplicates in O(n) while preserving order, and limits the run to 10,000 unique files, 20,000 raw lines, 32 KiB per line, 32 MiB of paths, 512 MiB of artifacts, and 32 workers. Paths exist only in the IPC payload and in the run's transient memory: they never enter events, logs, or history, and are not persisted.
+1. Select individual artifacts or folders to scan recursively.
+2. Ayla filters unsupported and structurally invalid files locally.
+3. The selected module validates eligible sessions directly or through the active proxy pool.
+4. Aggregated progress is reported in the app, with optional classified copies exported to a directory you choose.
 
-The ChatGPT, Twitch, and HBO Max adapters read at most 2 MiB per file, validate domain, path, expiration, values, JSON complexity, and cookie count, and then confirm the session against their authenticated endpoints. Clients preserve timeout, retries, concurrency, cancellation, and active HTTP/SOCKS proxies. Paths, cookies, tokens, and account identifiers do not enter events, logs, or history; the interface receives only aggregated counts. An authenticated HBO Max session without a usable entitlement remains distinct from a dead session and is copied to `max/failed` with the `no-entitlement` reason when result export is enabled. If authentication succeeds but plan lookup remains unavailable after bounded retry and proxy failover, Ayla reports that state separately and tags the active export as `plan-unavailable` instead of inventing an entitlement.
+Source artifacts are never modified.
+
+## Module coverage
+
+| Module | Status | Validation |
+| --- | --- | --- |
+| ChatGPT | Available | Authenticated session and plan classification |
+| Twitch | Preview | Authentication, Prime, Turbo, and role classification |
+| HBO Max | Preview | Authentication, entitlement, and subscription-state classification |
+
+Twitch and HBO Max have isolated adapters and synthetic test coverage. Verification with dedicated live test accounts is still pending. The other twelve catalog modules remain intentionally disabled until their adapters are implemented and tested.
+
+## Core capabilities
+
+- Bounded recursive discovery with configurable directory, file, and scan limits.
+- Cancellable background tasks with controlled concurrency, retries, delays, and aggregate-only history.
+- Proxy import, normalization, deduplication, persistence, and concurrent health checks.
+- Direct connections and user-provided HTTP, SOCKS4a, and SOCKS5h proxy routes.
+- Module-scoped cookie parsing with domain, path, expiry, size, and complexity checks.
+- Optional result export that preserves the original artifact and classifies a copy by outcome.
+
+## Result layout
+
+When export is enabled, Ayla creates an isolated structure inside the selected directory:
+
+```text
+<selected-directory>/
+└── <module>/
+    ├── active/
+    └── failed/
+```
+
+Exported filenames contain classification labels and an opaque run identifier. Account identifiers are not used in filenames.
+
+## Privacy and security
+
+- Cookies, sessions, tokens, proxy lists, account material, generated results, `.env` files, and `tdata` directories must remain outside the repository.
+- Selected source paths and session material are designed to stay out of application events, logs, and persisted task history; the interface receives aggregate task data.
+- Authenticated validation contacts the relevant service endpoints and can use a configured proxy when requested.
+- Proxy configuration is stored in the local application data directory. Authentication fields are withheld from interface responses, but the current proxy store is not encrypted at rest; protect the Windows profile accordingly.
+- The normal test suite uses synthetic fixtures. Tests requiring authorized external data are opt-in and ignored by default.
 
 ## Development
 
-Prerequisites: Node.js, stable Rust with the MSVC target, Visual Studio C++ Build Tools, WebView2, CMake, NASM, and libclang. The last three are required by the BoringSSL transport used for browser-compatible TLS on Windows; `LIBCLANG_PATH` must point to the directory containing `libclang.dll` when LLVM is not on `PATH`.
+### Requirements
+
+- Windows with the MSVC toolchain; release packages are validated on Forge running Windows 11
+- Node.js and npm
+- Stable Rust with the MSVC target
+- Visual Studio C++ Build Tools and WebView2
+- CMake, NASM, and libclang
+
+`LIBCLANG_PATH` must point to the directory containing `libclang.dll` when LLVM is not available on `PATH`.
+
+### Run locally
 
 ```powershell
-npm install
+npm ci
 npm run tauri dev
 ```
 
-Full validation:
+### Validate
 
 ```powershell
 npm run check
 ```
 
-## Structure
+`npm run check` is the canonical validation command and runs the production frontend build followed by the Rust test suite.
 
-```text
-src/                    React desktop interface
-src-tauri/src/catalog.rs module catalog
-src-tauri/src/auth_artifact.rs local parser and structural ChatGPT classification
-src-tauri/src/cookie_artifact.rs bounded module-scoped cookie parser
-src-tauri/src/module_probe.rs module-neutral probe results and plan labels
-src-tauri/src/twitch_client.rs authenticated Twitch transport and classification
-src-tauri/src/max_client.rs authenticated HBO Max transport and subscription classification
-src-tauri/src/proxy.rs   proxy parser and normalization
-src-tauri/src/proxy_store.rs list persistence and operations
-src-tauri/src/proxy_checker.rs concurrent checking and protocols
-src-tauri/src/task_engine.rs task engine, progress, cancellation, and history
-src-tauri/src/settings.rs settings and persistence
-src-tauri/src/lib.rs     commands exposed to the interface
-```
+## Windows builds
 
-## Interface
-
-The components are written in React and wired to the Rust backend; the original HTML prototype is not needed at runtime.
-
-## Security
-
-Cookies, sessions, licenses, real proxies, results, and `tdata` folders must not be added to the repository. The normal suite uses only synthetic data. External examples stay outside the project: the app reads only explicitly provided paths and the ignored test requires opt-in; both return only aggregated totals. The task history stores summaries exclusively: no entry, path, or credential is recorded.
-
-## Next steps
-
-1. Migrate the next modules individually, keeping each integration isolated and tested.
-2. Authentication/licensing with secure storage.
-3. Evolve scheduling toward multiple global runs, when needed.
-4. Isolated migration of Telegram `tdata` support.
+Release packages are produced on the dedicated Forge Windows environment. See [Building Ayla on Forge](docs/forge-build.md) for the trusted build and artifact workflow.
