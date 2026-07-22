@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   probe:
-    runs-on: [self-hosted, Windows, X64, forge, ayla]
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Confirm runner execution
