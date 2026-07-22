@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   probe:
-    runs-on: self-hosted
+    runs-on: windows-latest
     timeout-minutes: 5
     steps:
       - name: Confirm runner execution
