@@ -1,0 +1,69 @@
+name: Forge build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-ayla-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Validate and package on Forge
+    runs-on: [self-hosted, Windows, X64, forge, ayla, rust, tauri]
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: 'C:\Users\forgeadmin\.cargo'
+      RUSTUP_HOME: 'C:\Users\forgeadmin\.rustup'
+      CARGO_TARGET_DIR: 'C:\actions-cache\Ayla\target'
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out Ayla
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Activate the Forge toolchain
+        shell: pwsh
+        run: |
+          @(
+            'C:\Users\forgeadmin\.cargo\bin'
+            'C:\Program Files\nodejs'
+            'C:\Program Files\Git\cmd'
+          ) | Add-Content -LiteralPath $env:GITHUB_PATH
+
+      - name: Report tool versions
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+
+      - name: Install locked frontend dependencies
+        shell: pwsh
+        run: npm ci --no-audit --no-fund
+
+      - name: Validate frontend and Rust tests
+        shell: pwsh
+        run: npm run check
+
+      - name: Build the Windows application and NSIS installer
+        shell: pwsh
+        run: npm run tauri -- build --bundles nsis
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ayla-windows-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}\release\ayla.exe
+            ${{ env.CARGO_TARGET_DIR }}\release\bundle\nsis\*.exe
