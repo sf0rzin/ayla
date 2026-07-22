@@ -29,6 +29,8 @@ To request a build immediately or retry the current commit, run from the Rindexx
 
 The persistent target directory and release-profile tests let the test/package stages reuse Rust output. `npm ci` is skipped when both `package-lock.json` and the existing `node_modules` match. These are caches, not backups, and can be deleted when diagnosing stale build output; the next build recreates them.
 
+Observed on the first fully warm optimized run on 2026-07-22: Forge detected the push in 6.7 seconds and completed tests plus the Windows executable and NSIS installer in 14.5 seconds. Changes that invalidate more Rust dependencies will take longer; cold caches still require a full rebuild.
+
 ## Troubleshooting for an agent
 
 If a pushed commit is not built, use the direct command first. Then check the scheduled task and poller log in the Rindexx infrastructure task. The poller attempts a commit only once; a manual direct build is the approved retry path.
