@@ -186,6 +186,8 @@ impl ChatGptTaskSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ModuleTaskSummary {
     pub active: usize,
+    pub authenticated_unknown: usize,
+    pub no_entitlement: usize,
     pub dead: usize,
     pub rate_limited: usize,
     pub errors: usize,
@@ -196,6 +198,20 @@ pub struct ModuleTaskSummary {
 impl ModuleTaskSummary {
     fn record_active(&mut self, plan: ModulePlan) {
         self.active = self.active.saturating_add(1);
+        self.record_plan(plan);
+    }
+
+    fn record_no_entitlement(&mut self, plan: ModulePlan) {
+        self.no_entitlement = self.no_entitlement.saturating_add(1);
+        self.record_plan(plan);
+    }
+
+    fn record_authenticated(&mut self, plan: ModulePlan) {
+        self.authenticated_unknown = self.authenticated_unknown.saturating_add(1);
+        self.record_plan(plan);
+    }
+
+    fn record_plan(&mut self, plan: ModulePlan) {
         let counter = self.plans.entry(plan.label()).or_default();
         *counter = counter.saturating_add(1);
     }
@@ -494,6 +510,12 @@ fn export_classification(outcome: HandlerOutcome) -> Option<(bool, String, Optio
         },
         HandlerOutcome::Module(result) => match result.status {
             ModuleProbeStatus::Active(plan) => Some((true, plan.slug(), None)),
+            ModuleProbeStatus::Authenticated(plan) => {
+                Some((true, plan.slug(), Some("plan-unavailable")))
+            }
+            ModuleProbeStatus::NoEntitlement(plan) => {
+                Some((false, plan.slug(), Some("no-entitlement")))
+            }
             ModuleProbeStatus::Dead => Some((false, "unknown-plan".to_string(), Some("dead"))),
             ModuleProbeStatus::RateLimited => {
                 Some((false, "unknown-plan".to_string(), Some("rate-limited")))
@@ -1088,6 +1110,20 @@ impl EngineInner {
                                         active.snapshot.succeeded.saturating_add(1);
                                     if let Some(summary) = active.snapshot.module_summary.as_mut() {
                                         summary.record_active(plan);
+                                    }
+                                }
+                                ModuleProbeStatus::Authenticated(plan) => {
+                                    active.snapshot.succeeded =
+                                        active.snapshot.succeeded.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.record_authenticated(plan);
+                                    }
+                                }
+                                ModuleProbeStatus::NoEntitlement(plan) => {
+                                    active.snapshot.failed =
+                                        active.snapshot.failed.saturating_add(1);
+                                    if let Some(summary) = active.snapshot.module_summary.as_mut() {
+                                        summary.record_no_entitlement(plan);
                                     }
                                 }
                                 ModuleProbeStatus::Dead => {
@@ -2011,7 +2047,7 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module_probe::{TwitchPlan, TwitchRole};
+    use crate::module_probe::{MaxPlan, MaxSubscriptionState, MaxTier, TwitchPlan, TwitchRole};
     use std::collections::{HashSet, VecDeque};
 
     #[derive(Default)]
@@ -2159,6 +2195,15 @@ mod tests {
             format!(".twitch.tv\tTRUE\t/\tTRUE\t4102444800\tauth-token\t{token}\n"),
         )
         .expect("write structurally ready Twitch fixture");
+    }
+
+    fn write_max_artifact(path: &Path, index: usize) {
+        let token = format!("synthetic_max_{index:04}_{}", "M".repeat(48));
+        fs::write(
+            path,
+            format!(".api.hbomax.com\tTRUE\t/\tTRUE\t4102444800\tst\t{token}\n"),
+        )
+        .expect("write structurally ready Max fixture");
     }
 
     fn request(
@@ -2840,12 +2885,110 @@ mod tests {
             done.module_summary,
             Some(ModuleTaskSummary {
                 active: 1,
+                authenticated_unknown: 0,
+                no_entitlement: 0,
                 dead: 1,
                 rate_limited: 1,
                 errors: 1,
                 invalid: 0,
                 plans: BTreeMap::from([("Prime + Affiliate".to_string(), 1)]),
             })
+        );
+    }
+
+    #[test]
+    fn max_no_entitlement_is_counted_and_exported_without_marking_the_session_dead() {
+        let source_directory = tempfile::tempdir().expect("temporary source directory");
+        let output_directory = tempfile::tempdir().expect("temporary output directory");
+        let state_directory = tempfile::tempdir().expect("temporary state directory");
+        let source = source_directory.path().join("max.txt");
+        write_max_artifact(&source, 1);
+        let source_bytes = fs::read(&source).expect("read Max source bytes");
+        let plan = MaxPlan {
+            tier: MaxTier::Premium,
+            state: MaxSubscriptionState::Cancelled,
+        };
+
+        let events = Arc::new(RecordingEvents::default());
+        let engine = test_engine(
+            state_directory.path().join("task_history.json"),
+            Arc::new(ModuleInspectionHandler),
+            events.clone(),
+        );
+        let probe = Arc::new(SequencedCookieProber::new([ModuleProbeResult {
+            status: ModuleProbeStatus::NoEntitlement(ModulePlan::Max(plan)),
+            retries: 1,
+        }]));
+        let mut task_request = request("max", [source.display().to_string()], 1, 0);
+        task_request.output_directory = Some(output_directory.path().display().to_string());
+
+        let started = engine
+            .start_with_cookie_probe(task_request, probe, 0, DiscoveryLimits::default())
+            .expect("start Max task");
+        let history = wait_for_history(&engine, &started.run_id);
+        let done = wait_for_done(&events, &started.run_id);
+
+        assert_eq!(history.succeeded, 0);
+        assert_eq!(history.failed, 1);
+        assert_eq!(history.exported_active, 0);
+        assert_eq!(history.exported_failed, 1);
+        assert_eq!(done.retried, 1);
+        assert_eq!(
+            done.module_summary,
+            Some(ModuleTaskSummary {
+                active: 0,
+                authenticated_unknown: 0,
+                no_entitlement: 1,
+                dead: 0,
+                rate_limited: 0,
+                errors: 0,
+                invalid: 0,
+                plans: BTreeMap::from([(plan.label(), 1)]),
+            })
+        );
+
+        let run_prefix: String = started
+            .run_id
+            .trim_start_matches("task_")
+            .chars()
+            .filter(|character| character.is_ascii_hexdigit())
+            .take(12)
+            .collect();
+        let exported = output_directory.path().join(format!(
+            "max/failed/premium-cancelled__no-entitlement__{run_prefix}-p{:x}__000001.txt",
+            std::process::id()
+        ));
+        assert_eq!(
+            fs::read(exported).expect("read exported Max result"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn authenticated_max_with_unknown_plan_stays_distinct_and_exports_as_active() {
+        let plan = ModulePlan::Max(MaxPlan::default());
+        let outcome = HandlerOutcome::Module(ModuleProbeResult {
+            status: ModuleProbeStatus::Authenticated(plan),
+            retries: 2,
+        });
+        assert_eq!(
+            export_classification(outcome),
+            Some((
+                true,
+                "unknown-plan-unknown-status".to_string(),
+                Some("plan-unavailable"),
+            ))
+        );
+
+        let mut summary = ModuleTaskSummary::default();
+        summary.record_authenticated(plan);
+        assert_eq!(summary.active, 0);
+        assert_eq!(summary.authenticated_unknown, 1);
+        assert_eq!(summary.no_entitlement, 0);
+        assert_eq!(summary.dead, 0);
+        assert_eq!(
+            summary.plans,
+            BTreeMap::from([("Unknown plan (Unknown status)".to_string(), 1)])
         );
     }
 

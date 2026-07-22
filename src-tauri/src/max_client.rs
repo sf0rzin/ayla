@@ -30,8 +30,12 @@ const DISCO_PARAMS: &str = "realm=bolt,bid=beam,features=ar";
 const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROXY_ATTEMPTS: usize = 3;
+const MAX_ROUTE_ATTEMPTS: usize = 3;
+const MAX_REQUESTS_PER_CHECK: usize = 9;
 const MAX_CACHED_PROXY_CLIENTS: usize = 128;
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
+const DEVICE_COOKIE_NAME: &str = "GI_WEB_SDK_SONIC_DEVICE_ID";
 const CANCELLATION_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
@@ -213,8 +217,15 @@ impl MaxProbePool {
         client: &Client,
         artifact: &PreparedCookieArtifact,
         control: &dyn ProbeControl,
+        retry_same_route: bool,
+        request_budget: &mut usize,
     ) -> Result<ModuleProbeResult, ProbeFailure> {
-        let attempts = usize::from(self.retries) + 1;
+        let attempts = if retry_same_route {
+            (usize::from(self.retries) + 1).min(MAX_ROUTE_ATTEMPTS)
+        } else {
+            1
+        };
+        let mut saw_authenticated_unknown = false;
         for attempt in 0..attempts {
             if control.is_cancelled() {
                 return Err(ProbeFailure {
@@ -232,20 +243,34 @@ impl MaxProbePool {
                 });
             }
 
-            let result =
-                self.runtime
-                    .block_on(probe_once(client, artifact, &self.limiter, control));
+            let result = self.runtime.block_on(probe_once(
+                client,
+                artifact,
+                &self.limiter,
+                control,
+                request_budget,
+            ));
             match result {
-                Ok(plan) => {
+                Ok(status) => {
                     return Ok(ModuleProbeResult {
-                        status: ModuleProbeStatus::Active(ModulePlan::Max(plan)),
+                        status,
                         retries: attempt,
                     });
                 }
+                Err(FailureKind::AuthenticatedUnknown) if attempt + 1 < attempts => {
+                    saw_authenticated_unknown = true;
+                }
                 Err(kind) if attempt + 1 < attempts && kind.retryable() => {}
                 Err(kind) => {
+                    if kind == FailureKind::AuthenticatedUnknown {
+                        saw_authenticated_unknown = true;
+                    }
                     return Err(ProbeFailure {
-                        kind,
+                        kind: if saw_authenticated_unknown && kind != FailureKind::Cancelled {
+                            FailureKind::AuthenticatedUnknown
+                        } else {
+                            kind
+                        },
                         retries: attempt,
                     });
                 }
@@ -274,10 +299,13 @@ impl CookieModuleProber for MaxProbePool {
         }
 
         let start = self.next_route.fetch_add(1, Ordering::Relaxed) % route_count;
+        let retry_same_route = route_count == 1;
         let mut retries = 0usize;
         let mut route_offset = 0usize;
         let mut network_attempts = 0usize;
+        let mut request_budget = MAX_REQUESTS_PER_CHECK;
         let mut last_failure = None;
+        let mut saw_authenticated_unknown = false;
         while route_offset < route_count && network_attempts < MAX_PROXY_ATTEMPTS {
             let route_index = (start + route_offset) % route_count;
             route_offset = route_offset.saturating_add(1);
@@ -289,15 +317,30 @@ impl CookieModuleProber for MaxProbePool {
                 }
             };
             network_attempts = network_attempts.saturating_add(1);
-            match self.check_with_client(&client, artifact, control) {
+            match self.check_with_client(
+                &client,
+                artifact,
+                control,
+                retry_same_route,
+                &mut request_budget,
+            ) {
                 Ok(mut result) => {
                     result.retries = result.retries.saturating_add(retries);
                     return result;
                 }
                 Err(failure) => {
                     retries = retries.saturating_add(failure.retries);
-                    last_failure = Some(failure.kind);
-                    if failure.kind.can_failover()
+                    if failure.kind == FailureKind::AuthenticatedUnknown {
+                        saw_authenticated_unknown = true;
+                    }
+                    let effective_kind =
+                        if saw_authenticated_unknown && failure.kind != FailureKind::Cancelled {
+                            FailureKind::AuthenticatedUnknown
+                        } else {
+                            failure.kind
+                        };
+                    last_failure = Some(effective_kind);
+                    if effective_kind.can_failover()
                         && network_attempts < MAX_PROXY_ATTEMPTS
                         && route_offset < route_count
                     {
@@ -305,7 +348,7 @@ impl CookieModuleProber for MaxProbePool {
                         continue;
                     }
                     return ModuleProbeResult {
-                        status: failure.kind.status(),
+                        status: effective_kind.status(),
                         retries,
                     };
                 }
@@ -319,9 +362,8 @@ impl CookieModuleProber for MaxProbePool {
     }
 }
 
-#[derive(Debug)]
 struct MaxAuthContext {
-    cookie_header: String,
+    token: String,
     api_root: &'static str,
     device_id: String,
 }
@@ -331,9 +373,54 @@ async fn probe_once(
     artifact: &PreparedCookieArtifact,
     limiter: &RequestLimiter,
     control: &dyn ProbeControl,
-) -> Result<MaxPlan, FailureKind> {
+    request_budget: &mut usize,
+) -> Result<ModuleProbeStatus, FailureKind> {
     let now = now_unix().ok_or(FailureKind::Permanent)?;
-    let auth = auth_context(artifact, now)?;
+    let contexts = auth_contexts(artifact, now)?;
+    let mut saw_dead = false;
+    let mut saw_indeterminate = false;
+    for auth in contexts {
+        match probe_auth_context(
+            client,
+            artifact,
+            &auth,
+            now,
+            limiter,
+            control,
+            request_budget,
+        )
+        .await
+        {
+            Ok(status) => return Ok(status),
+            Err(
+                kind @ (FailureKind::Cancelled
+                | FailureKind::AuthenticatedUnknown
+                | FailureKind::RateLimited
+                | FailureKind::RouteBlocked
+                | FailureKind::Transient),
+            ) => {
+                return Err(kind);
+            }
+            Err(FailureKind::Dead) => saw_dead = true,
+            Err(FailureKind::Permanent) => saw_indeterminate = true,
+        }
+    }
+    Err(if saw_indeterminate || !saw_dead {
+        FailureKind::Permanent
+    } else {
+        FailureKind::Dead
+    })
+}
+
+async fn probe_auth_context(
+    client: &Client,
+    artifact: &PreparedCookieArtifact,
+    auth: &MaxAuthContext,
+    now_unix: i64,
+    limiter: &RequestLimiter,
+    control: &dyn ProbeControl,
+    request_budget: &mut usize,
+) -> Result<ModuleProbeStatus, FailureKind> {
     let bootstrap_root = API_ROOTS
         .iter()
         .find(|root| root.domain == auth.api_root)
@@ -348,9 +435,12 @@ async fn probe_once(
         &bootstrap_url,
         bootstrap_root.bootstrap_host,
         BOOTSTRAP_PATH,
-        &auth,
+        artifact,
+        auth,
+        now_unix,
         limiter,
         control,
+        request_budget,
     )
     .await?;
     let bootstrap = parse_bootstrap(&bootstrap_body)?;
@@ -361,9 +451,12 @@ async fn probe_once(
         &user_endpoint.url,
         &user_endpoint.host,
         USER_PATH,
-        &auth,
+        artifact,
+        auth,
+        now_unix,
         limiter,
         control,
+        request_budget,
     )
     .await?;
     validate_user_response(&user_body)?;
@@ -380,45 +473,89 @@ async fn probe_once(
         )
         .append_pair("include", "pricePlan,product,nextPaymentPricePlan");
     subscription_endpoint.url = subscription_url.to_string();
-    let (_, subscription_body) = request_json(
+    let subscription_response = request_json(
         client,
         RequestKind::Get,
         &subscription_endpoint.url,
         &subscription_endpoint.host,
         SUBSCRIPTIONS_PATH,
-        &auth,
+        artifact,
+        auth,
+        now_unix,
         limiter,
         control,
+        request_budget,
     )
-    .await?;
-    parse_subscription_plan(&subscription_body)
+    .await;
+    let plan = match subscription_response {
+        Ok((_, body)) => match parse_subscription_plan(&body) {
+            Ok(plan) => plan,
+            Err(_) => return Err(FailureKind::AuthenticatedUnknown),
+        },
+        Err(FailureKind::Cancelled) => return Err(FailureKind::Cancelled),
+        // `/users/me` already established that the session is authenticated. A
+        // downstream catalogue, region, or gateway failure must not erase that fact,
+        // but it still receives bounded retries and proxy failover before classification.
+        Err(_) => return Err(FailureKind::AuthenticatedUnknown),
+    };
+    Ok(max_status_for_plan(plan))
 }
 
-fn auth_context(
+fn auth_contexts(
     artifact: &PreparedCookieArtifact,
     now_unix: i64,
-) -> Result<MaxAuthContext, FailureKind> {
+) -> Result<Vec<MaxAuthContext>, FailureKind> {
+    let mut contexts = Vec::with_capacity(API_ROOTS.len());
+    let mut saw_token = false;
     for root in API_ROOTS {
         let request = CookieRequest::new(root.bootstrap_host, BOOTSTRAP_PATH, true, now_unix);
-        let Some(raw_token) = artifact
-            .cookie_value_for("st", request)
-            .map_err(|_| FailureKind::Permanent)?
-        else {
-            continue;
-        };
-        let token = normalize_token(raw_token)?;
-        let claims = decode_token_claims(token)?;
-        let device_id = claims
-            .device_id
-            .filter(|value| safe_device_id(value))
-            .unwrap_or_else(|| "ayla-desktop".to_string());
-        return Ok(MaxAuthContext {
-            cookie_header: format!("st={token}"),
-            api_root: root.domain,
-            device_id,
-        });
+        let tokens = artifact
+            .cookie_values_for("st", request)
+            .map_err(|_| FailureKind::Permanent)?;
+        for raw_token in tokens {
+            saw_token = true;
+            let Ok(token) = normalize_token(raw_token) else {
+                continue;
+            };
+            let Ok(claims) = decode_token_claims(token) else {
+                continue;
+            };
+            if claims.anonymous == Some(true)
+                || claims.exp.is_some_and(|expiry| expiry <= now_unix)
+                || claims.token_type.as_deref().is_some_and(invalid_token_type)
+            {
+                continue;
+            }
+            if contexts
+                .iter()
+                .any(|context: &MaxAuthContext| context.token == token)
+            {
+                continue;
+            }
+            let device_cookie = artifact
+                .cookie_values_for(DEVICE_COOKIE_NAME, request)
+                .ok()
+                .and_then(|values| values.into_iter().find(|value| safe_device_id(value)));
+            let device_id = device_cookie
+                .map(str::to_string)
+                .or_else(|| claims.device_id.filter(|value| safe_device_id(value)))
+                .unwrap_or_else(|| derived_device_id(token));
+            contexts.push(MaxAuthContext {
+                token: token.to_string(),
+                api_root: root.domain,
+                device_id,
+            });
+        }
     }
-    Err(FailureKind::Permanent)
+    if contexts.is_empty() {
+        Err(if saw_token {
+            FailureKind::Dead
+        } else {
+            FailureKind::Permanent
+        })
+    } else {
+        Ok(contexts)
+    }
 }
 
 fn normalize_token(value: &str) -> Result<&str, FailureKind> {
@@ -456,6 +593,10 @@ fn normalize_token(value: &str) -> Result<&str, FailureKind> {
 struct TokenClaims {
     #[serde(rename = "deviceId")]
     device_id: Option<String>,
+    anonymous: Option<bool>,
+    exp: Option<i64>,
+    #[serde(rename = "type", alias = "tokenType", alias = "token_type")]
+    token_type: Option<String>,
 }
 
 fn decode_token_claims(token: &str) -> Result<TokenClaims, FailureKind> {
@@ -468,6 +609,41 @@ fn decode_token_claims(token: &str) -> Result<TokenClaims, FailureKind> {
         return Err(FailureKind::Permanent);
     }
     serde_json::from_slice(&decoded).map_err(|_| FailureKind::Permanent)
+}
+
+fn invalid_token_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "anonymous" | "guest" | "refresh" | "refresh_token"
+    )
+}
+
+fn derived_device_id(token: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in b"ayla-max-device".iter().chain(token.as_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("ayla-{hash:016x}")
+}
+
+fn max_status_for_plan(plan: MaxPlan) -> ModuleProbeStatus {
+    let module_plan = ModulePlan::Max(plan);
+    match plan.state {
+        MaxSubscriptionState::Active | MaxSubscriptionState::InGracePeriod => {
+            ModuleProbeStatus::Active(module_plan)
+        }
+        MaxSubscriptionState::Unknown => ModuleProbeStatus::Authenticated(module_plan),
+        MaxSubscriptionState::PreActive
+        | MaxSubscriptionState::Paused
+        | MaxSubscriptionState::Cancelled
+        | MaxSubscriptionState::Expired
+        | MaxSubscriptionState::NoSubscription => ModuleProbeStatus::NoEntitlement(module_plan),
+    }
+}
+
+fn authenticated_unknown_status() -> ModuleProbeStatus {
+    ModuleProbeStatus::Authenticated(ModulePlan::Max(MaxPlan::default()))
 }
 
 fn safe_device_id(value: &str) -> bool {
@@ -491,11 +667,38 @@ async fn request_json(
     url: &str,
     host: &str,
     path: &str,
+    artifact: &PreparedCookieArtifact,
     auth: &MaxAuthContext,
+    now_unix: i64,
     limiter: &RequestLimiter,
     control: &dyn ProbeControl,
+    request_budget: &mut usize,
 ) -> Result<(u16, Vec<u8>), FailureKind> {
-    if !host_allowed(host, auth.api_root) || limiter.wait(control) {
+    let parsed = Url::parse(url).map_err(|_| FailureKind::Permanent)?;
+    let parsed_host = parsed.host_str().ok_or(FailureKind::Permanent)?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some_and(|port| port != 443)
+        || parsed_host != host
+        || parsed.path() != path
+        || parsed.fragment().is_some()
+        || !host_allowed(parsed_host, auth.api_root)
+    {
+        return Err(FailureKind::Permanent);
+    }
+    let cookie_header = artifact
+        .cookie_header_for_value(
+            "st",
+            &auth.token,
+            CookieRequest::new(parsed_host, path, true, now_unix),
+        )
+        .map_err(|_| FailureKind::Permanent)?;
+    if *request_budget == 0 {
+        return Err(FailureKind::Permanent);
+    }
+    *request_budget = request_budget.saturating_sub(1);
+    if limiter.wait(control) {
         return Err(if control.is_cancelled() {
             FailureKind::Cancelled
         } else {
@@ -512,13 +715,18 @@ async fn request_json(
     }
     .orig_headers(max_header_order())
     .header("accept", "application/json, text/plain, */*")
+    .header("authorization", format!("Bearer {}", auth.token))
     .header("content-type", "application/json")
-    .header("cookie", &auth.cookie_header)
     .header("user-agent", CHROME_USER_AGENT)
     .header("x-device-info", device_info)
     .header("x-disco-client", DISCO_CLIENT)
     .header("x-disco-params", DISCO_PARAMS)
     .header("x-wbd-time-zone", "UTC");
+    let request = if let Some(cookie_header) = cookie_header {
+        request.header("cookie", cookie_header)
+    } else {
+        request
+    };
     let request = match kind {
         RequestKind::Get => request,
         RequestKind::Post => request.body("{}"),
@@ -536,14 +744,6 @@ async fn request_json(
     }
     let body = cancellable(control, read_bounded_body(response)).await??;
     classify_http(status, &body)?;
-
-    // The resolved path is checked before every credentialed request. Keeping this
-    // assertion after I/O also prevents future callers from silently passing a URL whose
-    // path differs from the scoped operation they intended.
-    let parsed = Url::parse(url).map_err(|_| FailureKind::Permanent)?;
-    if parsed.path() != path {
-        return Err(FailureKind::Permanent);
-    }
     Ok((status, body))
 }
 
@@ -582,22 +782,28 @@ async fn read_bounded_body(response: wreq::Response) -> Result<Vec<u8>, FailureK
 }
 
 fn classify_http(status: u16, body: &[u8]) -> Result<(), FailureKind> {
-    if status == 200 {
-        return Ok(());
-    }
-    if status == 429 {
+    let signals = error_signals(body);
+    let auth_failure = signals.iter().any(|signal| exact_auth_error(signal));
+    if matches!(status, 429 | 503) {
         return Err(FailureKind::RateLimited);
     }
-    if matches!(status, 408 | 425 | 500..=599) {
-        return Err(FailureKind::Transient);
-    }
-
-    let signals = error_signals(body);
-    if signals.iter().any(|signal| exact_auth_error(signal)) {
+    if matches!(status, 401 | 403) && auth_failure {
         return Err(FailureKind::Dead);
     }
-    if signals.iter().any(|signal| gateway_error(signal)) {
-        return Err(FailureKind::RateLimited);
+    if response_is_route_blocked(body, &signals) {
+        return Err(FailureKind::RouteBlocked);
+    }
+    match status {
+        401 => return Err(FailureKind::Dead),
+        403 => return Err(FailureKind::RouteBlocked),
+        408 | 425 | 500..=599 => return Err(FailureKind::Transient),
+        _ => {}
+    }
+    if auth_failure {
+        return Err(FailureKind::Dead);
+    }
+    if (200..=299).contains(&status) {
+        return Ok(());
     }
     Err(FailureKind::Permanent)
 }
@@ -606,17 +812,62 @@ fn error_signals(body: &[u8]) -> Vec<String> {
     let Ok(root) = serde_json::from_slice::<Value>(body) else {
         return Vec::new();
     };
-    let mut signals = Vec::new();
-    if let Some(errors) = root.get("errors").and_then(Value::as_array) {
-        for error in errors.iter().take(16) {
-            for key in ["code", "title", "message", "detail"] {
-                if let Some(value) = error.get(key).and_then(Value::as_str) {
-                    signals.push(value.trim().to_ascii_lowercase());
-                }
+    let mut signals = Vec::with_capacity(8);
+    if let Some(object) = root.as_object() {
+        for key in [
+            "code",
+            "title",
+            "message",
+            "detail",
+            "error",
+            "error_description",
+            "errors",
+        ] {
+            if let Some(value) = object.get(key) {
+                collect_error_signals(value, &mut signals, 0);
             }
         }
     }
     signals
+}
+
+fn collect_error_signals(value: &Value, signals: &mut Vec<String>, depth: usize) {
+    if signals.len() >= 32 || depth > 2 {
+        return;
+    }
+    match value {
+        Value::String(value) => {
+            let normalized = value
+                .trim()
+                .chars()
+                .take(1_024)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if !normalized.is_empty() {
+                signals.push(normalized);
+            }
+        }
+        Value::Array(values) => {
+            for value in values.iter().take(16) {
+                collect_error_signals(value, signals, depth + 1);
+            }
+        }
+        Value::Object(object) => {
+            for key in [
+                "code",
+                "title",
+                "message",
+                "detail",
+                "error",
+                "error_description",
+            ] {
+                if let Some(value) = object.get(key) {
+                    collect_error_signals(value, signals, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn exact_auth_error(signal: &str) -> bool {
@@ -636,14 +887,34 @@ fn exact_auth_error(signal: &str) -> bool {
             .any(|needle| signal.contains(needle)))
 }
 
-fn gateway_error(signal: &str) -> bool {
+fn response_is_route_blocked(body: &[u8], signals: &[String]) -> bool {
+    if signals.iter().any(|signal| route_block_signal(signal)) {
+        return true;
+    }
+    let bounded = &body[..body.len().min(MAX_ERROR_TEXT_BYTES)];
+    let text = String::from_utf8_lossy(bounded).to_ascii_lowercase();
+    route_block_signal(&text)
+        || ((text.contains("<!doctype html") || text.contains("<html"))
+            && (text.contains("challenge") || text.contains("attention required")))
+}
+
+fn route_block_signal(signal: &str) -> bool {
     [
         "rate limit",
         "too many requests",
         "captcha",
         "cloudflare",
+        "cf-ray",
+        "cf-chl",
+        "/cdn-cgi/",
         "access denied",
         "blocked request",
+        "geo.blocked",
+        "geo_blocked",
+        "geo blocked",
+        "not available in your region",
+        "region is not supported",
+        "error 1020",
     ]
     .iter()
     .any(|needle| signal.contains(needle))
@@ -714,7 +985,8 @@ fn resolve_endpoint(
     let endpoint = config
         .endpoints
         .iter()
-        .find(|endpoint| request_path.starts_with(&endpoint.path))
+        .filter(|endpoint| endpoint_path_matches(&endpoint.path, request_path))
+        .max_by_key(|endpoint| endpoint.path.len())
         .ok_or(FailureKind::Permanent)?;
     let group = config
         .api_groups
@@ -751,6 +1023,28 @@ fn resolve_endpoint(
     })
 }
 
+fn endpoint_path_matches(endpoint_path: &str, request_path: &str) -> bool {
+    if !endpoint_path.starts_with('/')
+        || endpoint_path.len() > 4_096
+        || endpoint_path
+            .bytes()
+            .any(|byte| matches!(byte, b'?' | b'#'))
+        || endpoint_path.contains("//")
+    {
+        return false;
+    }
+    if endpoint_path == "/" || endpoint_path == request_path {
+        return true;
+    }
+    let prefix = endpoint_path.trim_end_matches('/');
+    if prefix.is_empty() {
+        return false;
+    }
+    request_path
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn safe_dns_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
@@ -774,6 +1068,19 @@ fn validate_user_response(body: &[u8]) -> Result<(), FailureKind> {
         .ok_or(FailureKind::Permanent)?;
     let user_type = user.get("type").and_then(Value::as_str);
     let user_id = user.get("id").and_then(Value::as_str);
+    let anonymous = user
+        .get("attributes")
+        .and_then(Value::as_object)
+        .and_then(|attributes| {
+            attributes
+                .get("anonymous")
+                .or_else(|| attributes.get("isAnonymous"))
+        })
+        .and_then(Value::as_bool)
+        .or_else(|| user.get("anonymous").and_then(Value::as_bool));
+    if anonymous == Some(true) {
+        return Err(FailureKind::Dead);
+    }
     if user_type == Some("user")
         && user_id.is_some_and(|id| !id.trim().is_empty() && id.len() <= 512)
     {
@@ -815,14 +1122,32 @@ fn parse_subscription_plan(body: &[u8]) -> Result<MaxPlan, FailureKind> {
             .find_map(|key| attributes.get(key).and_then(Value::as_str))
             .map(classify_subscription_state)
             .unwrap_or(MaxSubscriptionState::Unknown);
-        let mut plan_text = Vec::new();
-        collect_plan_text(attributes, &mut plan_text);
-        collect_relationship_plan_text(record, included, &mut plan_text);
+        let mut current_plan_text = Vec::new();
+        collect_plan_text(attributes, &mut current_plan_text);
+        collect_relationship_plan_text(
+            record,
+            included,
+            &["pricePlan", "product"],
+            &mut current_plan_text,
+        );
         if let Some(id) = record.get("id").and_then(Value::as_str) {
-            plan_text.push(id);
+            current_plan_text.push(id);
         }
+        let current_tier = classify_tier(&current_plan_text);
+        let tier = if current_tier == MaxTier::Unknown {
+            let mut next_plan_text = Vec::new();
+            collect_relationship_plan_text(
+                record,
+                included,
+                &["nextPaymentPricePlan"],
+                &mut next_plan_text,
+            );
+            classify_tier(&next_plan_text)
+        } else {
+            current_tier
+        };
         let plan = MaxPlan {
-            tier: classify_tier(&plan_text),
+            tier,
             state: status,
         };
         if best.is_none_or(|current: MaxPlan| {
@@ -837,13 +1162,14 @@ fn parse_subscription_plan(body: &[u8]) -> Result<MaxPlan, FailureKind> {
 fn collect_relationship_plan_text<'a>(
     record: &'a Value,
     included: &'a [Value],
+    relationship_names: &[&str],
     output: &mut Vec<&'a str>,
 ) {
     let Some(relationships) = record.get("relationships").and_then(Value::as_object) else {
         return;
     };
-    for name in ["pricePlan", "product", "nextPaymentPricePlan"] {
-        let Some(data) = relationships.get(name).and_then(|value| value.get("data")) else {
+    for name in relationship_names {
+        let Some(data) = relationships.get(*name).and_then(|value| value.get("data")) else {
             continue;
         };
         let references: Vec<&Value> = match data {
@@ -956,7 +1282,9 @@ fn state_priority(state: MaxSubscriptionState) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind {
     Dead,
+    AuthenticatedUnknown,
     RateLimited,
+    RouteBlocked,
     Transient,
     Permanent,
     Cancelled,
@@ -964,17 +1292,24 @@ enum FailureKind {
 
 impl FailureKind {
     fn retryable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Transient)
+        matches!(
+            self,
+            Self::AuthenticatedUnknown | Self::RateLimited | Self::Transient
+        )
     }
 
     fn can_failover(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Transient)
+        matches!(
+            self,
+            Self::AuthenticatedUnknown | Self::RateLimited | Self::RouteBlocked | Self::Transient
+        )
     }
 
     fn status(self) -> ModuleProbeStatus {
         match self {
             Self::Dead => ModuleProbeStatus::Dead,
-            Self::RateLimited => ModuleProbeStatus::RateLimited,
+            Self::AuthenticatedUnknown => authenticated_unknown_status(),
+            Self::RateLimited | Self::RouteBlocked => ModuleProbeStatus::RateLimited,
             Self::Transient | Self::Permanent | Self::Cancelled => ModuleProbeStatus::Error,
         }
     }
@@ -1014,9 +1349,10 @@ impl RequestLimiter {
 }
 
 fn max_header_order() -> OrigHeaderMap {
-    let mut order = OrigHeaderMap::with_capacity(8);
+    let mut order = OrigHeaderMap::with_capacity(9);
     for header in [
         "accept",
+        "authorization",
         "content-type",
         "cookie",
         "user-agent",
@@ -1099,15 +1435,16 @@ mod tests {
     const NOW: i64 = 2_000_000_000;
 
     fn synthetic_token(device_id: &str) -> String {
+        synthetic_token_with_claims(serde_json::json!({
+            "anonymous": false,
+            "deviceId": device_id,
+            "exp": NOW + 3600,
+        }))
+    }
+
+    fn synthetic_token_with_claims(claims: Value) -> String {
         let header = general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
-        let payload = general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({
-                "anonymous": false,
-                "deviceId": device_id,
-                "exp": NOW + 3600,
-            })
-            .to_string(),
-        );
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
         format!("{header}.{payload}.synthetic-signature")
     }
 
@@ -1127,13 +1464,15 @@ mod tests {
     fn bootstrap_fixture(domain: &str) -> Vec<u8> {
         serde_json::json!({
             "endpoints": [
+                {"path": "/", "apiGroup": "bolt"},
+                {"path": "/user", "apiGroup": "decoy"},
                 {"path": "/monetization/subscriptions", "apiGroup": "commerce"},
-                {"path": "/users", "apiGroup": "identity"},
-                {"path": "/", "apiGroup": "bolt"}
+                {"path": "/users", "apiGroup": "identity"}
             ],
             "apiGroups": {
                 "commerce": {"baseUrl": "https://default.{tenant}-{homeMarket}.euc1.{env}.{domain}"},
                 "identity": {"baseUrl": "https://default.{tenant}-{homeMarket}.{env}.{domain}"},
+                "decoy": {"baseUrl": "https://decoy.{env}.{domain}"},
                 "bolt": {"baseUrl": "https://default.any-any.{env}.{domain}"}
             },
             "routing": {
@@ -1151,10 +1490,62 @@ mod tests {
     fn extracts_scoped_jwt_and_device_without_exposing_account_data() {
         let token = synthetic_token("device-1234");
         let artifact = prepared_artifact(&token);
-        let context = auth_context(&artifact, NOW).expect("extract Max auth context");
+        let contexts = auth_contexts(&artifact, NOW).expect("extract Max auth context");
+        let context = contexts.first().expect("one scoped context");
         assert_eq!(context.api_root, "api.hbomax.com");
         assert_eq!(context.device_id, "device-1234");
-        assert_eq!(context.cookie_header, format!("st={token}"));
+        assert_eq!(context.token, token);
+        assert_ne!(context.device_id, "ayla-desktop");
+    }
+
+    #[test]
+    fn skips_invalid_candidates_and_uses_the_next_scoped_session() {
+        let valid = synthetic_token("valid-device");
+        let expired = synthetic_token_with_claims(serde_json::json!({
+            "anonymous": false,
+            "deviceId": "expired-device",
+            "exp": NOW - 1,
+        }));
+        let host = "default.any-any.prd.api.hbomax.com";
+        let artifact = prepare_cookie_artifact_at(
+            format!(
+                "{host}\tFALSE\t/session-context\tTRUE\t{}\tst\t{expired}\n.api.hbomax.com\tTRUE\t/\tTRUE\t{}\tst\t{valid}\n",
+                NOW + 3600,
+                NOW + 3600,
+            )
+            .into_bytes(),
+            MAX_COOKIE_POLICY,
+            NOW,
+        )
+        .expect("prepare candidate sessions");
+
+        let contexts = auth_contexts(&artifact, NOW).expect("find usable candidate");
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].token, valid);
+    }
+
+    #[test]
+    fn rejects_anonymous_and_guest_tokens_before_remote_validation() {
+        for claims in [
+            serde_json::json!({"anonymous": true, "exp": NOW + 3600}),
+            serde_json::json!({"anonymous": false, "type": "guest", "exp": NOW + 3600}),
+        ] {
+            let token = synthetic_token_with_claims(claims);
+            let artifact = prepared_artifact(&token);
+            assert_eq!(auth_contexts(&artifact, NOW).err(), Some(FailureKind::Dead));
+        }
+    }
+
+    #[test]
+    fn derived_device_identifier_is_stable_and_not_the_old_shared_fallback() {
+        let token = synthetic_token_with_claims(serde_json::json!({
+            "anonymous": false,
+            "exp": NOW + 3600,
+        }));
+        let first = derived_device_id(&token);
+        assert_eq!(first, derived_device_id(&token));
+        assert_ne!(first, "ayla-desktop");
+        assert!(safe_device_id(&first));
     }
 
     #[test]
@@ -1187,13 +1578,41 @@ mod tests {
         let invalid =
             br#"{"errors":[{"code":"invalid.token","message":"Token is missing or not valid"}]}"#;
         assert_eq!(classify_http(400, invalid), Err(FailureKind::Dead));
+        assert_eq!(classify_http(401, b""), Err(FailureKind::Dead));
+        assert_eq!(
+            classify_http(403, br#"{"error":"invalid_token"}"#),
+            Err(FailureKind::Dead)
+        );
+        assert_eq!(
+            classify_http(
+                401,
+                br#"{"code":"invalid.token","message":"access denied"}"#,
+            ),
+            Err(FailureKind::Dead)
+        );
         assert_eq!(
             classify_http(403, br#"{"errors":[{"code":"geo.blocked"}]}"#),
-            Err(FailureKind::Permanent)
+            Err(FailureKind::RouteBlocked)
+        );
+        assert_eq!(
+            classify_http(
+                200,
+                b"<!doctype html><html><title>Attention Required | Cloudflare</title></html>",
+            ),
+            Err(FailureKind::RouteBlocked)
+        );
+        assert_eq!(
+            classify_http(
+                401,
+                b"<!doctype html><html><title>Attention Required | Cloudflare</title></html>",
+            ),
+            Err(FailureKind::RouteBlocked)
         );
         assert_eq!(classify_http(404, b"{}"), Err(FailureKind::Permanent));
         assert_eq!(classify_http(500, b"{}"), Err(FailureKind::Transient));
         assert_eq!(classify_http(429, b"{}"), Err(FailureKind::RateLimited));
+        assert_eq!(classify_http(503, b"{}"), Err(FailureKind::RateLimited));
+        assert_eq!(classify_http(200, b"{}"), Ok(()));
     }
 
     #[test]
@@ -1207,6 +1626,12 @@ mod tests {
         assert_eq!(
             validate_user_response(br#"{"data":null}"#),
             Err(FailureKind::Permanent)
+        );
+        assert_eq!(
+            validate_user_response(
+                br#"{"data":{"type":"user","id":"guest","attributes":{"anonymous":true}}}"#,
+            ),
+            Err(FailureKind::Dead)
         );
     }
 
@@ -1242,5 +1667,64 @@ mod tests {
                 state: MaxSubscriptionState::NoSubscription,
             })
         );
+    }
+
+    #[test]
+    fn current_plan_wins_over_a_different_next_billing_plan() {
+        let body = serde_json::json!({
+            "data": [{
+                "type": "subscription",
+                "id": "synthetic-subscription",
+                "attributes": {"status": "ACTIVE"},
+                "relationships": {
+                    "pricePlan": {"data": {"type": "pricePlan", "id": "current"}},
+                    "nextPaymentPricePlan": {"data": {"type": "pricePlan", "id": "next"}}
+                }
+            }],
+            "included": [
+                {"type": "pricePlan", "id": "current", "attributes": {"displayName": "Standard Monthly"}},
+                {"type": "pricePlan", "id": "next", "attributes": {"displayName": "Premium Monthly"}}
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            parse_subscription_plan(body.as_bytes()),
+            Ok(MaxPlan {
+                tier: MaxTier::Standard,
+                state: MaxSubscriptionState::Active,
+            })
+        );
+    }
+
+    #[test]
+    fn entitlement_status_does_not_confuse_authentication_with_subscription_state() {
+        let active = MaxPlan {
+            tier: MaxTier::Premium,
+            state: MaxSubscriptionState::Active,
+        };
+        let absent = MaxPlan {
+            tier: MaxTier::Unknown,
+            state: MaxSubscriptionState::NoSubscription,
+        };
+        assert_eq!(
+            max_status_for_plan(active),
+            ModuleProbeStatus::Active(ModulePlan::Max(active))
+        );
+        assert_eq!(
+            max_status_for_plan(absent),
+            ModuleProbeStatus::NoEntitlement(ModulePlan::Max(absent))
+        );
+        assert_eq!(
+            max_status_for_plan(MaxPlan::default()),
+            authenticated_unknown_status()
+        );
+        assert!(FailureKind::AuthenticatedUnknown.retryable());
+        assert!(FailureKind::AuthenticatedUnknown.can_failover());
+        assert_eq!(
+            FailureKind::AuthenticatedUnknown.status(),
+            authenticated_unknown_status()
+        );
+        assert!(!endpoint_path_matches("//", USER_PATH));
+        assert!(!endpoint_path_matches("/user", USER_PATH));
     }
 }

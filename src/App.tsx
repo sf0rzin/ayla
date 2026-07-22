@@ -163,6 +163,8 @@ interface ChatGptTaskSummary {
 
 interface ModuleTaskSummary {
   active: number;
+  authenticatedUnknown?: number;
+  noEntitlement?: number;
   dead: number;
   rateLimited: number;
   errors: number;
@@ -711,7 +713,7 @@ function Sidebar({
             <button className={page === item.id ? "nav-item active" : "nav-item"} key={item.id} onClick={() => onNavigate(item.id)} type="button">
               <Icon size={16} strokeWidth={1.7} />
               <span>{item.label}</span>
-              {item.id === "modules" && <small>{overview?.modulesTotal ?? 13}</small>}
+              {item.id === "modules" && <small>{overview?.modulesTotal ?? 15}</small>}
               {item.id === "proxies" && Boolean(overview?.proxiesTotal) && <small>{overview?.proxiesTotal}</small>}
             </button>
           );
@@ -1328,7 +1330,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
               </div>
               <div className="task-active-progress"><div><span>{Math.max(0, activeTask.total - activeTask.queued - activeTask.running)} of {activeTask.total}</span><strong>{Math.round(progress)}%</strong></div><progress className="task-progress" value={progress} max="100" /></div>
               <div className="task-active-stats">
-                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{outcomeSummary?.active ?? activeTask.succeeded} active</span><span>{outcomeSummary?.dead ?? activeTask.failed} {hasDetailedOutcome ? "dead" : "failed"}</span>{moduleSummary && moduleSummary.rateLimited > 0 && <span>{moduleSummary.rateLimited} rate limited</span>}{moduleSummary && moduleSummary.errors > 0 && <span>{moduleSummary.errors} errors</span>}{moduleSummary && moduleSummary.invalid > 0 && <span>{moduleSummary.invalid} invalid</span>}{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
+                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{outcomeSummary?.active ?? activeTask.succeeded} active</span>{moduleSummary && (moduleSummary.authenticatedUnknown ?? 0) > 0 && <span>{moduleSummary.authenticatedUnknown ?? 0} authenticated · plan unavailable</span>}{moduleSummary && (moduleSummary.noEntitlement ?? 0) > 0 && <span>{moduleSummary.noEntitlement ?? 0} no entitlement</span>}<span>{outcomeSummary?.dead ?? activeTask.failed} {hasDetailedOutcome ? "dead" : "failed"}</span>{moduleSummary && moduleSummary.rateLimited > 0 && <span>{moduleSummary.rateLimited} rate limited</span>}{moduleSummary && moduleSummary.errors > 0 && <span>{moduleSummary.errors} errors</span>}{moduleSummary && moduleSummary.invalid > 0 && <span>{moduleSummary.invalid} invalid</span>}{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
               </div>
               <button className="button danger task-active-cancel" type="button" onClick={cancel} disabled={cancelling}><StopCircle size={14} />{cancelling ? "Cancelling…" : "Cancel"}</button>
             </article>
@@ -1379,7 +1381,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
                 </div>
                 <div className="settings-row task-source-row"><div className="settings-copy"><strong>Source preview</strong><small>{entryLimitExceeded ? "The 10,000-path limit has been exceeded." : duplicateEntryCount ? `${duplicateEntryCount} duplicate path(s) will be removed.` : "Cookie totals are calculated after the local scan starts."}</small></div><div className="task-source-summary"><span><strong>{uniqueEntryCount.toLocaleString("en-US")}</strong>Paths</span><span><strong>—</strong>Cookies</span></div></div>
                 <div className="settings-row task-output-row">
-                  <div className="settings-copy"><strong>Results folder <span className="optional-label">Optional</span></strong><small>{`Copies results into ${selectedModule?.name ?? "Module"}/active and ${selectedModule?.name ?? "Module"}/failed. Original files stay untouched.`}</small></div>
+                  <div className="settings-copy"><strong>Results folder <span className="optional-label">Optional</span></strong><small>{`Copies results into ${selectedModule?.id ?? "module"}/active and ${selectedModule?.id ?? "module"}/failed. Original files stay untouched.`}</small></div>
                   <div className="task-output-control">
                     <button className="button outline small task-output-picker" type="button" onClick={() => void chooseOutputDirectory()} disabled={starting || selectingOutputDirectory} title={outputDirectory || undefined}><FolderOpen size={13} /><span>{selectingOutputDirectory ? "Opening…" : outputFolderName || "Choose folder"}</span></button>
                     {outputDirectory && <button className="icon-button ghost task-output-clear" type="button" onClick={() => { setOutputDirectory(""); setMessage(""); }} disabled={starting || selectingOutputDirectory} aria-label="Clear results folder" title="Clear results folder"><X size={14} /></button>}

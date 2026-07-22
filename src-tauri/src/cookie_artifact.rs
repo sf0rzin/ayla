@@ -81,6 +81,7 @@ pub(crate) struct CookiePolicy {
     direct_aliases: &'static [DirectCookieAlias],
     required_any_cookie_names: &'static [&'static str],
     required_cookie_targets: &'static [CookieTarget],
+    readable_cookie_names: &'static [&'static str],
     outbound_cookie_names: &'static [&'static str],
 }
 
@@ -94,6 +95,7 @@ impl CookiePolicy {
         direct_aliases: &'static [DirectCookieAlias],
         required_any_cookie_names: &'static [&'static str],
         required_cookie_targets: &'static [CookieTarget],
+        readable_cookie_names: &'static [&'static str],
         outbound_cookie_names: &'static [&'static str],
     ) -> Self {
         Self {
@@ -104,6 +106,7 @@ impl CookiePolicy {
             direct_aliases,
             required_any_cookie_names,
             required_cookie_targets,
+            readable_cookie_names,
             outbound_cookie_names,
         }
     }
@@ -130,6 +133,7 @@ const TWITCH_VALUE_PREFIXES: &[&str] = &["OAuth ", "Bearer "];
 const TWITCH_ALLOWED_DOMAINS: &[&str] = &["twitch.tv"];
 const TWITCH_REQUIRED_COOKIES: &[&str] = &["auth-token"];
 const TWITCH_AUTH_TARGETS: &[CookieTarget] = &[CookieTarget::new("gql.twitch.tv", "/gql", true)];
+const TWITCH_READABLE_COOKIES: &[&str] = &["auth-token"];
 const TWITCH_OUTBOUND_COOKIES: &[&str] = &["auth-token"];
 const TWITCH_DIRECT_ALIASES: &[DirectCookieAlias] = &[
     DirectCookieAlias::new(
@@ -189,6 +193,7 @@ pub(crate) const TWITCH_COOKIE_POLICY: CookiePolicy = CookiePolicy::new(
     TWITCH_DIRECT_ALIASES,
     TWITCH_REQUIRED_COOKIES,
     TWITCH_AUTH_TARGETS,
+    TWITCH_READABLE_COOKIES,
     TWITCH_OUTBOUND_COOKIES,
 );
 
@@ -200,6 +205,7 @@ const MAX_AUTH_TARGETS: &[CookieTarget] = &[
     CookieTarget::new("default.any-any.prd.api.max.com", "/", true),
     CookieTarget::new("default.any-any.prd.api.discomax.com", "/", true),
 ];
+const MAX_READABLE_COOKIES: &[&str] = &["st", "GI_WEB_SDK_SONIC_DEVICE_ID"];
 const MAX_OUTBOUND_COOKIES: &[&str] = &["st"];
 const MAX_DIRECT_ALIASES: &[DirectCookieAlias] = &[
     DirectCookieAlias::new(
@@ -210,7 +216,7 @@ const MAX_DIRECT_ALIASES: &[DirectCookieAlias] = &[
         true,
         true,
         false,
-        false,
+        true,
         MAX_VALUE_PREFIXES,
     ),
     DirectCookieAlias::new(
@@ -248,6 +254,7 @@ pub(crate) const MAX_COOKIE_POLICY: CookiePolicy = CookiePolicy::new(
     MAX_DIRECT_ALIASES,
     MAX_REQUIRED_COOKIES,
     MAX_AUTH_TARGETS,
+    MAX_READABLE_COOKIES,
     MAX_OUTBOUND_COOKIES,
 );
 
@@ -394,7 +401,27 @@ impl PreparedCookieArtifact {
         Ok(Some(header))
     }
 
-    /// Returns one named value under the same scope checks used by header rendering.
+    /// Returns all readable values with this name under the same scope checks used by
+    /// header rendering. Readable cookies are policy-controlled independently from
+    /// outbound cookies, so metadata can inform a request without being placed in its
+    /// `Cookie` header.
+    pub(crate) fn cookie_values_for<'artifact>(
+        &'artifact self,
+        name: &str,
+        request: CookieRequest<'_>,
+    ) -> Result<Vec<&'artifact str>, CookieHeaderError> {
+        if !safe_cookie_name(name) || !self.policy.readable_cookie_names.contains(&name) {
+            return Err(CookieHeaderError::InvalidCookieName);
+        }
+        Ok(self
+            .matching_cookies(request)?
+            .into_iter()
+            .filter(|cookie| cookie.name == name)
+            .map(|cookie| cookie.value.as_str())
+            .collect())
+    }
+
+    /// Returns the first readable named value using browser cookie ordering.
     /// This is useful for modules such as Twitch that derive an `Authorization` header
     /// from a cookie, without bypassing domain/path/scheme/expiry validation.
     pub(crate) fn cookie_value_for<'artifact>(
@@ -402,14 +429,43 @@ impl PreparedCookieArtifact {
         name: &str,
         request: CookieRequest<'_>,
     ) -> Result<Option<&'artifact str>, CookieHeaderError> {
+        Ok(self.cookie_values_for(name, request)?.into_iter().next())
+    }
+
+    /// Renders only the selected cookie value when that exact stored cookie is valid for
+    /// the request. This avoids accidentally forwarding a same-name cookie from another
+    /// host or path while keeping outbound names constrained by the module policy.
+    pub(crate) fn cookie_header_for_value(
+        &self,
+        name: &str,
+        value: &str,
+        request: CookieRequest<'_>,
+    ) -> Result<Option<String>, CookieHeaderError> {
         if !safe_cookie_name(name) || !self.policy.outbound_cookie_names.contains(&name) {
             return Err(CookieHeaderError::InvalidCookieName);
         }
-        Ok(self
+        let selected = self
             .matching_cookies(request)?
             .into_iter()
-            .find(|cookie| cookie.name == name)
-            .map(|cookie| cookie.value.as_str()))
+            .find(|cookie| cookie.name == name && cookie.value == value);
+        let Some(cookie) = selected else {
+            return Ok(None);
+        };
+
+        let required_bytes = cookie
+            .name
+            .len()
+            .checked_add(1)
+            .and_then(|size| size.checked_add(cookie.value.len()))
+            .ok_or(CookieHeaderError::HeaderTooLarge)?;
+        if required_bytes > MAX_COOKIE_HEADER_BYTES {
+            return Err(CookieHeaderError::HeaderTooLarge);
+        }
+        let mut header = String::with_capacity(required_bytes);
+        header.push_str(&cookie.name);
+        header.push('=');
+        header.push_str(&cookie.value);
+        Ok(Some(header))
     }
 
     fn matching_cookies(
@@ -761,6 +817,11 @@ fn validate_policy(policy: CookiePolicy) -> Result<(), CookieArtifactError> {
             return Err(CookieArtifactError::InvalidPolicy);
         }
     }
+    for readable in policy.readable_cookie_names {
+        if !safe_cookie_name(readable) {
+            return Err(CookieArtifactError::InvalidPolicy);
+        }
+    }
     for outbound in policy.outbound_cookie_names {
         if !safe_cookie_name(outbound) {
             return Err(CookieArtifactError::InvalidPolicy);
@@ -769,7 +830,11 @@ fn validate_policy(policy: CookiePolicy) -> Result<(), CookieArtifactError> {
     if policy
         .required_any_cookie_names
         .iter()
-        .any(|required| !policy.outbound_cookie_names.contains(required))
+        .any(|required| !policy.readable_cookie_names.contains(required))
+        || policy
+            .outbound_cookie_names
+            .iter()
+            .any(|outbound| !policy.readable_cookie_names.contains(outbound))
     {
         return Err(CookieArtifactError::InvalidPolicy);
     }
@@ -784,6 +849,7 @@ fn validate_policy(policy: CookiePolicy) -> Result<(), CookieArtifactError> {
         if alias.json_key.is_empty()
             || alias.json_key.bytes().any(|byte| byte.is_ascii_control())
             || !safe_cookie_name(alias.cookie_name)
+            || !policy.readable_cookie_names.contains(&alias.cookie_name)
             || !safe_cookie_path(alias.path)
             || alias
                 .strip_value_prefixes
@@ -1379,17 +1445,118 @@ mod tests {
 
     #[test]
     fn max_direct_token_alias_requires_module_context() {
-        let unrelated = format!(r#"{{"token":"{SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
-        assert!(matches!(
-            prepare_max(unrelated),
-            Err(CookieArtifactError::UnsupportedFormat)
-        ));
+        for alias in ["st", "token", "access_token"] {
+            let unrelated = format!(r#"{{"{alias}":"{SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
+            assert!(matches!(
+                prepare_max(unrelated),
+                Err(CookieArtifactError::UnsupportedFormat)
+            ));
+        }
 
         let scoped =
-            format!(r#"{{"module":"max","token":"Bearer {SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
+            format!(r#"{{"module":"max","st":"Cookie {SYNTHETIC_MAX_TOKEN}"}}"#).into_bytes();
         let artifact = prepare_max(scoped).expect("prepare scoped HBO Max alias");
         assert_eq!(artifact.cookies()[0].name(), "st");
         assert_eq!(artifact.cookies()[0].value(), SYNTHETIC_MAX_TOKEN);
+    }
+
+    #[test]
+    fn max_device_cookie_is_readable_but_never_outbound() {
+        let device_id = "synthetic-max-device-0001";
+        let bytes = format!(
+            ".api.hbomax.com\tTRUE\t/\tTRUE\t{FUTURE}\tst\t{SYNTHETIC_MAX_TOKEN}\n.api.hbomax.com\tTRUE\t/\tTRUE\t{FUTURE}\tGI_WEB_SDK_SONIC_DEVICE_ID\t{device_id}\n"
+        )
+        .into_bytes();
+        let artifact = prepare_max(bytes).expect("prepare HBO Max auth and device cookies");
+        let request =
+            CookieRequest::new("default.any-any.prd.api.hbomax.com", "/users/me", true, NOW);
+
+        assert_eq!(
+            artifact
+                .cookie_value_for("GI_WEB_SDK_SONIC_DEVICE_ID", request)
+                .expect("read scoped device ID"),
+            Some(device_id)
+        );
+        assert_eq!(
+            artifact.cookie_header_for(request).expect("safe header"),
+            Some(format!("st={SYNTHETIC_MAX_TOKEN}"))
+        );
+        assert!(matches!(
+            artifact.cookie_header_for_value("GI_WEB_SDK_SONIC_DEVICE_ID", device_id, request),
+            Err(CookieHeaderError::InvalidCookieName)
+        ));
+    }
+
+    #[test]
+    fn max_host_only_cookie_matches_only_the_exact_api_host() {
+        let host = "default.any-any.prd.api.hbomax.com";
+        let bytes =
+            format!("{host}\tFALSE\t/\tTRUE\t{FUTURE}\tst\t{SYNTHETIC_MAX_TOKEN}\n").into_bytes();
+        let artifact = prepare_max(bytes).expect("prepare host-only HBO Max cookie");
+
+        assert_eq!(
+            artifact
+                .cookie_value_for("st", CookieRequest::new(host, "/users/me", true, NOW))
+                .expect("exact host"),
+            Some(SYNTHETIC_MAX_TOKEN)
+        );
+        assert_eq!(
+            artifact
+                .cookie_value_for(
+                    "st",
+                    CookieRequest::new(
+                        "default.beam-emea.prd.api.hbomax.com",
+                        "/users/me",
+                        true,
+                        NOW,
+                    ),
+                )
+                .expect("allowed sibling host"),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_max_cookie_header_preserves_value_and_request_scope() {
+        let broad_token = SYNTHETIC_MAX_TOKEN;
+        let narrow_token =
+            "eyJhbGciOiJSUzI1NiJ9.eyJhbm9ueW1vdXMiOmZhbHNlLCJzY29wZSI6Im5hcnJvdyJ9.signature";
+        let host = "default.any-any.prd.api.hbomax.com";
+        let bytes = format!(
+            ".api.hbomax.com\tTRUE\t/\tTRUE\t{FUTURE}\tst\t{broad_token}\n{host}\tFALSE\t/users\tTRUE\t{FUTURE}\tst\t{narrow_token}\n"
+        )
+        .into_bytes();
+        let artifact = prepare_max(bytes).expect("prepare multiple scoped HBO Max cookies");
+        let users_request = CookieRequest::new(host, "/users/me", true, NOW);
+
+        assert_eq!(
+            artifact
+                .cookie_values_for("st", users_request)
+                .expect("read scoped candidates"),
+            vec![narrow_token, broad_token]
+        );
+        assert_eq!(
+            artifact
+                .cookie_header_for_value("st", broad_token, users_request)
+                .expect("select broad token"),
+            Some(format!("st={broad_token}"))
+        );
+        assert_eq!(
+            artifact
+                .cookie_header_for_value(
+                    "st",
+                    narrow_token,
+                    CookieRequest::new(host, "/", true, NOW),
+                )
+                .expect("narrow path does not match"),
+            None
+        );
+        assert_eq!(
+            artifact
+                .cookie_header_for_value("st", "not-a-stored-token", users_request)
+                .expect("unknown selected token"),
+            None
+        );
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub(crate) struct ModuleProbeResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModuleProbeStatus {
     Active(ModulePlan),
+    /// Authentication was confirmed, but plan or entitlement lookup remained
+    /// unavailable after bounded retries and route failover.
+    Authenticated(ModulePlan),
+    /// Authentication succeeded, but the module confirmed that the account does not
+    /// currently have a usable entitlement. This remains distinct from a dead session.
+    NoEntitlement(ModulePlan),
     Dead,
     RateLimited,
     Error,
