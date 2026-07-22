@@ -18,6 +18,7 @@ import {
   CircleHelp,
   CircleDot,
   CircleGauge,
+  Clapperboard,
   Clock3,
   Disc3,
   Ellipsis,
@@ -160,6 +161,17 @@ interface ChatGptTaskSummary {
   enterprise: number;
 }
 
+interface ModuleTaskSummary {
+  active: number;
+  authenticatedUnknown?: number;
+  noEntitlement?: number;
+  dead: number;
+  rateLimited: number;
+  errors: number;
+  invalid: number;
+  plans: Record<string, number>;
+}
+
 
 interface TaskSnapshot {
   runId: string;
@@ -188,6 +200,7 @@ interface TaskSnapshot {
   exportedActive?: number;
   exportedFailed?: number;
   exportErrors?: number;
+  moduleSummary?: ModuleTaskSummary | null;
   chatgpt?: ChatGptTaskSummary | null;
 }
 
@@ -233,7 +246,7 @@ const pageMeta: Record<Page, { title: string; icon: LucideIcon }> = {
 
 const fallbackOverview: AppOverview = {
   version: "0.1.0",
-  modulesTotal: 13,
+  modulesTotal: 15,
   defaultThreads: 24,
   proxiesTotal: 0,
   proxiesLive: 0,
@@ -251,10 +264,12 @@ const fallbackModules: ModuleInfo[] = [
   ["stockx", "StockX", "Marketplace", "Marketplace for sneakers, streetwear, and collectibles"],
   ["airbnb", "Airbnb", "Marketplace", "Marketplace for stays and travel experiences"],
   ["spotify", "Spotify", "Entertainment", "Music, podcasts, and audio streaming platform"],
+  ["twitch", "Twitch", "Entertainment", "Live streaming for gaming, creators, and communities"],
+  ["max", "HBO Max", "Entertainment", "HBO, Warner Bros., movies, series, and live events"],
   ["kick", "Kick", "Social", "Live-streaming and creator platform"],
   ["instagram", "Instagram", "Social", "Photo, video, and social networking platform"],
   ["reddit", "Reddit", "Social", "Community discussion and content-sharing platform"],
-].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" }));
+].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" || id === "twitch" || id === "max" }));
 
 function App() {
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
@@ -445,7 +460,8 @@ function App() {
             {page === "tasks" && (
               <Tasks
                 modules={runnableModules}
-                defaultConcurrency={settings?.moduleThreads?.chatgpt ?? settings?.threads ?? 24}
+                defaultConcurrency={settings?.threads ?? 24}
+                moduleConcurrency={settings?.moduleThreads}
                 defaultDelayMs={settings?.delayMs ?? 120}
                 proxiesLive={overview?.proxiesLive ?? 0}
                 onOpenProxies={() => navigate("proxies")}
@@ -697,7 +713,7 @@ function Sidebar({
             <button className={page === item.id ? "nav-item active" : "nav-item"} key={item.id} onClick={() => onNavigate(item.id)} type="button">
               <Icon size={16} strokeWidth={1.7} />
               <span>{item.label}</span>
-              {item.id === "modules" && <small>{overview?.modulesTotal ?? 13}</small>}
+              {item.id === "modules" && <small>{overview?.modulesTotal ?? 15}</small>}
               {item.id === "proxies" && Boolean(overview?.proxiesTotal) && <small>{overview?.proxiesTotal}</small>}
             </button>
           );
@@ -916,6 +932,8 @@ const moduleIcons: Record<string, LucideIcon> = {
   stockx: TrendingUp,
   airbnb: House,
   spotify: Disc3,
+  twitch: Radio,
+  max: Clapperboard,
 };
 
 const moduleFilters: Array<{ id: string; label: string; icon: LucideIcon }> = [
@@ -929,7 +947,7 @@ const moduleFilters: Array<{ id: string; label: string; icon: LucideIcon }> = [
 const moduleTopics: Array<{ id: string; title: string; modules: string[] }> = [
   { id: "featured", title: "Featured", modules: ["chatgpt", "grok", "tiktok", "zai"] },
   { id: "commerce", title: "Commerce & services", modules: ["doordash", "uber", "sephora", "stockx", "airbnb"] },
-  { id: "media", title: "Media & communities", modules: ["spotify", "kick", "instagram", "reddit"] },
+  { id: "media", title: "Media & communities", modules: ["spotify", "twitch", "max", "kick", "instagram", "reddit"] },
 ];
 
 function Modules({ modules, preferences, onToggle, onConfigure }: { modules: ModuleInfo[]; preferences: Record<string, boolean>; onToggle: (id: string) => void; onConfigure: (id: string) => void }) {
@@ -1059,7 +1077,7 @@ function formatTaskDate(value: string | number | null) {
   return Number.isNaN(date.getTime()) ? value : taskDateFormatter.format(date);
 }
 
-function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpenProxies, onTaskSnapshot, onHistoryChanged }: { modules: ModuleInfo[]; defaultConcurrency: number; defaultDelayMs: number; proxiesLive: number; onOpenProxies: () => void; onTaskSnapshot: (snapshot: TaskSnapshot) => void; onHistoryChanged: () => void }) {
+function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs, proxiesLive, onOpenProxies, onTaskSnapshot, onHistoryChanged }: { modules: ModuleInfo[]; defaultConcurrency: number; moduleConcurrency?: Record<string, number>; defaultDelayMs: number; proxiesLive: number; onOpenProxies: () => void; onTaskSnapshot: (snapshot: TaskSnapshot) => void; onHistoryChanged: () => void }) {
   const enabledModules = useMemo(() => modules.filter((module) => module.enabled), [modules]);
   const preferredModuleId = enabledModules.find((module) => module.id === "chatgpt")?.id ?? enabledModules[0]?.id ?? "";
   const [moduleId, setModuleId] = useState(preferredModuleId);
@@ -1091,9 +1109,18 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
   const effectiveConcurrency = useProxy ? Math.min(requestedConcurrency, Math.max(1, proxiesLive)) : requestedConcurrency;
   const activeRunning = taskIsRunning(activeTask);
   const progress = Math.max(0, Math.min(100, activeTask?.percent ?? 0));
+  const moduleSummary = activeTask?.moduleSummary;
   const chatgptSummary = activeTask?.chatgpt;
-  const planSummary = chatgptSummary
-    ? [
+  const outcomeSummary = moduleSummary ?? chatgptSummary;
+  const hasDetailedOutcome = Boolean(outcomeSummary);
+  const planSummary = moduleSummary
+    ? Object.entries(moduleSummary.plans)
+        .filter(([, count]) => count > 0)
+        .sort(([, left], [, right]) => right - left)
+        .map(([plan, count]) => `${plan}: ${count}`)
+        .join(" · ")
+    : chatgptSummary
+      ? [
         ["Free", chatgptSummary.free],
         ["Go", chatgptSummary.go],
         ["Plus", chatgptSummary.plus],
@@ -1101,7 +1128,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
         ["Team", chatgptSummary.team],
         ["Enterprise", chatgptSummary.enterprise],
       ].filter(([, count]) => Number(count) > 0).map(([plan, count]) => `${plan}: ${count}`).join(" · ")
-    : "";
+      : "";
   const historyPageSize = 5;
   const historyPageCount = Math.max(1, Math.ceil(history.length / historyPageSize));
   const visibleHistory = history.slice(historyPage * historyPageSize, (historyPage + 1) * historyPageSize);
@@ -1148,8 +1175,9 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
   }, [enabledModules, moduleId, preferredModuleId]);
 
   useEffect(() => {
-    setConcurrency(Math.max(1, Math.min(32, defaultConcurrency)));
-  }, [defaultConcurrency]);
+    const configured = moduleConcurrency?.[moduleId] ?? defaultConcurrency;
+    setConcurrency(Math.max(1, Math.min(32, configured)));
+  }, [defaultConcurrency, moduleConcurrency, moduleId]);
 
   useEffect(() => {
     setDelayMs(defaultDelayMs);
@@ -1302,7 +1330,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
               </div>
               <div className="task-active-progress"><div><span>{Math.max(0, activeTask.total - activeTask.queued - activeTask.running)} of {activeTask.total}</span><strong>{Math.round(progress)}%</strong></div><progress className="task-progress" value={progress} max="100" /></div>
               <div className="task-active-stats">
-                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{chatgptSummary?.active ?? activeTask.succeeded} succeeded</span><span>{chatgptSummary?.dead ?? activeTask.failed} failed</span>{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
+                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{outcomeSummary?.active ?? activeTask.succeeded} active</span>{moduleSummary && (moduleSummary.authenticatedUnknown ?? 0) > 0 && <span>{moduleSummary.authenticatedUnknown ?? 0} authenticated · plan unavailable</span>}{moduleSummary && (moduleSummary.noEntitlement ?? 0) > 0 && <span>{moduleSummary.noEntitlement ?? 0} no entitlement</span>}<span>{outcomeSummary?.dead ?? activeTask.failed} {hasDetailedOutcome ? "dead" : "failed"}</span>{moduleSummary && moduleSummary.rateLimited > 0 && <span>{moduleSummary.rateLimited} rate limited</span>}{moduleSummary && moduleSummary.errors > 0 && <span>{moduleSummary.errors} errors</span>}{moduleSummary && moduleSummary.invalid > 0 && <span>{moduleSummary.invalid} invalid</span>}{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
               </div>
               <button className="button danger task-active-cancel" type="button" onClick={cancel} disabled={cancelling}><StopCircle size={14} />{cancelling ? "Cancelling…" : "Cancel"}</button>
             </article>
@@ -1353,7 +1381,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
                 </div>
                 <div className="settings-row task-source-row"><div className="settings-copy"><strong>Source preview</strong><small>{entryLimitExceeded ? "The 10,000-path limit has been exceeded." : duplicateEntryCount ? `${duplicateEntryCount} duplicate path(s) will be removed.` : "Cookie totals are calculated after the local scan starts."}</small></div><div className="task-source-summary"><span><strong>{uniqueEntryCount.toLocaleString("en-US")}</strong>Paths</span><span><strong>—</strong>Cookies</span></div></div>
                 <div className="settings-row task-output-row">
-                  <div className="settings-copy"><strong>Results folder <span className="optional-label">Optional</span></strong><small>{`Copies results into ${selectedModule?.name ?? "Module"}/active and ${selectedModule?.name ?? "Module"}/failed. Original files stay untouched.`}</small></div>
+                  <div className="settings-copy"><strong>Results folder <span className="optional-label">Optional</span></strong><small>{`Copies results into ${selectedModule?.id ?? "module"}/active and ${selectedModule?.id ?? "module"}/failed. Original files stay untouched.`}</small></div>
                   <div className="task-output-control">
                     <button className="button outline small task-output-picker" type="button" onClick={() => void chooseOutputDirectory()} disabled={starting || selectingOutputDirectory} title={outputDirectory || undefined}><FolderOpen size={13} /><span>{selectingOutputDirectory ? "Opening…" : outputFolderName || "Choose folder"}</span></button>
                     {outputDirectory && <button className="icon-button ghost task-output-clear" type="button" onClick={() => { setOutputDirectory(""); setMessage(""); }} disabled={starting || selectingOutputDirectory} aria-label="Clear results folder" title="Clear results folder"><X size={14} /></button>}
@@ -1367,7 +1395,7 @@ function Tasks({ modules, defaultConcurrency, defaultDelayMs, proxiesLive, onOpe
               <div className="settings-group task-create-group">
                 <div className="settings-row task-proxy-setting"><div className="settings-copy"><strong>Proxy routing</strong><small>{proxiesLive > 0 ? `${proxiesLive} live ${proxiesLive === 1 ? "proxy" : "proxies"} available` : "Add and check proxies before enabling this option."}</small>{proxiesLive === 0 && <button className="inline-action" type="button" onClick={onOpenProxies}>Manage proxies</button>}</div><button className={useProxy ? "switch-control active" : "switch-control"} type="button" role="switch" aria-checked={useProxy} onClick={() => setUseProxy((current) => !current)} disabled={starting || proxiesLive === 0}><span /></button></div>
                 <SettingNumberRow id="task-concurrency" label="Concurrency" description={useProxy && effectiveConcurrency < requestedConcurrency ? `${requestedConcurrency} requested · ${effectiveConcurrency} effective with the current proxy pool.` : "Parallel workers. Higher values use more CPU and network capacity."} min={1} max={32} value={concurrency} onChange={setConcurrency} disabled={starting} />
-                <SettingNumberRow id="task-delay" label="Worker delay" description="Pause between entries per worker, in milliseconds." min={0} max={60_000} value={delayMs} onChange={setDelayMs} disabled={starting} />
+                <SettingNumberRow id="task-delay" label={selectedModule && selectedModule.id !== "chatgpt" ? "Request spacing" : "Worker delay"} description={selectedModule && selectedModule.id !== "chatgpt" ? `Minimum global spacing between ${selectedModule.name} requests, including retries and proxy failover.` : "Pause between entries per worker, in milliseconds."} min={0} max={60_000} value={delayMs} onChange={setDelayMs} disabled={starting} />
               </div>
             </section>
           </div>
