@@ -67,7 +67,7 @@ From a trusted release environment that can access the Forge artifact directory,
   -DryRun
 ```
 
-The dry run validates that the directory contains exactly one correctly named NSIS installer and its matching `.sig`, verifies the signature, confirms the new version is strictly newer than the current published version, computes the installer SHA-256, and writes UTF-8 `latest.json` with an immutable release URL. It may perform anonymous network reads, but it does not create or modify a GitHub release.
+The dry run selects the exact versioned NSIS installer and matching `.sig` by name, safely ignoring stale installers from Forge's shared bundle cache. It verifies the signature, confirms the new version is strictly newer than the current published version, computes the installer SHA-256, and writes UTF-8 `latest.json` with an immutable release URL. It may perform anonymous network reads, but it does not create or modify a GitHub release.
 
 After reviewing the version, SHA-256, signature source, and metadata, omit `-DryRun` to publish:
 

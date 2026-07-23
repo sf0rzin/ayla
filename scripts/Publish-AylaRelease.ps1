@@ -545,28 +545,22 @@ if (-not $artifactItem.PSIsContainer) {
 
 $artifactPath = $artifactItem.FullName
 $installers = @(Get-ChildItem -LiteralPath $artifactPath -File -Force | Where-Object {
-    $_.Name -like 'Ayla_*_x64-setup.exe'
+    [string]::Equals($_.Name, $expectedInstallerName, [System.StringComparison]::Ordinal)
 })
 if ($installers.Count -ne 1) {
-    throw "Artifact directory must contain exactly one Ayla_*_x64-setup.exe file; found $($installers.Count)."
+    throw "Artifact directory must contain exactly one '$expectedInstallerName' file; found $($installers.Count)."
 }
 
 $installer = $installers[0]
-if (-not [string]::Equals($installer.Name, $expectedInstallerName, [System.StringComparison]::Ordinal)) {
-    throw "Installer name mismatch: expected '$expectedInstallerName', found '$($installer.Name)'."
-}
 
 $signatures = @(Get-ChildItem -LiteralPath $artifactPath -File -Force | Where-Object {
-    $_.Name -like 'Ayla_*_x64-setup.exe.sig'
+    [string]::Equals($_.Name, $expectedSignatureName, [System.StringComparison]::Ordinal)
 })
 if ($signatures.Count -ne 1) {
-    throw "Artifact directory must contain exactly one Ayla_*_x64-setup.exe.sig file; found $($signatures.Count)."
+    throw "Artifact directory must contain exactly one '$expectedSignatureName' file; found $($signatures.Count)."
 }
 
 $signatureFile = $signatures[0]
-if (-not [string]::Equals($signatureFile.Name, $expectedSignatureName, [System.StringComparison]::Ordinal)) {
-    throw "Signature name mismatch: expected '$expectedSignatureName', found '$($signatureFile.Name)'."
-}
 
 foreach ($artifact in @($installer, $signatureFile)) {
     if (($artifact.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
