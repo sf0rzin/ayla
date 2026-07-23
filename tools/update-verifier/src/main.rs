@@ -1,6 +1,13 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use minisign_verify::{PublicKey, Signature};
-use std::{env, ffi::OsString, fs::File, io::Read, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    ffi::OsString,
+    fs::{self, File},
+    io::Read,
+    path::PathBuf,
+    process::ExitCode,
+};
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -34,6 +41,17 @@ fn decode_tauri_public_key(wrapped: &str) -> Result<PublicKey, String> {
 
     PublicKey::decode(&normalized)
         .map_err(|error| format!("the decoded Minisign public key is invalid: {error}"))
+}
+
+fn decode_tauri_signature(wrapped: &str) -> Result<Signature, String> {
+    let decoded = STANDARD
+        .decode(wrapped.as_bytes())
+        .map_err(|_| "the Tauri updater signature is not strict standard Base64".to_string())?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| "the decoded Tauri updater signature is not UTF-8".to_string())?;
+
+    Signature::decode(&decoded)
+        .map_err(|error| format!("the decoded Minisign signature is invalid: {error}"))
 }
 
 fn verify_reader<R: Read>(
@@ -83,8 +101,9 @@ fn run() -> Result<(), String> {
     }
 
     let public_key = decode_tauri_public_key(&wrapped_public_key)?;
-    let signature = Signature::from_file(&signature_path)
-        .map_err(|error| format!("the detached signature is invalid: {error}"))?;
+    let wrapped_signature = fs::read_to_string(&signature_path)
+        .map_err(|error| format!("the detached signature could not be read: {error}"))?;
+    let signature = decode_tauri_signature(&wrapped_signature)?;
     let installer = File::open(&installer)
         .map_err(|error| format!("the installer could not be opened: {error}"))?;
 
@@ -112,9 +131,11 @@ mod tests {
     const SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1556193335\tfile:test\ny/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==";
 
     fn fixture() -> (PublicKey, Signature) {
-        let wrapped = STANDARD.encode(PUBLIC_KEY.as_bytes());
-        let public_key = decode_tauri_public_key(&wrapped).expect("public key should decode");
-        let signature = Signature::decode(SIGNATURE).expect("signature should decode");
+        let wrapped_key = STANDARD.encode(PUBLIC_KEY.as_bytes());
+        let wrapped_signature = STANDARD.encode(SIGNATURE.as_bytes());
+        let public_key = decode_tauri_public_key(&wrapped_key).expect("public key should decode");
+        let signature =
+            decode_tauri_signature(&wrapped_signature).expect("signature should decode");
         (public_key, signature)
     }
 
@@ -135,5 +156,10 @@ mod tests {
     fn rejects_extra_decoded_lines() {
         let wrapped = STANDARD.encode(format!("{PUBLIC_KEY}extra\n").as_bytes());
         assert!(decode_tauri_public_key(&wrapped).is_err());
+    }
+
+    #[test]
+    fn rejects_unwrapped_minisign_signature() {
+        assert!(decode_tauri_signature(SIGNATURE).is_err());
     }
 }

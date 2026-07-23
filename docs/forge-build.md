@@ -54,7 +54,7 @@ Ayla_<version>_x64-setup.exe.sig
 
 Tauri updater signatures are mandatory. The release job may sign the completed NSIS installer separately with Tauri's signer, or use an explicit release-only Tauri config override that enables updater artifacts. In both cases, the private key and password must be injected only into that transient release process and removed in a `finally` path. They must remain outside both repositories, persistent Forge configuration, application bundles, command output, and build logs.
 
-The publishing helper never reads or manages signing credentials. Before any GitHub mutation, it loads the exact base64-wrapped updater public key from `src-tauri/tauri.conf.json`, decodes the complete two-line Minisign public key, and uses the locked Rust verifier in `tools/update-verifier` to cryptographically verify the installer and detached signature. It also checks all project versions, requires the matching NSIS product version, and checks the current anonymous public release. `GH_DEBUG` must be unset.
+The publishing helper never reads or manages signing credentials. Before any GitHub mutation, it loads the exact base64-wrapped updater public key from `src-tauri/tauri.conf.json`, decodes both Tauri's Base64 signature envelope and the complete Minisign records inside it, and uses the locked Rust verifier in `tools/update-verifier` to cryptographically verify the installer and detached signature. It also checks all project versions, requires the matching NSIS product version, and checks the current anonymous public release. `GH_DEBUG` must be unset.
 
 ### Validate and publish
 
