@@ -334,6 +334,63 @@ const fallbackModules: ModuleInfo[] = [
   ["reddit", "Reddit", "Social", "Community discussion and content-sharing platform"],
 ].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" || id === "twitch" || id === "max" }));
 
+const overviewPreviewEnabled = import.meta.env.DEV
+  && typeof window !== "undefined"
+  && new URLSearchParams(window.location.search).get("preview") === "overview";
+
+const overviewPreviewSession: AuthSession = {
+  token: "development-overview-preview",
+  expiresAt: new Date(0).toISOString(),
+  user: {
+    id: "development-overview-preview",
+    name: "Ayla Preview",
+    email: "preview@ayla.local",
+    role: "admin",
+  },
+};
+
+const overviewPreviewHistory: TaskHistoryEntry[] = [
+  [0, "chatgpt", 140, 136],
+  [0, "twitch", 82, 79],
+  [0, "max", 64, 61],
+  [2, "chatgpt", 118, 114],
+  [5, "twitch", 92, 89],
+  [5, "chatgpt", 153, 149],
+  [9, "max", 76, 72],
+  [13, "chatgpt", 121, 118],
+  [18, "twitch", 98, 96],
+  [18, "max", 68, 64],
+  [27, "chatgpt", 132, 128],
+  [34, "twitch", 88, 85],
+  [46, "chatgpt", 105, 102],
+  [59, "max", 73, 70],
+  [74, "chatgpt", 147, 142],
+  [96, "twitch", 91, 87],
+  [124, "chatgpt", 116, 113],
+  [157, "max", 69, 66],
+  [203, "chatgpt", 129, 125],
+  [248, "twitch", 84, 81],
+  [301, "chatgpt", 112, 108],
+].map(([daysAgo, moduleId, total, succeeded], index) => {
+  const finishedAt = new Date();
+  finishedAt.setDate(finishedAt.getDate() - Number(daysAgo));
+  finishedAt.setHours(12, 0, 0, 0);
+  const startedAt = new Date(finishedAt.getTime() - 72_000);
+  return {
+    runId: `overview-preview-${index}`,
+    moduleId: String(moduleId),
+    status: "completed",
+    total: Number(total),
+    succeeded: Number(succeeded),
+    failed: Number(total) - Number(succeeded),
+    skipped: 0,
+    concurrency: 24,
+    delayMs: 120,
+    startedAt: startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+  };
+});
+
 function hasTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -352,7 +409,9 @@ function userRoleLabel(user: AuthUser) {
 }
 
 function App() {
-  const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+  const [authSession, setAuthSession] = useState<AuthSession | null>(() => (
+    overviewPreviewEnabled ? overviewPreviewSession : null
+  ));
 
   if (!authSession) {
     return <LoginPreview onAuthenticated={setAuthSession} />;
@@ -361,7 +420,7 @@ function App() {
   const handleLogout = () => {
     const token = authSession.token;
     setAuthSession(null);
-    void logout(token).catch(() => undefined);
+    if (!overviewPreviewEnabled) void logout(token).catch(() => undefined);
   };
 
   return <WorkspaceApp user={authSession.user} onLogout={handleLogout} />;
@@ -575,12 +634,22 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [overview, setOverview] = useState<AppOverview | null>(fallbackOverview);
+  const [overview, setOverview] = useState<AppOverview | null>(() => (
+    overviewPreviewEnabled
+      ? { ...fallbackOverview, version: "0.3.0", proxiesTotal: 48, proxiesLive: 44 }
+      : fallbackOverview
+  ));
   const [modules, setModules] = useState<ModuleInfo[]>(fallbackModules);
   const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(null);
+  const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(() => (
+    overviewPreviewEnabled
+      ? { cpuPercent: 23, cpuCount: 8, memoryUsedBytes: 7_730_941_132, memoryTotalBytes: 17_179_869_184 }
+      : null
+  ));
   const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null);
-  const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>([]);
+  const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>(() => (
+    overviewPreviewEnabled ? overviewPreviewHistory : []
+  ));
   const [configuredModuleId, setConfiguredModuleId] = useState<string | null>(null);
   const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
   const pendingUpdateRef = useRef<Update | null>(null);
@@ -792,7 +861,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         setModules(nextModules);
         setSettings(nextSettings);
       })
-      .catch((reason: unknown) => setError(String(reason)));
+      .catch((reason: unknown) => {
+        if (!overviewPreviewEnabled) setError(String(reason));
+      });
   }, []);
 
   useEffect(() => {
@@ -1392,20 +1463,39 @@ function ContributionActivity({ history }: { history: TaskHistoryEntry[] }) {
   return (
     <article className="card contribution-card">
       <div className="section-heading">
-        <h2>Task activity</h2>
-        <span className="contribution-summary">{total} {total === 1 ? "task" : "tasks"} in the last 12 months</span>
+        <div>
+          <h2>Task activity</h2>
+          <span>Last 12 months</span>
+        </div>
+        <span className="contribution-summary"><strong>{total}</strong> {total === 1 ? "task" : "tasks"}</span>
       </div>
       <div className="contribution-scroll">
-        <div className="heatmap-grid">
-          {weeks.flatMap((week) => week.map((date) => {
-            const count = activity.get(localDayKey(date)) ?? 0;
-            const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maximum) * 4));
-            const label = `${new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date)}: ${count} ${count === 1 ? "task" : "tasks"}`;
-            return <span className={`heatmap-cell level-${level}`} key={localDayKey(date)} title={label} aria-label={label} />;
-          }))}
-        </div>
         <div className="heatmap-months">
           {monthLabels.map((label, index) => <span key={`${label}-${index}`}>{label}</span>)}
+        </div>
+        <div className="heatmap-body">
+          <div className="heatmap-weekdays" aria-hidden="true">
+            <span />
+            <span>Mon</span>
+            <span />
+            <span>Wed</span>
+            <span />
+            <span>Fri</span>
+            <span />
+          </div>
+          <div className="heatmap-grid" role="img" aria-label={`${total} ${total === 1 ? "task" : "tasks"} in the last 12 months`}>
+            {weeks.flatMap((week) => week.map((date) => {
+              const count = activity.get(localDayKey(date)) ?? 0;
+              const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maximum) * 4));
+              const label = `${new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date)}: ${count} ${count === 1 ? "task" : "tasks"}`;
+              return <span className={`heatmap-cell level-${level}`} key={localDayKey(date)} title={label} aria-label={label} />;
+            }))}
+          </div>
+        </div>
+        <div className="heatmap-legend" aria-hidden="true">
+          <span>Less</span>
+          {[0, 1, 2, 3, 4].map((level) => <i className={`heatmap-cell level-${level}`} key={level} />)}
+          <span>More</span>
         </div>
       </div>
     </article>
