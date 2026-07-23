@@ -255,6 +255,19 @@ function Invoke-AnonymousWebRequest {
     return Invoke-WebRequest @parameters
 }
 
+function Convert-WebResponseContentToText {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Response
+    )
+
+    if ($Response.Content -is [byte[]]) {
+        return [System.Text.Encoding]::UTF8.GetString($Response.Content)
+    }
+
+    return [string]$Response.Content
+}
+
 function Get-LatestPublishedVersion {
     try {
         $response = Invoke-AnonymousWebRequest -Uri $githubLatestApiUrl
@@ -267,7 +280,7 @@ function Get-LatestPublishedVersion {
     }
 
     try {
-        $release = ConvertFrom-Json -InputObject $response.Content
+        $release = ConvertFrom-Json -InputObject (Convert-WebResponseContentToText -Response $response)
     }
     catch {
         throw 'The current public GitHub release response is not valid JSON.'
@@ -439,7 +452,7 @@ function Assert-PublicChannelOnce {
     $response = Invoke-AnonymousWebRequest -Uri "$publicLatestUrl`?verification=$cacheBuster"
 
     try {
-        $publicMetadata = ConvertFrom-Json -InputObject $response.Content
+        $publicMetadata = ConvertFrom-Json -InputObject (Convert-WebResponseContentToText -Response $response)
     }
     catch {
         throw 'Public latest.json is not valid JSON.'
