@@ -1,6 +1,6 @@
 [package]
 name = "ayla"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ayla desktop application"
 authors = ["Ayla contributors"]
 edition = "2024"
@@ -30,6 +30,8 @@ wreq = { version = "=6.0.0-rc.29", features = ["brotli", "cookies", "deflate", "
 wreq-util = { version = "=3.0.0-rc.14", features = ["emulation-compression", "tokio-rt"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [dev-dependencies]
 tempfile = "3"

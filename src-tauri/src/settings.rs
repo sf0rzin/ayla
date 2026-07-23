@@ -33,6 +33,7 @@ pub struct AppSettings {
     pub max_scan_directories: u32,
     pub max_scan_files: u32,
     pub scan_budget_mib: u32,
+    pub auto_check_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -46,6 +47,7 @@ impl Default for AppSettings {
             max_scan_directories: DEFAULT_MAX_SCAN_DIRECTORIES,
             max_scan_files: DEFAULT_MAX_SCAN_FILES,
             scan_budget_mib: DEFAULT_SCAN_BUDGET_MIB,
+            auto_check_updates: true,
         }
     }
 }
@@ -168,6 +170,7 @@ mod tests {
             max_scan_directories: u32::MAX,
             max_scan_files: u32::MAX,
             scan_budget_mib: u32::MAX,
+            auto_check_updates: false,
         }
         .normalized();
 
@@ -181,6 +184,7 @@ mod tests {
         assert_eq!(settings.max_scan_directories, MAX_SCAN_DIRECTORIES);
         assert_eq!(settings.max_scan_files, MAX_SCAN_FILES);
         assert_eq!(settings.scan_budget_mib, MAX_SCAN_BUDGET_MIB);
+        assert!(!settings.auto_check_updates);
     }
 
     #[test]
@@ -196,10 +200,11 @@ mod tests {
         assert_eq!(settings.max_scan_directories, DEFAULT_MAX_SCAN_DIRECTORIES);
         assert_eq!(settings.max_scan_files, DEFAULT_MAX_SCAN_FILES);
         assert_eq!(settings.scan_budget_mib, DEFAULT_SCAN_BUDGET_MIB);
+        assert!(settings.auto_check_updates);
     }
 
     #[test]
-    fn legacy_settings_receive_discovery_defaults() {
+    fn legacy_settings_receive_new_defaults() {
         let settings: AppSettings = serde_json::from_value(serde_json::json!({
             "threads": 32,
             "moduleThreads": {},
@@ -212,6 +217,7 @@ mod tests {
         assert_eq!(settings.max_scan_directories, DEFAULT_MAX_SCAN_DIRECTORIES);
         assert_eq!(settings.max_scan_files, DEFAULT_MAX_SCAN_FILES);
         assert_eq!(settings.scan_budget_mib, DEFAULT_SCAN_BUDGET_MIB);
+        assert!(settings.auto_check_updates);
     }
 
     #[test]
@@ -226,6 +232,7 @@ mod tests {
                 max_scan_directories: 2_500,
                 max_scan_files: 25_000,
                 scan_budget_mib: 768,
+                auto_check_updates: false,
                 ..AppSettings::default()
             })
             .expect("save settings");
@@ -233,6 +240,7 @@ mod tests {
         assert_eq!(saved.max_scan_directories, 2_500);
         assert_eq!(saved.max_scan_files, 25_000);
         assert_eq!(saved.scan_budget_mib, 768);
+        assert!(!saved.auto_check_updates);
 
         let reopened = SettingsStore::open(path);
         assert_eq!(reopened.snapshot().expect("read settings"), saved);

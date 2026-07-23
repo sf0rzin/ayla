@@ -17,7 +17,7 @@ use proxy_checker::{CheckProxiesRequest, CheckProxiesResponse};
 use proxy_store::{AddProxiesResult, ProxyItem, ProxyManager};
 use serde::Serialize;
 use settings::{AppSettings, SettingsStore};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use sysinfo::System;
 use task_engine::{DiscoveryLimits, StartTaskRequest, TaskEngine, TaskHistoryEntry, TaskSnapshot};
 use tauri::{AppHandle, Manager, State};
@@ -35,6 +35,80 @@ struct AppOverview {
 }
 
 struct SystemMetricsStore(Mutex<System>);
+
+#[derive(Default)]
+struct UpdateInstallGate(RwLock<bool>);
+
+impl UpdateInstallGate {
+    fn begin_background_operation(&self) -> Result<RwLockReadGuard<'_, bool>, String> {
+        let guard = self
+            .0
+            .read()
+            .map_err(|_| "the update safety gate is unavailable".to_string())?;
+        if *guard {
+            return Err(
+                "an application update is being installed; restart Ayla to continue".to_string(),
+            );
+        }
+        Ok(guard)
+    }
+
+    fn try_lock_for_install(&self) -> Result<Option<RwLockWriteGuard<'_, bool>>, String> {
+        match self.0.try_write() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                Err("the update safety gate is unavailable".to_string())
+            }
+        }
+    }
+
+    fn release(&self) -> Result<(), String> {
+        let mut armed = self
+            .0
+            .write()
+            .map_err(|_| "the update safety gate is unavailable".to_string())?;
+        *armed = false;
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInstallReadiness {
+    can_install: bool,
+    task_running: bool,
+    proxy_check_running: bool,
+    blocked_reason: Option<&'static str>,
+}
+
+fn evaluate_update_install_readiness(
+    task_running: bool,
+    proxy_check_running: bool,
+) -> UpdateInstallReadiness {
+    let blocked_reason = match (task_running, proxy_check_running) {
+        (true, true) => Some("Wait for the active task and proxy check to finish."),
+        (true, false) => Some("Wait for the active task to finish."),
+        (false, true) => Some("Wait for the proxy check to finish."),
+        (false, false) => None,
+    };
+
+    UpdateInstallReadiness {
+        can_install: blocked_reason.is_none(),
+        task_running,
+        proxy_check_running,
+        blocked_reason,
+    }
+}
+
+fn background_operation_is_starting() -> UpdateInstallReadiness {
+    UpdateInstallReadiness {
+        can_install: false,
+        task_running: false,
+        proxy_check_running: false,
+        blocked_reason: Some("A background operation is starting. Try again in a moment."),
+    }
+}
 
 impl SystemMetricsStore {
     fn new() -> Self {
@@ -87,6 +161,32 @@ fn get_app_overview(
         proxies_live,
         storage_path: settings.path().display().to_string(),
     })
+}
+
+#[tauri::command]
+fn prepare_update_install(
+    gate: State<'_, UpdateInstallGate>,
+    tasks: State<'_, TaskEngine>,
+    proxies: State<'_, ProxyManager>,
+) -> Result<UpdateInstallReadiness, String> {
+    let Some(mut armed) = gate.try_lock_for_install()? else {
+        return Ok(background_operation_is_starting());
+    };
+    if *armed {
+        return Ok(evaluate_update_install_readiness(false, false));
+    }
+
+    let readiness =
+        evaluate_update_install_readiness(!tasks.list_active().is_empty(), proxies.is_checking()?);
+    if readiness.can_install {
+        *armed = true;
+    }
+    Ok(readiness)
+}
+
+#[tauri::command]
+fn release_update_install_gate(gate: State<'_, UpdateInstallGate>) -> Result<(), String> {
+    gate.release()
 }
 
 #[tauri::command]
@@ -156,6 +256,8 @@ async fn check_proxies(
 ) -> Result<CheckProxiesResponse, String> {
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let gate = worker_app.state::<UpdateInstallGate>();
+        let _operation = gate.begin_background_operation()?;
         let manager = worker_app.state::<ProxyManager>();
         proxy_checker::run_check(&worker_app, &manager, request)
     })
@@ -167,6 +269,8 @@ async fn check_proxies(
 async fn start_task(app: AppHandle, request: StartTaskRequest) -> Result<TaskSnapshot, String> {
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let gate = worker_app.state::<UpdateInstallGate>();
+        let _operation = gate.begin_background_operation()?;
         let settings = worker_app.state::<SettingsStore>();
         let proxies = worker_app.state::<ProxyManager>();
         let engine = worker_app.state::<TaskEngine>();
@@ -264,6 +368,8 @@ fn clear_task_history(state: State<'_, TaskEngine>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let settings_path = config_dir.join("settings.json");
@@ -273,10 +379,13 @@ pub fn run() {
             app.manage(ProxyManager::open(proxies_path));
             app.manage(TaskEngine::open(task_history_path, app.handle().clone()));
             app.manage(SystemMetricsStore::new());
+            app.manage(UpdateInstallGate::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_app_overview,
+            prepare_update_install,
+            release_update_install_gate,
             get_system_metrics,
             list_modules,
             get_settings,
@@ -298,4 +407,55 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Ayla");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_install_is_ready_only_when_background_work_is_idle() {
+        let ready = evaluate_update_install_readiness(false, false);
+        assert!(ready.can_install);
+        assert_eq!(ready.blocked_reason, None);
+
+        let task_blocked = evaluate_update_install_readiness(true, false);
+        assert!(!task_blocked.can_install);
+        assert_eq!(
+            task_blocked.blocked_reason,
+            Some("Wait for the active task to finish.")
+        );
+
+        let proxy_blocked = evaluate_update_install_readiness(false, true);
+        assert!(!proxy_blocked.can_install);
+        assert_eq!(
+            proxy_blocked.blocked_reason,
+            Some("Wait for the proxy check to finish.")
+        );
+    }
+
+    #[test]
+    fn update_gate_excludes_new_background_operations_until_released() {
+        let gate = UpdateInstallGate::default();
+        let operation = gate
+            .begin_background_operation()
+            .expect("background operation starts while idle");
+        assert!(
+            gate.try_lock_for_install()
+                .expect("gate remains healthy")
+                .is_none()
+        );
+        drop(operation);
+
+        let mut install = gate
+            .try_lock_for_install()
+            .expect("gate remains healthy")
+            .expect("install obtains the exclusive startup lock");
+        *install = true;
+        drop(install);
+        assert!(gate.begin_background_operation().is_err());
+
+        gate.release().expect("release install gate");
+        assert!(gate.begin_background_operation().is_ok());
+    }
 }

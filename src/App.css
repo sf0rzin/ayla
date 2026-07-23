@@ -634,6 +634,39 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
 .number-input::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
 .settings-savebar { min-height: 56px; margin-top: 20px; padding: 12px 0 0; display: flex; align-items: center; justify-content: flex-end; gap: 14px; border-top: 1px solid var(--border-subtle); }
 .settings-savebar span { margin-right: auto; color: var(--success); font-size: 10px; }
+.update-check-row { grid-template-columns: minmax(0, 1fr) auto; }
+.update-check-button { min-width: 140px; }
+.update-version-summary { min-width: 0; display: grid; justify-items: end; gap: 5px; }
+.update-version-summary > strong { color: var(--text-primary); font-size: 13px; font-weight: 500; }
+.update-status { padding: 3px 7px; border-radius: var(--radius-full); color: var(--text-tertiary); background: var(--bg-tertiary); font-size: 9px; line-height: 1.2; white-space: nowrap; }
+.update-status-current, .update-status-ready { color: var(--success); background: var(--success-subtle); }
+.update-status-available, .update-status-downloading, .update-status-installing, .update-status-restarting, .update-status-checking { color: var(--text-primary); background: var(--active-wash); }
+.update-status-blocked { color: var(--warning); background: var(--warning-subtle); }
+.update-status-error { color: var(--danger); background: var(--danger-subtle); }
+.update-release-panel { padding: 20px; border-top: 1px solid var(--border-subtle); background: rgba(0, 0, 0, 0.1); }
+.update-release-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.update-release-heading > div { min-width: 0; display: grid; gap: 4px; }
+.update-release-heading span { color: var(--text-tertiary); font-size: 10px; }
+.update-release-heading strong { font-size: 15px; font-weight: 500; letter-spacing: -0.01em; }
+.update-release-heading small { color: var(--text-tertiary); font-size: 10px; }
+.update-release-notes { margin-top: 18px; display: grid; gap: 6px; }
+.update-release-notes > strong { font-size: 11px; }
+.update-release-notes p { max-width: 720px; margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.55; white-space: pre-wrap; }
+.update-download-progress { margin-top: 18px; display: grid; gap: 8px; }
+.update-download-progress > div { display: flex; justify-content: space-between; gap: 18px; color: var(--text-tertiary); font-size: 10px; }
+.update-download-progress strong { color: var(--text-secondary); font-weight: 500; }
+.update-download-progress progress { width: 100%; height: 5px; overflow: hidden; border: 0; border-radius: var(--radius-full); appearance: none; }
+.update-download-progress progress::-webkit-progress-bar { background: var(--bg-tertiary); }
+.update-download-progress progress::-webkit-progress-value { border-radius: inherit; background: var(--accent); }
+.is-spinning { animation: update-spin 900ms linear infinite; }
+
+@keyframes update-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .is-spinning { animation: none; }
+}
 
 .modal-backdrop { position: fixed; z-index: 200; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(0, 0, 0, 0.62); backdrop-filter: blur(6px); }
 .about-dialog { width: min(330px, 100%); padding: 28px; display: grid; justify-items: center; border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--bg-overlay); box-shadow: 0 24px 70px rgba(0, 0, 0, 0.62), var(--highlight-top); text-align: center; }
@@ -689,6 +722,11 @@ h1, h2, h3, h4, h5, h6, strong, b { font-weight: 500; }
   .settings-page-header { padding-top: 4px; padding-bottom: 14px; }
   .settings-sections { margin-top: 14px; gap: 14px; }
   .settings-row { gap: 14px; padding: 10px 12px; }
+  .update-check-row { grid-template-columns: 1fr; }
+  .update-check-button { width: 100%; }
+  .update-release-panel { padding: 16px 12px; }
+  .update-release-heading { align-items: stretch; flex-direction: column; gap: 14px; }
+  .update-release-heading .button { width: 100%; }
   .task-input-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-input-grid label:first-child { grid-column: 1 / -1; }
   .task-history-row { grid-template-columns: 30px minmax(0, 1fr) auto; }

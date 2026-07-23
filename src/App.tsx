@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity,
@@ -21,6 +23,7 @@ import {
   Clapperboard,
   Clock3,
   Disc3,
+  Download,
   Ellipsis,
   FileUp,
   Flower2,
@@ -43,6 +46,7 @@ import {
   Play,
   Plus,
   Radio,
+  RefreshCw,
   Search,
   Settings2,
   ShieldCheck,
@@ -89,7 +93,53 @@ interface AppSettings {
   maxScanDirectories: number;
   maxScanFiles: number;
   scanBudgetMib: number;
+  autoCheckUpdates: boolean;
 }
+
+type UpdatePhase = "idle" | "checking" | "current" | "available" | "downloading" | "ready" | "installing" | "restarting" | "blocked" | "error" | "unsupported";
+
+interface AppUpdateState {
+  phase: UpdatePhase;
+  version: string;
+  notes: string;
+  publishedAt: string;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  downloadComplete: boolean;
+  message: string;
+}
+
+interface UpdateInstallReadiness {
+  canInstall: boolean;
+  taskRunning: boolean;
+  proxyCheckRunning: boolean;
+  blockedReason: string | null;
+}
+
+const initialUpdateState: AppUpdateState = {
+  phase: "idle",
+  version: "",
+  notes: "",
+  publishedAt: "",
+  downloadedBytes: 0,
+  totalBytes: null,
+  downloadComplete: false,
+  message: "Updates are signed and delivered through public GitHub Releases.",
+};
+
+const updatePhaseLabels: Record<UpdatePhase, string> = {
+  idle: "Ready",
+  checking: "Checking",
+  current: "Up to date",
+  available: "Available",
+  downloading: "Downloading",
+  ready: "Ready to install",
+  installing: "Installing",
+  restarting: "Restarting",
+  blocked: "Waiting",
+  error: "Needs attention",
+  unsupported: "Desktop only",
+};
 
 interface SystemMetrics {
   cpuPercent: number;
@@ -245,7 +295,7 @@ const pageMeta: Record<Page, { title: string; icon: LucideIcon }> = {
 };
 
 const fallbackOverview: AppOverview = {
-  version: "0.1.0",
+  version: "0.2.0",
   modulesTotal: 15,
   defaultThreads: 24,
   proxiesTotal: 0,
@@ -271,6 +321,10 @@ const fallbackModules: ModuleInfo[] = [
   ["reddit", "Reddit", "Social", "Community discussion and content-sharing platform"],
 ].map(([id, name, category, description]) => ({ id, name, category, description, enabled: id === "chatgpt" || id === "twitch" || id === "max" }));
 
+function hasTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 function App() {
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -282,6 +336,11 @@ function App() {
   const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null);
   const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>([]);
   const [configuredModuleId, setConfiguredModuleId] = useState<string | null>(null);
+  const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
+  const pendingUpdateRef = useRef<Update | null>(null);
+  const updateDownloadedRef = useRef(false);
+  const updateBusyRef = useRef(false);
+  const autoCheckAttemptedRef = useRef(false);
   const [modulePreferences, setModulePreferences] = useState<Record<string, boolean>>(() => {
     try {
       return JSON.parse(localStorage.getItem("ayla.module-preferences") ?? "{}") as Record<string, boolean>;
@@ -310,6 +369,163 @@ function App() {
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
   };
 
+  const checkForUpdates = useCallback(async (automatic = false) => {
+    if (updateBusyRef.current) return;
+    if (!hasTauriRuntime()) {
+      if (!automatic) {
+        setUpdateState((current) => ({
+          ...current,
+          phase: "unsupported",
+          message: "Update checks are available in the installed desktop app.",
+        }));
+      }
+      return;
+    }
+
+    updateBusyRef.current = true;
+    setUpdateState((current) => ({
+      ...current,
+      phase: "checking",
+      message: automatic ? "Checking for updates…" : "Contacting the update service…",
+    }));
+
+    try {
+      const previous = pendingUpdateRef.current;
+      pendingUpdateRef.current = null;
+      updateDownloadedRef.current = false;
+      if (previous) await previous.close().catch(() => undefined);
+
+      const next = await check({ timeout: 15_000 });
+      if (!next) {
+        setUpdateState({
+          ...initialUpdateState,
+          phase: "current",
+          message: "Ayla is up to date.",
+        });
+        return;
+      }
+
+      pendingUpdateRef.current = next;
+      setUpdateState({
+        phase: "available",
+        version: next.version,
+        notes: next.body?.trim() ?? "",
+        publishedAt: next.date ?? "",
+        downloadedBytes: 0,
+        totalBytes: null,
+        downloadComplete: false,
+        message: `Ayla ${next.version} is available.`,
+      });
+    } catch (reason: unknown) {
+      setUpdateState({
+        ...initialUpdateState,
+        phase: "error",
+        message: `Unable to check for updates: ${String(reason)}`,
+      });
+    } finally {
+      updateBusyRef.current = false;
+    }
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    if (updateBusyRef.current) return;
+    const pending = pendingUpdateRef.current;
+    if (!pending) {
+      setUpdateState((current) => ({
+        ...current,
+        phase: "error",
+        message: "Check for updates again before installing.",
+      }));
+      return;
+    }
+
+    updateBusyRef.current = true;
+    let gateArmed = false;
+    try {
+      if (!updateDownloadedRef.current) {
+        let downloadedBytes = 0;
+        let totalBytes: number | null = null;
+        setUpdateState((current) => ({
+          ...current,
+          phase: "downloading",
+          downloadedBytes: 0,
+          totalBytes: null,
+          downloadComplete: false,
+          message: `Downloading Ayla ${pending.version}…`,
+        }));
+
+        try {
+          await pending.download((event) => {
+            if (event.event === "Started") {
+              totalBytes = event.data.contentLength ?? null;
+              downloadedBytes = 0;
+            } else if (event.event === "Progress") {
+              downloadedBytes += event.data.chunkLength;
+            }
+
+            setUpdateState((current) => ({
+              ...current,
+              downloadedBytes,
+              totalBytes,
+            }));
+          }, { timeout: 120_000 });
+        } catch (reason: unknown) {
+          updateDownloadedRef.current = false;
+          setUpdateState((current) => ({
+            ...current,
+            phase: "error",
+            downloadedBytes: 0,
+            totalBytes: null,
+            downloadComplete: false,
+            message: `Unable to download the update: ${String(reason)}`,
+          }));
+          return;
+        }
+
+        updateDownloadedRef.current = true;
+        setUpdateState((current) => ({
+          ...current,
+          phase: "ready",
+          downloadComplete: true,
+          message: "Download complete. Preparing to install…",
+        }));
+      }
+
+      const readiness = await invoke<UpdateInstallReadiness>("prepare_update_install");
+      if (!readiness.canInstall) {
+        setUpdateState((current) => ({
+          ...current,
+          phase: "blocked",
+          message: `Update downloaded. ${readiness.blockedReason ?? "Finish active work before installing."}`,
+        }));
+        return;
+      }
+      gateArmed = true;
+
+      setUpdateState((current) => ({
+        ...current,
+        phase: "installing",
+        message: "Installing the signed update…",
+      }));
+      await pending.install();
+      setUpdateState((current) => ({
+        ...current,
+        phase: "restarting",
+        message: "Update installed. Restarting Ayla…",
+      }));
+      await relaunch();
+    } catch (reason: unknown) {
+      if (gateArmed) await invoke("release_update_install_gate").catch(() => undefined);
+      setUpdateState((current) => ({
+        ...current,
+        phase: "error",
+        message: `Unable to install the update: ${String(reason)}`,
+      }));
+    } finally {
+      updateBusyRef.current = false;
+    }
+  }, []);
+
   const refreshTaskHistory = async () => {
     try {
       const nextHistory = await invoke<TaskHistoryEntry[]>("task_history", { limit: 100 });
@@ -331,6 +547,18 @@ function App() {
         setSettings(nextSettings);
       })
       .catch((reason: unknown) => setError(String(reason)));
+  }, []);
+
+  useEffect(() => {
+    if (!settings?.autoCheckUpdates || autoCheckAttemptedRef.current) return;
+    autoCheckAttemptedRef.current = true;
+    void checkForUpdates(true);
+  }, [checkForUpdates, settings?.autoCheckUpdates]);
+
+  useEffect(() => () => {
+    const pending = pendingUpdateRef.current;
+    pendingUpdateRef.current = null;
+    if (pending) void pending.close().catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -478,7 +706,17 @@ function App() {
                 }}
               />
             )}
-            {page === "settings" && <Settings settings={settings} configuredModule={modules.find((item) => item.id === configuredModuleId) ?? null} onSaved={setSettings} />}
+            {page === "settings" && (
+              <Settings
+                settings={settings}
+                configuredModule={modules.find((item) => item.id === configuredModuleId) ?? null}
+                installedVersion={overview?.version ?? "0.2.0"}
+                updateState={updateState}
+                onCheckForUpdates={() => void checkForUpdates(false)}
+                onInstallUpdate={() => void installUpdate()}
+                onSaved={setSettings}
+              />
+            )}
           </main>
         </div>
 
@@ -489,7 +727,7 @@ function App() {
           <article className="about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title" onMouseDown={(event) => event.stopPropagation()}>
             <div className="about-mark"><Flower2 size={22} /></div>
             <h2 id="about-title">Ayla</h2>
-            <p>Version {overview?.version ?? "0.1.0"}</p>
+            <p>Version {overview?.version ?? "0.2.0"}</p>
             <button className="button secondary" type="button" onClick={() => setAboutOpen(false)}>Close</button>
           </article>
         </div>
@@ -1786,7 +2024,38 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
   );
 }
 
-function Settings({ settings, configuredModule, onSaved }: { settings: AppSettings | null; configuredModule: ModuleInfo | null; onSaved: (settings: AppSettings) => void }) {
+function formatUpdateDate(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatUpdateProgress(downloadedBytes: number, totalBytes: number | null) {
+  const format = (bytes: number) => {
+    if (bytes < 1024 * 1024) return `${Math.max(0, bytes / 1024).toFixed(0)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  return totalBytes ? `${format(downloadedBytes)} of ${format(totalBytes)}` : `${format(downloadedBytes)} downloaded`;
+}
+
+function Settings({
+  settings,
+  configuredModule,
+  installedVersion,
+  updateState,
+  onCheckForUpdates,
+  onInstallUpdate,
+  onSaved,
+}: {
+  settings: AppSettings | null;
+  configuredModule: ModuleInfo | null;
+  installedVersion: string;
+  updateState: AppUpdateState;
+  onCheckForUpdates: () => void;
+  onInstallUpdate: () => void;
+  onSaved: (settings: AppSettings) => void;
+}) {
   const [threads, setThreads] = useState(settings?.threads ?? 24);
   const [moduleThreads, setModuleThreads] = useState<Record<string, number>>(settings?.moduleThreads ?? {});
   const [delayMs, setDelayMs] = useState(settings?.delayMs ?? 120);
@@ -1795,6 +2064,7 @@ function Settings({ settings, configuredModule, onSaved }: { settings: AppSettin
   const [maxScanDirectories, setMaxScanDirectories] = useState(settings?.maxScanDirectories ?? 1_000);
   const [maxScanFiles, setMaxScanFiles] = useState(settings?.maxScanFiles ?? 10_000);
   const [scanBudgetMib, setScanBudgetMib] = useState(settings?.scanBudgetMib ?? 512);
+  const [autoCheckUpdates, setAutoCheckUpdates] = useState(settings?.autoCheckUpdates ?? true);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -1807,12 +2077,13 @@ function Settings({ settings, configuredModule, onSaved }: { settings: AppSettin
     setMaxScanDirectories(settings.maxScanDirectories ?? 1_000);
     setMaxScanFiles(settings.maxScanFiles ?? 10_000);
     setScanBudgetMib(settings.scanBudgetMib ?? 512);
+    setAutoCheckUpdates(settings.autoCheckUpdates ?? true);
   }, [settings]);
 
   async function save() {
     if (!settings) return;
     try {
-      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories, maxScanFiles, scanBudgetMib } });
+      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories, maxScanFiles, scanBudgetMib, autoCheckUpdates } });
       onSaved(saved);
       setMessage("Settings saved locally.");
     } catch (reason: unknown) {
@@ -1867,6 +2138,96 @@ function Settings({ settings, configuredModule, onSaved }: { settings: AppSettin
             <SettingNumberRow id="max-scan-directories" label="Directory limit" description="Maximum directories visited while expanding folders" min={1} max={10_000} value={maxScanDirectories} onChange={setMaxScanDirectories} />
             <SettingNumberRow id="max-scan-files" label="File limit" description="Maximum unique files discovered for each task" min={1} max={100_000} value={maxScanFiles} onChange={setMaxScanFiles} />
             <SettingNumberRow id="scan-budget-mib" label="Scan budget" description="MiB available to each local validation phase" min={1} max={4_096} value={scanBudgetMib} onChange={setScanBudgetMib} />
+          </div>
+        </section>
+
+        <section className="settings-section" aria-labelledby="update-settings-title">
+          <h2 id="update-settings-title">Updates</h2>
+          <div className="settings-group update-settings-group">
+            <div className="settings-row update-version-row">
+              <div className="settings-copy">
+                <strong>Installed version</strong>
+                <small role="status" aria-live="polite">{updateState.message}</small>
+              </div>
+              <div className="update-version-summary">
+                <span className={`update-status update-status-${updateState.phase}`}>{updatePhaseLabels[updateState.phase]}</span>
+                <strong>v{installedVersion}</strong>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-copy">
+                <strong>Automatically check for updates</strong>
+                <small>Checks at startup and always asks before downloading or installing.</small>
+              </div>
+              <button
+                className={autoCheckUpdates ? "switch-control active" : "switch-control"}
+                type="button"
+                role="switch"
+                aria-checked={autoCheckUpdates}
+                aria-label="Automatically check for updates"
+                onClick={() => setAutoCheckUpdates((current) => !current)}
+                disabled={!settings}
+              >
+                <span />
+              </button>
+            </div>
+
+            <div className="settings-row update-check-row">
+              <div className="settings-copy">
+                <strong>Check manually</strong>
+                <small>Looks for the newest signed stable release without installing it.</small>
+              </div>
+              <button
+                className="button outline update-check-button"
+                type="button"
+                onClick={onCheckForUpdates}
+                disabled={["checking", "downloading", "installing", "restarting"].includes(updateState.phase)}
+              >
+                <RefreshCw className={updateState.phase === "checking" ? "is-spinning" : ""} size={14} />
+                {updateState.phase === "checking" ? "Checking…" : "Check for updates"}
+              </button>
+            </div>
+
+            {updateState.version && (
+              <div className="update-release-panel">
+                <div className="update-release-heading">
+                  <div>
+                    <span>Available update</span>
+                    <strong>Ayla {updateState.version}</strong>
+                    {updateState.publishedAt && <small>{formatUpdateDate(updateState.publishedAt)}</small>}
+                  </div>
+                  <button
+                    className="button primary"
+                    type="button"
+                    onClick={onInstallUpdate}
+                    disabled={["downloading", "installing", "restarting"].includes(updateState.phase)}
+                  >
+                    <Download size={14} />
+                    {updateState.phase === "downloading" ? "Downloading…" : updateState.phase === "installing" ? "Installing…" : updateState.phase === "restarting" ? "Restarting…" : updateState.phase === "error" && updateState.downloadComplete ? "Retry install" : updateState.downloadComplete ? "Install and restart" : "Update and restart"}
+                  </button>
+                </div>
+
+                <div className="update-release-notes">
+                  <strong>What’s new</strong>
+                  <p>{updateState.notes || "No release notes were provided for this version."}</p>
+                </div>
+
+                {(updateState.phase === "downloading" || updateState.downloadComplete) && (
+                  <div className="update-download-progress" aria-live="polite">
+                    <div>
+                      <span>{updateState.downloadComplete ? "Download complete" : "Downloading update"}</span>
+                      <strong>{formatUpdateProgress(updateState.downloadedBytes, updateState.totalBytes)}</strong>
+                    </div>
+                    {updateState.totalBytes ? (
+                      <progress aria-label="Update download progress" value={Math.min(updateState.downloadedBytes, updateState.totalBytes)} max={updateState.totalBytes} />
+                    ) : (
+                      <progress aria-label="Update download progress" />
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </section>
 
