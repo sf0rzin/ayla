@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -15,6 +15,7 @@ import {
   Boxes,
   BrainCircuit,
   Camera,
+  Check,
   ChevronDown,
   CarFront,
   CircleHelp,
@@ -25,6 +26,8 @@ import {
   Disc3,
   Download,
   Ellipsis,
+  Eye,
+  EyeOff,
   FileUp,
   Flower2,
   FolderOpen,
@@ -36,6 +39,7 @@ import {
   LayoutGrid,
   ListFilter,
   ListChecks,
+  LoaderCircle,
   LogOut,
   MessagesSquare,
   Minus,
@@ -61,6 +65,7 @@ import {
   X,
 } from "lucide-react";
 import { ModuleBrandIcon } from "./ModuleBrandIcon";
+import loginArtwork from "./assets/ayla-login-art.png";
 import "./App.css";
 
 const MAX_PROXY_IMPORT_BYTES = 16 * 1024 * 1024;
@@ -326,6 +331,183 @@ function hasTauriRuntime() {
 }
 
 function App() {
+  const [showLoginPreview, setShowLoginPreview] = useState(true);
+
+  if (showLoginPreview) {
+    return <LoginPreview onContinue={() => setShowLoginPreview(false)} />;
+  }
+
+  return <WorkspaceApp />;
+}
+
+function LoginPreview({ onContinue }: { onContinue: () => void }) {
+  const [showPassword, setShowPassword] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [mode, setMode] = useState<"signIn" | "register">("signIn");
+  const [authState, setAuthState] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [authMessage, setAuthMessage] = useState("");
+  const [registrationPending, setRegistrationPending] = useState(false);
+  const matchedPasswordChecks = [
+    password.length >= 8,
+    /[a-z]/.test(password) && /[A-Z]/.test(password),
+    /\d/.test(password),
+    /[^A-Za-z0-9]/.test(password),
+  ].filter(Boolean).length;
+  const passwordScore = password ? Math.max(1, matchedPasswordChecks) : 0;
+  const passwordLevel = ["Strength", "Weak", "Fair", "Good", "Strong"][passwordScore];
+  const selectMode = (nextMode: "signIn" | "register") => {
+    if (authState === "loading") return;
+    setMode(nextMode);
+    setAuthState("idle");
+    setAuthMessage("");
+    setRegistrationPending(false);
+  };
+  const handleAuthSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (authState === "loading" || authState === "success") return;
+
+    setAuthState("loading");
+    setAuthMessage("");
+    await new Promise((resolve) => window.setTimeout(resolve, 900));
+
+    const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+    let validationError = "";
+    if (!email.trim() || !password || (mode === "register" && (!name.trim() || !confirmPassword))) {
+      validationError = "Complete all required fields.";
+    } else if (!emailValid) {
+      validationError = "Enter a valid email address.";
+    } else if (mode === "register" && passwordScore < 3) {
+      validationError = "Choose a stronger password.";
+    } else if (mode === "register" && password !== confirmPassword) {
+      validationError = "Passwords do not match.";
+    }
+
+    if (validationError) {
+      setAuthMessage(validationError);
+      setAuthState("error");
+      await new Promise((resolve) => window.setTimeout(resolve, 1_600));
+      setAuthState("idle");
+      return;
+    }
+
+    setAuthState("success");
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    if (mode === "register") {
+      setRegistrationPending(true);
+      setAuthState("idle");
+      return;
+    }
+    onContinue();
+  };
+  const runWindowAction = (action: (window: ReturnType<typeof getCurrentWindow>) => Promise<void>) => {
+    try {
+      void action(getCurrentWindow()).catch(() => undefined);
+    } catch {
+      // Browser previews do not have a Tauri window.
+    }
+  };
+
+  return (
+    <div className="login-screen">
+      <div className="login-drag-region" data-tauri-drag-region onDoubleClick={() => runWindowAction((window) => window.toggleMaximize())} />
+      <div className="login-window-controls">
+        <button type="button" onClick={() => runWindowAction((window) => window.minimize())} aria-label="Minimize"><Minus size={15} /></button>
+        <button type="button" onClick={() => runWindowAction((window) => window.toggleMaximize())} aria-label="Maximize"><Square size={12} /></button>
+        <button className="window-close" type="button" onClick={() => runWindowAction((window) => window.close())} aria-label="Close"><X size={15} /></button>
+      </div>
+
+      <div className="login-shell">
+        <aside className="login-art-panel" aria-hidden="true">
+          <div className="login-art-backdrop" />
+          <img className="login-art-image" src={loginArtwork} alt="" draggable={false} />
+          <div className="login-art-copy">
+            <strong>Ayla</strong>
+            <p>A Windows desktop application for authorized session validation.</p>
+          </div>
+        </aside>
+
+        <main className="login-form-panel">
+          <div className="login-form-wrap">
+            {registrationPending ? (
+              <section className="login-registration-pending" aria-labelledby="registration-pending-title">
+                <span className="login-pending-icon"><Clock3 size={22} /></span>
+                <h1 id="registration-pending-title">Account pending activation</h1>
+                <p>An administrator must activate your account before you can sign in.</p>
+                <button type="button" onClick={() => selectMode("signIn")}>Back to sign in <ArrowRight size={14} /></button>
+              </section>
+            ) : (
+              <>
+                <div className="login-mode-switch" aria-label="Authentication mode">
+                  <button className={mode === "signIn" ? "active" : ""} type="button" onClick={() => selectMode("signIn")} disabled={authState === "loading"}>Sign in</button>
+                  <button className={mode === "register" ? "active" : ""} type="button" onClick={() => selectMode("register")} disabled={authState === "loading"}>Register</button>
+                </div>
+
+                <header className="login-form-heading">
+                  <h1>{mode === "signIn" ? "Sign in" : "Create account"}</h1>
+                </header>
+
+                <form className="login-form" onSubmit={handleAuthSubmit} noValidate>
+                  {mode === "register" && (
+                    <label className="login-field">
+                      <span>Name</span>
+                      <input type="text" name="name" autoComplete="name" placeholder="Your name" value={name} onChange={(event) => setName(event.target.value)} disabled={authState === "loading"} />
+                    </label>
+                  )}
+
+                  <label className="login-field">
+                    <span>Email address</span>
+                    <input type="email" name="email" autoComplete="email" placeholder="you@example.com" value={email} onChange={(event) => setEmail(event.target.value)} disabled={authState === "loading"} />
+                  </label>
+
+                  <label className="login-field">
+                    <span>Password</span>
+                    <div className="login-password-input">
+                      <input type={showPassword ? "text" : "password"} name="password" autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder="Enter your password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={authState === "loading"} />
+                      <button type="button" onClick={() => setShowPassword((current) => !current)} aria-label={showPassword ? "Hide password" : "Show password"} disabled={authState === "loading"}>
+                        {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                  </label>
+
+                  {mode === "register" && (
+                    <div className={`login-password-strength strength-${passwordScore}`}>
+                      <div className="login-strength-track" role="meter" aria-label="Password strength" aria-valuemin={0} aria-valuemax={4} aria-valuenow={passwordScore} aria-valuetext={passwordLevel}>
+                        {[1, 2, 3, 4].map((level) => <span className={passwordScore >= level ? "filled" : ""} key={level} />)}
+                      </div>
+                      <span>{passwordLevel}</span>
+                    </div>
+                  )}
+
+                  {mode === "register" && (
+                    <label className="login-field">
+                      <span>Confirm password</span>
+                      <input type="password" name="confirmPassword" autoComplete="new-password" placeholder="Repeat your password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={authState === "loading"} />
+                    </label>
+                  )}
+
+                  <button className={`login-submit state-${authState}`} type="submit" disabled={authState === "loading" || authState === "success"}>
+                    <span className="login-button-content" key={authState}>
+                      {authState === "loading" && <><LoaderCircle className="login-button-spinner" size={15} /> {mode === "signIn" ? "Signing in" : "Creating account"}</>}
+                      {authState === "success" && <><Check size={16} strokeWidth={2.4} /> Success</>}
+                      {authState === "error" && <><X size={15} /> Failed</>}
+                      {authState === "idle" && <>{mode === "signIn" ? "Sign in" : "Register"} <ArrowRight size={15} /></>}
+                    </span>
+                  </button>
+                  {authMessage && <span className="login-auth-message" role="alert">{authMessage}</span>}
+                </form>
+              </>
+            )}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceApp() {
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aboutOpen, setAboutOpen] = useState(false);
