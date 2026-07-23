@@ -185,7 +185,15 @@ function Invoke-GitHubJson {
     }
 
     try {
-        return ConvertFrom-Json -InputObject $result.StdOut
+        $parsed = ConvertFrom-Json -InputObject $result.StdOut
+        if ($parsed -is [System.Array]) {
+            foreach ($item in $parsed) {
+                Write-Output $item
+            }
+            return
+        }
+
+        return $parsed
     }
     catch {
         throw "$Operation returned invalid JSON on stdout. GitHub CLI stderr remained isolated and was suppressed."
