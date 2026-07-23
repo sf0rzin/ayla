@@ -1,0 +1,66 @@
+name: ayla
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ayla
+      POSTGRES_USER: ayla
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ayla -d ayla"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: ./app
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      NODE_ENV: production
+      API_PORT: 3000
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ayla
+      PGUSER: ayla
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      CORS_ORIGINS: http://localhost:1420,http://127.0.0.1:1420,http://tauri.localhost,https://tauri.localhost,tauri://localhost
+      SESSION_TTL_DAYS: 30
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - internal
+      - edge
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  internal:
+    internal: true
+  edge:
+
+volumes:
+  postgres-data:

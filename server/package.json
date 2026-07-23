@@ -1,0 +1,16 @@
+{
+  "name": "@ayla/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@fastify/cors": "11.3.0",
+    "@fastify/helmet": "13.1.0",
+    "@fastify/rate-limit": "11.1.0",
+    "fastify": "5.10.0",
+    "pg": "8.22.0"
+  }
+}

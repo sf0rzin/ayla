@@ -66,6 +66,14 @@ import {
 } from "lucide-react";
 import { ModuleBrandIcon } from "./ModuleBrandIcon";
 import loginArtwork from "./assets/ayla-login-art.png";
+import {
+  AuthApiError,
+  login,
+  logout,
+  registerAccount,
+  type AuthSession,
+  type AuthUser,
+} from "./authApi";
 import "./App.css";
 
 const MAX_PROXY_IMPORT_BYTES = 16 * 1024 * 1024;
@@ -330,17 +338,51 @@ function hasTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-function App() {
-  const [showLoginPreview, setShowLoginPreview] = useState(true);
-
-  if (showLoginPreview) {
-    return <LoginPreview onContinue={() => setShowLoginPreview(false)} />;
-  }
-
-  return <WorkspaceApp />;
+function userInitials(name: string) {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "AY";
 }
 
-function LoginPreview({ onContinue }: { onContinue: () => void }) {
+function userRoleLabel(user: AuthUser) {
+  return user.role === "admin" ? "Administrator" : "Member";
+}
+
+function App() {
+  const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+
+  if (!authSession) {
+    return <LoginPreview onAuthenticated={setAuthSession} />;
+  }
+
+  const handleLogout = () => {
+    const token = authSession.token;
+    setAuthSession(null);
+    void logout(token).catch(() => undefined);
+  };
+
+  return <WorkspaceApp user={authSession.user} onLogout={handleLogout} />;
+}
+
+function authErrorMessage(code: string) {
+  switch (code) {
+    case "INVALID_CREDENTIALS": return "Email or password is incorrect.";
+    case "ACCOUNT_PENDING": return "Your account is waiting for administrator activation.";
+    case "ACCOUNT_DISABLED": return "This account has been disabled.";
+    case "INVALID_NAME": return "Enter a valid name.";
+    case "INVALID_EMAIL": return "Enter a valid email address.";
+    case "INVALID_PASSWORD": return "Use a password with at least 12 characters.";
+    case "RATE_LIMITED": return "Too many attempts. Wait a moment and try again.";
+    case "REQUEST_TIMEOUT": return "The server took too long to respond.";
+    case "NETWORK_ERROR": return "Unable to reach the Ayla service.";
+    default: return "Something went wrong. Try again.";
+  }
+}
+
+function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
   const [showPassword, setShowPassword] = useState(false);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -351,7 +393,7 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
   const [authMessage, setAuthMessage] = useState("");
   const [registrationPending, setRegistrationPending] = useState(false);
   const matchedPasswordChecks = [
-    password.length >= 8,
+    password.length >= 12,
     /[a-z]/.test(password) && /[A-Z]/.test(password),
     /\d/.test(password),
     /[^A-Za-z0-9]/.test(password),
@@ -371,7 +413,7 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
 
     setAuthState("loading");
     setAuthMessage("");
-    await new Promise((resolve) => window.setTimeout(resolve, 900));
+    const minimumAnimation = new Promise((resolve) => window.setTimeout(resolve, 650));
 
     const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
     let validationError = "";
@@ -379,6 +421,8 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
       validationError = "Complete all required fields.";
     } else if (!emailValid) {
       validationError = "Enter a valid email address.";
+    } else if (mode === "register" && password.length < 12) {
+      validationError = "Use a password with at least 12 characters.";
     } else if (mode === "register" && passwordScore < 3) {
       validationError = "Choose a stronger password.";
     } else if (mode === "register" && password !== confirmPassword) {
@@ -386,6 +430,7 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
     }
 
     if (validationError) {
+      await minimumAnimation;
       setAuthMessage(validationError);
       setAuthState("error");
       await new Promise((resolve) => window.setTimeout(resolve, 1_600));
@@ -393,14 +438,33 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
       return;
     }
 
-    setAuthState("success");
-    await new Promise((resolve) => window.setTimeout(resolve, 700));
-    if (mode === "register") {
-      setRegistrationPending(true);
+    try {
+      if (mode === "register") {
+        await Promise.all([
+          registerAccount({ name: name.trim(), email: email.trim(), password }),
+          minimumAnimation,
+        ]);
+        setAuthState("success");
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        setRegistrationPending(true);
+        setAuthState("idle");
+      } else {
+        const [session] = await Promise.all([
+          login({ email: email.trim(), password }),
+          minimumAnimation,
+        ]);
+        setAuthState("success");
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        onAuthenticated(session);
+      }
+    } catch (error) {
+      await minimumAnimation;
+      const code = error instanceof AuthApiError ? error.code : "UNKNOWN";
+      setAuthMessage(authErrorMessage(code));
+      setAuthState("error");
+      await new Promise((resolve) => window.setTimeout(resolve, 1_600));
       setAuthState("idle");
-      return;
     }
-    onContinue();
   };
   const runWindowAction = (action: (window: ReturnType<typeof getCurrentWindow>) => Promise<void>) => {
     try {
@@ -507,7 +571,7 @@ function LoginPreview({ onContinue }: { onContinue: () => void }) {
   );
 }
 
-function WorkspaceApp() {
+function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [navigation, setNavigation] = useState<{ entries: Page[]; index: number }>({ entries: ["overview"], index: 0 });
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -847,6 +911,8 @@ function WorkspaceApp() {
             modules={modules}
             taskSnapshot={taskSnapshot}
             searchInputRef={searchInputRef}
+            user={user}
+            onLogout={onLogout}
           />
         )}
 
@@ -858,7 +924,7 @@ function WorkspaceApp() {
                 <div><strong>Desktop services are unavailable in this preview</strong><span>Open Ayla through Tauri to use local data.</span></div>
               </div>
             )}
-            {page === "overview" && <Overview overview={overview} metrics={systemMetrics} history={taskHistory} modules={modules} />}
+            {page === "overview" && <Overview overview={overview} metrics={systemMetrics} history={taskHistory} modules={modules} user={user} />}
             {page === "modules" && (
               <Modules
                 modules={modules}
@@ -1017,6 +1083,8 @@ function Sidebar({
   modules,
   taskSnapshot,
   searchInputRef,
+  user,
+  onLogout,
 }: {
   page: Page;
   onNavigate: (page: Page) => void;
@@ -1024,6 +1092,8 @@ function Sidebar({
   modules: ModuleInfo[];
   taskSnapshot: TaskSnapshot | null;
   searchInputRef: RefObject<HTMLInputElement | null>;
+  user: AuthUser;
+  onLogout: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1040,6 +1110,8 @@ function Sidebar({
   const moduleResults = normalizedQuery ? modules.filter((item) => `${item.name} ${item.category}`.toLowerCase().includes(normalizedQuery)).slice(0, 5) : [];
   const progress = Math.max(0, Math.min(100, taskSnapshot?.percent ?? 0));
   const taskDone = taskSnapshot ? Math.max(0, taskSnapshot.total - taskSnapshot.queued - taskSnapshot.running) : 0;
+  const initials = userInitials(user.name);
+  const roleLabel = userRoleLabel(user);
 
   const openFirstResult = () => {
     if (pageResults[0]) onNavigate(pageResults[0].id);
@@ -1149,11 +1221,11 @@ function Sidebar({
       <div className="sidebar-profile-wrap" ref={profileRoot}>
         {profilePopover === "profile" && (
           <div className="profile-popover" ref={profilePopoverRef} role="dialog" aria-label="Profile menu">
-            <div className="profile-popover-header"><span className="avatar">US</span><div><strong>Username</strong><small>@username</small></div><span className="profile-plan-badge">Super</span></div>
+            <div className="profile-popover-header"><span className="avatar">{initials}</span><div><strong>{user.name}</strong><small>{user.email}</small></div><span className="profile-plan-badge">{roleLabel}</span></div>
             <button className="profile-menu-item" type="button" aria-expanded={planExpanded} onClick={() => setPlanExpanded((current) => !current)}><CircleGauge size={16} /><span>Plan information</span><ChevronDown className={planExpanded ? "expanded" : ""} size={15} /></button>
             {planExpanded && (
               <div className="profile-plan-details">
-                <div className="profile-plan-current"><span>Current plan</span><strong>Super</strong></div>
+                <div className="profile-plan-current"><span>Account access</span><strong>{roleLabel}</strong></div>
                 <div className="profile-plan-grid">
                   <div><span>Time remaining</span><strong>—</strong></div>
                   <div><span>Next billing</span><strong>Unavailable</strong></div>
@@ -1164,7 +1236,7 @@ function Sidebar({
             )}
             <button className="profile-menu-item" type="button" onClick={() => void copyInvitation()}><UserPlus size={16} /><span>Invite friend</span></button>
             <span className="profile-menu-separator" />
-            <button className="profile-menu-item danger" type="button" onClick={() => setProfileMessage("No account session is connected in this local build.")}><LogOut size={16} /><span>Log out</span></button>
+            <button className="profile-menu-item danger" type="button" onClick={onLogout}><LogOut size={16} /><span>Log out</span></button>
             {profileMessage && <p className="profile-menu-message" role="status">{profileMessage}</p>}
           </div>
         )}
@@ -1183,8 +1255,8 @@ function Sidebar({
 
         <div className="sidebar-profile">
           <button className="profile-trigger" ref={profileTriggerRef} type="button" aria-haspopup="dialog" aria-expanded={profilePopover === "profile"} onClick={() => { setProfileMessage(""); setProfilePopover((current) => current === "profile" ? null : "profile"); setHelpDetail(null); }}>
-            <span className="avatar">US</span>
-            <span><strong>Username</strong><small>Super</small></span>
+            <span className="avatar">{initials}</span>
+            <span><strong>{user.name}</strong><small>{roleLabel}</small></span>
           </button>
           <button className="profile-help-trigger" ref={helpTriggerRef} type="button" aria-label="Open help menu" aria-haspopup="dialog" aria-expanded={profilePopover === "help"} onClick={() => { setProfilePopover((current) => current === "help" ? null : "help"); setHelpDetail(null); }}><CircleHelp size={17} /></button>
         </div>
@@ -1193,7 +1265,7 @@ function Sidebar({
   );
 }
 
-function Overview({ overview, metrics, history, modules }: { overview: AppOverview | null; metrics: SystemMetrics | null; history: TaskHistoryEntry[]; modules: ModuleInfo[] }) {
+function Overview({ overview, metrics, history, modules, user }: { overview: AppOverview | null; metrics: SystemMetrics | null; history: TaskHistoryEntry[]; modules: ModuleInfo[]; user: AuthUser }) {
   const memoryPercent = metrics?.memoryTotalBytes ? (metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100 : 0;
   const sessionsChecked = history.reduce((sum, item) => sum + item.total, 0);
   const sessionsSucceeded = history.reduce((sum, item) => sum + item.succeeded, 0);
@@ -1201,6 +1273,8 @@ function Overview({ overview, metrics, history, modules }: { overview: AppOvervi
   const proxyAvailability = overview?.proxiesTotal ? ((overview.proxiesLive / overview.proxiesTotal) * 100) : null;
   const averageTaskSize = history.length ? sessionsChecked / history.length : null;
   const today = new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", year: "numeric" }).format(new Date());
+  const initials = userInitials(user.name);
+  const roleLabel = userRoleLabel(user);
 
   const moduleUsage = useMemo(() => {
     const counts = new Map<string, number>();
@@ -1215,10 +1289,10 @@ function Overview({ overview, metrics, history, modules }: { overview: AppOvervi
   return (
     <section className="overview-page">
       <header className="profile-hero">
-        <div className="profile-avatar" aria-hidden="true">US</div>
+        <div className="profile-avatar" aria-hidden="true">{initials}</div>
         <div className="profile-identity">
-          <h1>Username</h1>
-          <p>@username <span className="profile-plan">Super</span></p>
+          <h1>{user.name}</h1>
+          <p>{user.email} <span className="profile-plan">{roleLabel}</span></p>
         </div>
         <span className="profile-date">{today}</span>
       </header>

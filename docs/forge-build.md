@@ -62,7 +62,7 @@ From a trusted release environment that can access the Forge artifact directory,
 
 ```powershell
 & '.\scripts\Publish-AylaRelease.ps1' `
-  -Version '0.2.0' `
+  -Version '0.3.0' `
   -ArtifactDirectory 'C:\Builds\Artifacts\Ayla\<commit-sha>' `
   -DryRun
 ```
@@ -73,7 +73,7 @@ After reviewing the version, SHA-256, signature source, and metadata, omit `-Dry
 
 ```powershell
 & '.\scripts\Publish-AylaRelease.ps1' `
-  -Version '0.2.0' `
+  -Version '0.3.0' `
   -ArtifactDirectory 'C:\Builds\Artifacts\Ayla\<commit-sha>'
 ```
 
@@ -87,7 +87,7 @@ The first updater-aware Ayla build is a one-time bootstrap and must be installed
 2. Compare the local hash with the `Installer SHA-256` value in that release's notes:
 
    ```powershell
-   Get-FileHash -LiteralPath '.\Ayla_0.2.0_x64-setup.exe' -Algorithm SHA256
+   Get-FileHash -LiteralPath '.\Ayla_0.3.0_x64-setup.exe' -Algorithm SHA256
    ```
 
 3. Verify the detached signature against the exact public key embedded in the private source checkout:
@@ -97,8 +97,8 @@ The first updater-aware Ayla build is a one-time bootstrap and must be installed
    $pubkey = $config.plugins.updater.pubkey
    cargo run --quiet --locked `
      --manifest-path '.\tools\update-verifier\Cargo.toml' -- `
-     '.\Ayla_0.2.0_x64-setup.exe' `
-     '.\Ayla_0.2.0_x64-setup.exe.sig' `
+     '.\Ayla_0.3.0_x64-setup.exe' `
+     '.\Ayla_0.3.0_x64-setup.exe.sig' `
      $pubkey
    ```
 
@@ -113,7 +113,7 @@ Preflight signature or version failures occur before any GitHub mutation. If cre
 - If the final anonymous verification fails, the release may already be public. Confirm the tag, immediately quarantine it back to a draft, and investigate before recreating the release:
 
   ```powershell
-  gh release edit 'v0.2.0' --repo 'sf0rzin/ayla-releases' --draft
+  gh release edit 'v0.3.0' --repo 'sf0rzin/ayla-releases' --draft
   ```
 
 Never repair a release with `--clobber`; updater metadata, signature, and installer must remain one immutable set.

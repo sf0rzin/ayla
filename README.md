@@ -85,7 +85,16 @@ npm run tauri dev
 npm run check
 ```
 
-`npm run check` is the canonical validation command and runs the production frontend build followed by the Rust test suite.
+`npm run check` is the canonical validation command and runs the production
+frontend build, authentication API tests, and the Rust test suite.
+
+## Account service
+
+The desktop login and registration flow uses the development API at
+`https://ayla.rindexx.cc/api/v1`. New accounts remain pending until an operator
+activates them. The API source, container deployment, endpoint contract, and
+administrator commands are documented in
+[Ayla authentication API](docs/auth-api.md).
 
 ## Windows builds
 
