@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Ayla Cookie Manager",
+  "short_name": "Ayla Cookies",
+  "version": "0.1.0",
+  "description": "Gerencie, proteja, importe e exporte cookies no Chromium com a interface do Ayla.",
+  "minimum_chrome_version": "119",
+  "permissions": [
+    "activeTab",
+    "browsingData",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Ayla Cookie Manager",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "commands": {
+    "open-manager": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Abrir o gerenciador de cookies"
+    }
+  },
+  "icons": {
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "incognito": "split"
+}

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ayla Cookie Manager</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="manager.css">
+  </head>
+  <body class="manager-body">
+    <div class="manager-shell">
+      <aside class="sidebar">
+        <header class="brand-row">
+          <div class="brand-mark">A</div>
+          <div><strong>Ayla</strong><span>Cookie Manager</span></div>
+        </header>
+
+        <label class="search-box">
+          <span>⌕</span>
+          <input id="domain-search" type="search" placeholder="Pesquisar domínios" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+
+        <div class="sidebar-heading"><span>DOMÍNIOS</span><small id="domain-total">0</small></div>
+        <nav id="domain-list" class="domain-list"></nav>
+
+        <div class="sidebar-footer">
+          <button id="show-protected"><span>◆</span><span>Protegidos</span><small id="protected-total">0</small></button>
+          <button id="show-settings"><span>⚙</span><span>Configurações</span></button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="toolbar">
+          <div class="toolbar-title">
+            <span class="eyebrow" id="view-eyebrow">TODOS OS COOKIES</span>
+            <h1 id="view-title">Visão geral</h1>
+          </div>
+          <div class="toolbar-actions">
+            <button id="refresh" title="Atualizar">↻</button>
+            <button id="import-open">Importar</button>
+            <button id="export-open">Exportar</button>
+            <button class="primary" id="new-cookie">Novo cookie</button>
+          </div>
+        </header>
+
+        <section id="cookies-view" class="content-view">
+          <div class="summary-grid">
+            <article><span>Total</span><strong id="summary-total">0</strong><small>cookies acessíveis</small></article>
+            <article><span>Domínios</span><strong id="summary-domains">0</strong><small>origens encontradas</small></article>
+            <article><span>Protegidos</span><strong id="summary-protected">0</strong><small>preservados pelo Ayla</small></article>
+            <article><span>Sessão</span><strong id="summary-session">0</strong><small>sem expiração</small></article>
+          </div>
+
+          <div class="table-card">
+            <div class="table-tools">
+              <label class="table-search"><span>⌕</span><input id="cookie-search" type="search" placeholder="Pesquisar nome ou valor"></label>
+              <span id="selection-label">Nenhum selecionado</span>
+              <button id="protect-selected">Proteger</button>
+              <button class="danger" id="delete-selected">Apagar</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th><input id="select-all" type="checkbox" aria-label="Selecionar todos"></th><th>Nome</th><th>Domínio</th><th>Caminho</th><th>Expiração</th><th>Flags</th><th></th></tr></thead>
+                <tbody id="cookie-rows"></tbody>
+              </table>
+              <div id="empty-state" class="empty-state hidden"><strong>Nenhum cookie encontrado</strong><span>Altere os filtros ou crie um novo cookie.</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="settings-view" class="content-view hidden">
+          <div class="settings-card">
+            <div><strong>Proteção ativa</strong><span>Restaura cookies protegidos quando um site ou outra ação tenta removê-los.</span><label class="switch"><input id="setting-protection" type="checkbox"><i></i></label></div>
+            <div><strong>Limpar ao iniciar</strong><span>Remove todos os cookies não protegidos quando o Chromium inicia.</span><label class="switch"><input id="setting-autoclear" type="checkbox"><i></i></label></div>
+            <div><strong>Confirmar ações destrutivas</strong><span>Solicita confirmação antes de exclusões em massa.</span><label class="switch"><input id="setting-confirm" type="checkbox"><i></i></label></div>
+          </div>
+          <div class="settings-card privacy-note"><strong>Privacidade local</strong><p>Cookies, preferências e cópias protegidas permanecem no perfil local do Chromium. A extensão não envia telemetria e não se conecta à API do Ayla.</p></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="cookie-dialog">
+      <form method="dialog" id="cookie-form">
+        <header><div><span class="eyebrow">COOKIE</span><h2 id="cookie-dialog-title">Novo cookie</h2></div><button type="button" data-close-dialog="cookie-dialog" class="icon-button" aria-label="Fechar">×</button></header>
+        <div class="form-grid">
+          <label class="wide"><span>Nome</span><input name="name" required></label>
+          <label class="wide"><span>Valor</span><textarea name="value" rows="5"></textarea></label>
+          <label><span>Domínio</span><input name="domain" required placeholder="example.com"></label>
+          <label><span>Caminho</span><input name="path" required value="/"></label>
+          <label><span>SameSite</span><select name="sameSite"><option value="unspecified">Não especificado</option><option value="lax">Lax</option><option value="strict">Strict</option><option value="no_restriction">None</option></select></label>
+          <label><span>Expira em</span><input name="expiration" type="datetime-local"></label>
+          <label class="check"><input name="hostOnly" type="checkbox" checked><span>Host-only</span></label>
+          <label class="check"><input name="secure" type="checkbox"><span>Secure</span></label>
+          <label class="check"><input name="httpOnly" type="checkbox"><span>HttpOnly</span></label>
+          <label class="check"><input name="session" type="checkbox" checked><span>Cookie de sessão</span></label>
+          <label class="wide"><span>Top-level site (CHIPS, opcional)</span><input name="partitionSite" placeholder="https://example.com"></label>
+        </div>
+        <p id="cookie-form-error" class="form-error"></p>
+        <footer><button type="button" data-close-dialog="cookie-dialog">Cancelar</button><button type="submit" value="default" class="primary">Salvar cookie</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="transfer-dialog">
+      <form method="dialog" id="transfer-form">
+        <header><div><span class="eyebrow" id="transfer-eyebrow">TRANSFERÊNCIA</span><h2 id="transfer-title">Exportar cookies</h2></div><button type="button" data-close-dialog="transfer-dialog" class="icon-button" aria-label="Fechar">×</button></header>
+        <div id="export-panel">
+          <label><span>Formato</span><select id="export-format"><option value="json">JSON</option><option value="netscape">Netscape (cookies.txt)</option></select></label>
+          <p id="export-description"></p>
+        </div>
+        <div id="import-panel" class="hidden">
+          <label class="file-drop"><input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"><strong>Selecionar arquivo</strong><span>JSON ou Netscape cookies.txt</span></label>
+          <textarea id="import-text" rows="12" placeholder="Ou cole os cookies aqui…"></textarea>
+        </div>
+        <p id="transfer-error" class="form-error"></p>
+        <footer><button type="button" data-close-dialog="transfer-dialog">Cancelar</button><button type="submit" value="default" class="primary" id="transfer-submit">Exportar</button></footer>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="preview-mock.js"></script>
+    <script type="module" src="manager.js"></script>
+  </body>
+</html>
