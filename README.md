@@ -39,6 +39,14 @@ Twitch and HBO Max have isolated adapters and synthetic test coverage. Verificat
 - Module-scoped cookie parsing with domain, path, expiry, size, and complexity checks.
 - Optional result export that preserves the original artifact and classifies a copy by outcome.
 
+## Chromium companion extension
+
+`extensions/ayla-cookie-manager` contains a Manifest V3 cookie manager for
+Chrome, Edge, Brave, and other Chromium browsers. It follows Ayla's visual
+language and supports cookie inspection, creation, editing, deletion,
+protection, JSON/Netscape backup and restore, LocalStorage cleanup, and
+partitioned cookies. See the extension's [installation and security notes](extensions/ayla-cookie-manager/README.md).
+
 ## Result layout
 
 When export is enabled, Ayla creates an isolated structure inside the selected directory:
@@ -99,3 +107,7 @@ administrator commands are documented in
 ## Windows builds
 
 Release packages are produced on the dedicated Forge Windows environment. See [Building Ayla on Forge](docs/forge-build.md) for the trusted build and artifact workflow.
+
+Signed application updates and the authentication API are served from
+`ayla.rindexx.cc`; see [Self-hosted Ayla services](docs/self-hosted-updater.md)
+for deployment, backup, and release publication details.

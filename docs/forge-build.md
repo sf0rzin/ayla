@@ -31,7 +31,17 @@ The persistent target directory and release-profile tests let the test/package s
 
 Observed on the first fully warm optimized run on 2026-07-22: Forge detected the push in 6.7 seconds and completed tests plus the Windows executable and NSIS installer in 14.5 seconds. Changes that invalidate more Rust dependencies will take longer; cold caches still require a full rebuild.
 
-## Signed updater releases
+## Self-hosted updater releases
+
+The active updater channel is hosted at
+`https://ayla.rindexx.cc/updates/stable/latest.json`. Build and publication are
+documented in [Self-hosted Ayla services](self-hosted-updater.md). The updater
+private key remains outside both the repository and the public service VM.
+
+## Legacy GitHub updater publication (do not use for new releases)
+
+The workflow below is retained only as recovery history for installations that
+still contain the old GitHub endpoint. New releases use the self-hosted channel.
 
 Ayla source remains in the private `sf0rzin/Ayla` repository. Public updater artifacts are published separately in [`sf0rzin/ayla-releases`](https://github.com/sf0rzin/ayla-releases); its releases contain only signed Windows installers, their detached signatures, and updater metadata. Installed applications read the public channel at:
 
