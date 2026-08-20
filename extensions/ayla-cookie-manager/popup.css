@@ -1,20 +1,28 @@
-.popup-body { width: 380px; min-height: 438px; overflow: hidden; background: var(--bg); }
-.popup-shell { min-height: 438px; padding: 18px; display: flex; flex-direction: column; background: radial-gradient(circle at 80% -10%, rgba(255,255,255,.07), transparent 34%), var(--bg); }
+.popup-body { width: 390px; min-height: 520px; overflow: hidden; background: var(--bg); }
+.popup-shell { min-height: 520px; padding: 18px; display: flex; flex-direction: column; background: radial-gradient(circle at 80% -10%, rgba(255,255,255,.07), transparent 34%), var(--bg); }
 .site-card { margin-top: 22px; padding: 15px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--panel); box-shadow: var(--highlight), var(--shadow); }
 .site-heading { margin-top: 12px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
 .site-favicon { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--raised); font-size: 13px; }
 .site-heading > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
 .site-heading strong, .site-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-heading strong { font-size: 12px; font-weight: 500; }
-.site-heading span { color: var(--dim); font-size: 9px; }
+.site-heading span { color: var(--dim); font-size: 10px; }
 .count-pill { min-width: 25px; padding: 4px 7px; border-radius: 999px; color: var(--muted) !important; background: rgba(255,255,255,.05); font-size: 10px !important; text-align: center; }
 .popup-actions { margin-top: 14px; display: grid; gap: 8px; }
-.popup-actions button { height: 40px; padding: 0 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--panel); cursor: pointer; font-size: 10px; text-align: left; transition: background 120ms ease, color 120ms ease; }
+.popup-actions button { min-height: 40px; padding: 9px 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--panel); cursor: pointer; font-size: 11px; line-height: 1.35; text-align: left; transition: background 120ms ease, color 120ms ease; }
 .popup-actions button:hover { color: var(--text); background: var(--raised); }
 .popup-actions .primary { text-align: center; }
-footer { min-height: 31px; margin-top: auto; padding-top: 14px; display: flex; align-items: center; border-top: 1px solid var(--border); color: var(--dim); font-size: 9px; }
+footer { min-height: 31px; margin-top: auto; padding-top: 14px; display: flex; align-items: center; border-top: 1px solid var(--border); color: var(--dim); font-size: 10px; }
 footer span { flex: 1; }
 footer span[data-tone="success"] { color: var(--success); }
 footer span[data-tone="danger"] { color: var(--danger); }
 footer button { width: 28px; height: 28px; border: 0; border-radius: 8px; color: var(--dim); background: transparent; cursor: pointer; }
 footer button:hover { color: var(--text); background: var(--hover); }
+.popup-body dialog { width: 330px; padding: 0; border: 1px solid var(--border-strong); border-radius: 14px; color: var(--text); background: var(--overlay); box-shadow: 0 24px 80px rgba(0,0,0,.68), var(--highlight); }
+.popup-body dialog::backdrop { background: rgba(0,0,0,.68); backdrop-filter: blur(4px); }
+.popup-body dialog form { padding: 18px; }
+.popup-body dialog h2 { margin: 5px 0 0; font-size: 16px; font-weight: 500; }
+.popup-body dialog p { min-height: 58px; margin: 14px 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.confirm-actions button { min-height: 34px; padding: 0 11px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: var(--panel); cursor: pointer; font-size: 11px; }
+.confirm-actions button:hover { color: var(--text); background: var(--raised); }

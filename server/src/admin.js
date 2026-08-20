@@ -1,5 +1,5 @@
 import { loadConfig } from "./config.js";
-import { createDatabase, migrate } from "./db.js";
+import { createDatabase } from "./db.js";
 import { normalizeEmail } from "./validation.js";
 
 const [, , command, emailArgument, confirmation] = process.argv;
@@ -19,8 +19,6 @@ if (
 const database = createDatabase(loadConfig().database);
 
 try {
-  await migrate(database);
-
   if (command === "pending") {
     const result = await database.query(
       `SELECT name, email, created_at

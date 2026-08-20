@@ -1,0 +1,8 @@
+**
+!package.json
+!package-lock.json
+!server
+!server/Dockerfile
+!server/package.json
+!server/src
+!server/src/**

@@ -13,7 +13,7 @@ use std::{
 };
 
 static PROXY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const PROXY_STORE_VERSION: u8 = 1;
+const PROXY_STORE_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +25,7 @@ pub struct ProxyItem {
     pub port: u16,
     pub has_auth: bool,
     pub status: String,
+    pub capability: String,
     pub latency_ms: u64,
     pub message: String,
     pub ip: String,
@@ -55,6 +56,7 @@ pub(crate) struct StoredProxy {
     pub(crate) username: Option<String>,
     pub(crate) password: Option<String>,
     pub(crate) status: String,
+    pub(crate) capability: String,
     pub(crate) latency_ms: u64,
     pub(crate) message: String,
     pub(crate) ip: String,
@@ -68,6 +70,7 @@ pub(crate) struct StoredProxy {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CheckUpdate {
     pub(crate) live: bool,
+    pub(crate) http_only: bool,
     pub(crate) latency_ms: u64,
     pub(crate) message: String,
     pub(crate) ip: String,
@@ -246,7 +249,7 @@ impl ProxyManager {
         Ok(state
             .items
             .iter()
-            .filter(|item| item.status == "live")
+            .filter(|item| item.status == "live" && item.capability == "httpsVerified")
             .cloned()
             .collect())
     }
@@ -277,26 +280,25 @@ impl ProxyManager {
             return Ok(None);
         };
 
+        let item = &mut state.items[position];
         if update.live {
-            let item = &mut state.items[position];
             item.status = "live".to_string();
-            item.latency_ms = update.latency_ms;
-            item.message = update.message;
-            item.ip = update.ip;
-            item.country = update.country;
-            item.country_code = update.country_code;
-            item.city = update.city;
-            item.checked_at = now_timestamp();
-            Ok(Some(item.item()))
+            item.capability = "httpsVerified".to_string();
+        } else if update.http_only {
+            item.status = "httpOnly".to_string();
+            item.capability = "httpOnly".to_string();
         } else {
-            let removed = state.items.swap_remove(position);
-            state.positions.remove(&removed.id);
-            if position < state.items.len() {
-                let moved_id = state.items[position].id.clone();
-                state.positions.insert(moved_id, position);
-            }
-            Ok(None)
+            item.status = "failed".to_string();
+            item.capability = "unavailable".to_string();
         }
+        item.latency_ms = update.latency_ms;
+        item.message = update.message;
+        item.ip = update.ip;
+        item.country = update.country;
+        item.country_code = update.country_code;
+        item.city = update.city;
+        item.checked_at = now_timestamp();
+        Ok(Some(item.item()))
     }
 
     pub(crate) fn commit_check(&self) -> Result<(), String> {
@@ -321,6 +323,7 @@ impl StoredProxy {
             username: parsed.username,
             password: parsed.password,
             status: "pending".to_string(),
+            capability: "unchecked".to_string(),
             created_at: now.to_string(),
             ..Self::default()
         }
@@ -346,6 +349,7 @@ impl StoredProxy {
             port: self.port,
             has_auth: self.username.is_some(),
             status: self.status.clone(),
+            capability: self.capability.clone(),
             latency_ms: self.latency_ms,
             message: self.message.clone(),
             ip: self.ip.clone(),
@@ -401,8 +405,17 @@ fn load(path: &Path) -> Vec<StoredProxy> {
                 return None;
             }
             item.protocol = normalized_protocol(&item.protocol).to_string();
-            if !matches!(item.status.as_str(), "pending" | "live") {
+            if item.capability.is_empty() {
+                // Version 1 could label a proxy live after a plain-HTTP probe. Force a
+                // recheck before it can be used by HTTPS-only modules.
                 item.status = "pending".to_string();
+                item.capability = "unchecked".to_string();
+            } else if !matches!(
+                item.status.as_str(),
+                "pending" | "live" | "httpOnly" | "failed"
+            ) {
+                item.status = "pending".to_string();
+                item.capability = "unchecked".to_string();
             }
             if item.id.is_empty() {
                 item.id = new_proxy_id("px");
@@ -569,6 +582,7 @@ mod tests {
                 &live_id,
                 CheckUpdate {
                     live: true,
+                    http_only: false,
                     latency_ms: 42,
                     message: "ok".to_string(),
                     ip: "203.0.113.10".to_string(),
@@ -589,7 +603,7 @@ mod tests {
                     ..CheckUpdate::default()
                 },
             )
-            .expect("remove dead");
+            .expect("mark failed");
 
         assert_eq!(
             ProxyManager::open(path.clone()).snapshot().unwrap().len(),
@@ -599,16 +613,49 @@ mod tests {
 
         let reopened = ProxyManager::open(path);
         let items = reopened.snapshot().expect("reopen snapshot");
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         let live = items
             .iter()
             .find(|item| item.id == live_id)
             .expect("live item");
         assert_eq!(live.status, "live");
+        assert_eq!(live.capability, "httpsVerified");
         assert_eq!(live.latency_ms, 42);
         assert_eq!(live.country_code, "EX");
         assert_eq!(live.city, "Example City");
-        assert!(!items.iter().any(|item| item.id == dead_id));
+        let failed = items
+            .iter()
+            .find(|item| item.id == dead_id)
+            .expect("failed item is retained");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.message, "dead");
+        assert!(!failed.checked_at.is_empty());
+    }
+
+    #[test]
+    fn http_only_proxy_is_visible_but_never_eligible_for_https_modules() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let manager = ProxyManager::open(directory.path().join("proxies.json"));
+        let added = manager.add("1.1.1.1:80", "http").expect("add proxy");
+
+        let item = manager
+            .apply_check(
+                &added.items[0].id,
+                CheckUpdate {
+                    live: false,
+                    http_only: true,
+                    latency_ms: 12,
+                    message: "HTTP only; HTTPS unavailable".to_string(),
+                    ip: "203.0.113.10".to_string(),
+                    ..CheckUpdate::default()
+                },
+            )
+            .expect("apply check")
+            .expect("retained item");
+
+        assert_eq!(item.status, "httpOnly");
+        assert_eq!(item.capability, "httpOnly");
+        assert!(manager.live_targets().expect("eligible targets").is_empty());
     }
 
     #[test]

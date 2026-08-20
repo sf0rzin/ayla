@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ayla Cookie Manager</title>
+    <title>Ayla Cookies for Microsoft Edge</title>
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="popup.css">
   </head>
@@ -11,28 +11,38 @@
     <main class="popup-shell">
       <header class="brand-row">
         <div class="brand-mark">A</div>
-        <div><strong>Ayla</strong><span>Cookie Manager</span></div>
-        <span class="status-dot" title="Dados processados localmente"></span>
+        <div><strong>Ayla</strong><span>Cookies for Edge</span></div>
+        <span class="status-dot" role="img" aria-label="Dados processados localmente"></span>
       </header>
 
       <section class="site-card">
         <span class="eyebrow">SITE ATUAL</span>
         <div class="site-heading">
-          <div class="site-favicon" id="site-favicon">•</div>
+          <div class="site-favicon" id="site-favicon" aria-hidden="true">•</div>
           <div><strong id="site-name">Carregando…</strong><span id="site-url">Aguardando a aba ativa</span></div>
           <span class="count-pill" id="cookie-count">0</span>
         </div>
       </section>
 
       <div class="popup-actions">
-        <button class="primary" id="open-manager">Gerenciar cookies</button>
-        <button id="delete-site">Apagar cookies não protegidos</button>
-        <button id="clear-storage">Limpar LocalStorage deste site</button>
+        <button type="button" class="primary" id="import-txt">Importar cookies.txt</button>
+        <button type="button" id="open-manager">Gerenciar cookies</button>
+        <button type="button" id="delete-site" disabled>Apagar cookies não protegidos</button>
+        <button type="button" id="clear-storage" disabled>Limpar LocalStorage deste site</button>
+        <button type="button" class="danger-solid" id="delete-all" disabled>Apagar todos os cookies do Edge</button>
       </div>
 
-      <footer><span id="message">Tudo acontece localmente.</span><button id="refresh" title="Atualizar">↻</button></footer>
+      <footer><span id="message" role="status" aria-live="polite" aria-atomic="true">Tudo acontece localmente.</span><button type="button" id="refresh" aria-label="Atualizar site atual">↻</button></footer>
     </main>
-    <script src="preview-mock.js"></script>
+
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+      <form method="dialog">
+        <span class="eyebrow">CONFIRMAÇÃO</span>
+        <h2 id="confirm-title" data-confirm-title>Confirmar ação</h2>
+        <p id="confirm-description" data-confirm-description></p>
+        <div class="confirm-actions"><button value="cancel" data-confirm-cancel>Cancelar</button><button value="confirm" class="danger" data-confirm-submit>Confirmar</button></div>
+      </form>
+    </dialog>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

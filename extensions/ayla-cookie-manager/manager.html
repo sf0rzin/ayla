@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ayla Cookie Manager</title>
+    <title>Ayla Cookies for Microsoft Edge</title>
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="manager.css">
   </head>
@@ -12,21 +12,21 @@
       <aside class="sidebar">
         <header class="brand-row">
           <div class="brand-mark">A</div>
-          <div><strong>Ayla</strong><span>Cookie Manager</span></div>
+          <div><strong>Ayla</strong><span>Cookies for Edge</span></div>
         </header>
 
         <label class="search-box">
-          <span>⌕</span>
-          <input id="domain-search" type="search" placeholder="Pesquisar domínios" autocomplete="off">
+          <span aria-hidden="true">⌕</span>
+          <input id="domain-search" type="search" placeholder="Pesquisar domínios" aria-label="Pesquisar domínios" autocomplete="off">
           <kbd>/</kbd>
         </label>
 
         <div class="sidebar-heading"><span>DOMÍNIOS</span><small id="domain-total">0</small></div>
-        <nav id="domain-list" class="domain-list"></nav>
+        <nav id="domain-list" class="domain-list" aria-label="Domínios de cookies"></nav>
 
         <div class="sidebar-footer">
-          <button id="show-protected"><span>◆</span><span>Protegidos</span><small id="protected-total">0</small></button>
-          <button id="show-settings"><span>⚙</span><span>Configurações</span></button>
+          <button type="button" id="show-protected" aria-pressed="false"><span aria-hidden="true">◆</span><span>Protegidos</span><small id="protected-total">0</small></button>
+          <button type="button" id="show-settings" aria-pressed="false"><span aria-hidden="true">⚙</span><span>Configurações</span></button>
         </div>
       </aside>
 
@@ -37,10 +37,11 @@
             <h1 id="view-title">Visão geral</h1>
           </div>
           <div class="toolbar-actions">
-            <button id="refresh" title="Atualizar">↻</button>
-            <button id="import-open">Importar</button>
-            <button id="export-open">Exportar</button>
-            <button class="primary" id="new-cookie">Novo cookie</button>
+            <button type="button" id="refresh" aria-label="Atualizar cookies">↻</button>
+            <button type="button" class="primary" id="import-open">Importar TXT</button>
+            <button type="button" id="export-open">Exportar</button>
+            <button type="button" id="new-cookie">Novo cookie</button>
+            <button type="button" class="danger-solid" id="delete-all">Apagar tudo</button>
           </div>
         </header>
 
@@ -54,14 +55,16 @@
 
           <div class="table-card">
             <div class="table-tools">
-              <label class="table-search"><span>⌕</span><input id="cookie-search" type="search" placeholder="Pesquisar nome ou valor"></label>
-              <span id="selection-label">Nenhum selecionado</span>
-              <button id="protect-selected">Proteger</button>
-              <button class="danger" id="delete-selected">Apagar</button>
+              <label class="table-search"><span aria-hidden="true">⌕</span><input id="cookie-search" type="search" placeholder="Pesquisar nome ou valor" aria-label="Pesquisar cookies por nome, valor ou domínio"></label>
+              <span id="selection-label" aria-live="polite">Nenhum selecionado</span>
+              <button type="button" id="protect-selected" disabled>Proteger</button>
+              <button type="button" id="unprotect-selected" disabled>Desproteger</button>
+              <button type="button" class="danger" id="delete-selected" disabled>Apagar</button>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th><input id="select-all" type="checkbox" aria-label="Selecionar todos"></th><th>Nome</th><th>Domínio</th><th>Caminho</th><th>Expiração</th><th>Flags</th><th></th></tr></thead>
+                <caption class="sr-only">Cookies da visualização atual</caption>
+                <thead><tr><th><input id="select-all" type="checkbox" aria-label="Selecionar todos os cookies visíveis"></th><th>Nome</th><th>Domínio</th><th>Caminho</th><th>Expiração</th><th>Flags</th><th><span class="sr-only">Ações</span></th></tr></thead>
                 <tbody id="cookie-rows"></tbody>
               </table>
               <div id="empty-state" class="empty-state hidden"><strong>Nenhum cookie encontrado</strong><span>Altere os filtros ou crie um novo cookie.</span></div>
@@ -71,16 +74,16 @@
 
         <section id="settings-view" class="content-view hidden">
           <div class="settings-card">
-            <div><strong>Proteção ativa</strong><span>Restaura cookies protegidos quando um site ou outra ação tenta removê-los.</span><label class="switch"><input id="setting-protection" type="checkbox"><i></i></label></div>
-            <div><strong>Limpar ao iniciar</strong><span>Remove todos os cookies não protegidos quando o Chromium inicia.</span><label class="switch"><input id="setting-autoclear" type="checkbox"><i></i></label></div>
-            <div><strong>Confirmar ações destrutivas</strong><span>Solicita confirmação antes de exclusões em massa.</span><label class="switch"><input id="setting-confirm" type="checkbox"><i></i></label></div>
+            <div><strong id="setting-protection-label">Proteção ativa</strong><span id="setting-protection-description">Restaura cookies protegidos quando um site ou outra ação tenta removê-los.</span><label class="switch"><input id="setting-protection" type="checkbox" aria-labelledby="setting-protection-label" aria-describedby="setting-protection-description"><i aria-hidden="true"></i></label></div>
+            <div><strong id="setting-autoclear-label">Limpar ao iniciar</strong><span id="setting-autoclear-description">Remove todos os cookies não protegidos quando o Chromium inicia.</span><label class="switch"><input id="setting-autoclear" type="checkbox" aria-labelledby="setting-autoclear-label" aria-describedby="setting-autoclear-description"><i aria-hidden="true"></i></label></div>
+            <div><strong id="setting-confirm-label">Confirmar ações destrutivas</strong><span id="setting-confirm-description">Solicita confirmação antes de exclusões em massa.</span><label class="switch"><input id="setting-confirm" type="checkbox" aria-labelledby="setting-confirm-label" aria-describedby="setting-confirm-description"><i aria-hidden="true"></i></label></div>
           </div>
-          <div class="settings-card privacy-note"><strong>Privacidade local</strong><p>Cookies, preferências e cópias protegidas permanecem no perfil local do Chromium. A extensão não envia telemetria e não se conecta à API do Ayla.</p></div>
+          <div class="settings-card privacy-note"><strong>Privacidade local</strong><p>Preferências e identidades de proteção do perfil normal podem persistir. Valores protegidos ficam somente na memória da sessão; valores do modo anônimo nunca são gravados no armazenamento local. A extensão não envia telemetria e não se conecta à API do Ayla.</p></div>
         </section>
       </main>
     </div>
 
-    <dialog id="cookie-dialog">
+    <dialog id="cookie-dialog" aria-labelledby="cookie-dialog-title" aria-describedby="cookie-form-error">
       <form method="dialog" id="cookie-form">
         <header><div><span class="eyebrow">COOKIE</span><h2 id="cookie-dialog-title">Novo cookie</h2></div><button type="button" data-close-dialog="cookie-dialog" class="icon-button" aria-label="Fechar">×</button></header>
         <div class="form-grid">
@@ -96,29 +99,40 @@
           <label class="check"><input name="session" type="checkbox" checked><span>Cookie de sessão</span></label>
           <label class="wide"><span>Top-level site (CHIPS, opcional)</span><input name="partitionSite" placeholder="https://example.com"></label>
         </div>
-        <p id="cookie-form-error" class="form-error"></p>
+        <p id="cookie-form-error" class="form-error" role="alert" aria-live="assertive"></p>
         <footer><button type="button" data-close-dialog="cookie-dialog">Cancelar</button><button type="submit" value="default" class="primary">Salvar cookie</button></footer>
       </form>
     </dialog>
 
-    <dialog id="transfer-dialog">
+    <dialog id="transfer-dialog" aria-labelledby="transfer-title" aria-describedby="transfer-error">
       <form method="dialog" id="transfer-form">
         <header><div><span class="eyebrow" id="transfer-eyebrow">TRANSFERÊNCIA</span><h2 id="transfer-title">Exportar cookies</h2></div><button type="button" data-close-dialog="transfer-dialog" class="icon-button" aria-label="Fechar">×</button></header>
         <div id="export-panel">
           <label><span>Formato</span><select id="export-format"><option value="json">JSON</option><option value="netscape">Netscape (cookies.txt)</option></select></label>
           <p id="export-description"></p>
+          <p id="export-warning" class="transfer-warning" role="status" aria-live="polite"></p>
         </div>
         <div id="import-panel" class="hidden">
-          <label class="file-drop"><input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"><strong>Selecionar arquivo</strong><span>JSON ou Netscape cookies.txt</span></label>
-          <textarea id="import-text" rows="12" placeholder="Ou cole os cookies aqui…"></textarea>
+          <label class="file-drop"><input id="import-file" type="file" accept=".txt,.json,text/plain,application/json"><strong>Selecionar cookies.txt</strong><span>Netscape/HttpOnly ou JSON · até 32 MiB</span></label>
+          <div class="import-file-meta"><strong id="import-file-name">Nenhum arquivo selecionado</strong><span id="import-summary" role="status" aria-live="polite">Escolha um TXT para analisar todos os registros.</span></div>
+          <label class="import-text-label" for="import-text">Conteúdo de cookies.txt ou JSON</label>
+          <textarea id="import-text" rows="12" placeholder="Ou cole aqui o conteúdo de cookies.txt…" aria-describedby="import-summary"></textarea>
+          <p class="transfer-note">Duplicatas usam a última ocorrência. Cookies que já existem com a mesma identidade só são substituídos após confirmação.</p>
         </div>
-        <p id="transfer-error" class="form-error"></p>
+        <p id="transfer-error" class="form-error" role="alert" aria-live="assertive"></p>
         <footer><button type="button" data-close-dialog="transfer-dialog">Cancelar</button><button type="submit" value="default" class="primary" id="transfer-submit">Exportar</button></footer>
       </form>
     </dialog>
 
-    <div id="toast" class="toast" role="status"></div>
-    <script src="preview-mock.js"></script>
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+      <form method="dialog">
+        <header><div><span class="eyebrow">CONFIRMAÇÃO</span><h2 id="confirm-title" data-confirm-title>Confirmar ação</h2></div></header>
+        <p id="confirm-description" class="confirm-description" data-confirm-description></p>
+        <footer><button value="cancel" data-confirm-cancel>Cancelar</button><button value="confirm" class="danger" data-confirm-submit>Confirmar</button></footer>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
     <script type="module" src="manager.js"></script>
   </body>
 </html>

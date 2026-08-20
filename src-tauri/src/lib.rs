@@ -17,7 +17,10 @@ use proxy_checker::{CheckProxiesRequest, CheckProxiesResponse};
 use proxy_store::{AddProxiesResult, ProxyItem, ProxyManager};
 use serde::Serialize;
 use settings::{AppSettings, SettingsStore};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::{
+    ffi::OsString,
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError},
+};
 use sysinfo::System;
 use task_engine::{DiscoveryLimits, StartTaskRequest, TaskEngine, TaskHistoryEntry, TaskSnapshot};
 use tauri::{AppHandle, Manager, State};
@@ -35,6 +38,64 @@ struct AppOverview {
 }
 
 struct SystemMetricsStore(Mutex<System>);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevelopmentLoginSession {
+    token: &'static str,
+    expires_at: &'static str,
+    user: DevelopmentLoginUser,
+}
+
+#[derive(Serialize)]
+struct DevelopmentLoginUser {
+    id: &'static str,
+    name: &'static str,
+    email: &'static str,
+    role: &'static str,
+}
+
+#[cfg(debug_assertions)]
+const DEVELOPMENT_LOGIN_BYPASS_ARGUMENT: &str = "--skip-login";
+
+#[cfg(debug_assertions)]
+fn development_login_bypass_requested_from(arguments: impl IntoIterator<Item = OsString>) -> bool {
+    arguments
+        .into_iter()
+        .any(|argument| argument == std::ffi::OsStr::new(DEVELOPMENT_LOGIN_BYPASS_ARGUMENT))
+}
+
+#[cfg(not(debug_assertions))]
+fn development_login_bypass_requested_from(_arguments: impl IntoIterator<Item = OsString>) -> bool {
+    false
+}
+
+fn development_login_bypass_session_from(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Option<DevelopmentLoginSession> {
+    if !development_login_bypass_requested_from(arguments) {
+        return None;
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        Some(DevelopmentLoginSession {
+            token: "development-local-test-session",
+            expires_at: "9999-12-31T23:59:59.999Z",
+            user: DevelopmentLoginUser {
+                id: "development-local-test",
+                name: "Local Tester",
+                email: "test@local.invalid",
+                role: "user",
+            },
+        })
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
 
 #[derive(Default)]
 struct UpdateInstallGate(RwLock<bool>);
@@ -197,6 +258,16 @@ fn list_modules() -> Vec<catalog::ModuleInfo> {
 #[tauri::command]
 fn get_settings(state: State<'_, SettingsStore>) -> Result<AppSettings, String> {
     state.snapshot()
+}
+
+#[tauri::command]
+fn development_login_bypass_session() -> Option<DevelopmentLoginSession> {
+    development_login_bypass_session_from(std::env::args_os())
+}
+
+#[tauri::command]
+fn get_settings_recovery_notice(state: State<'_, SettingsStore>) -> Result<Option<String>, String> {
+    state.recovery_notice()
 }
 
 #[tauri::command]
@@ -383,12 +454,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            development_login_bypass_session,
             get_app_overview,
             prepare_update_install,
             release_update_install_gate,
             get_system_metrics,
             list_modules,
             get_settings,
+            get_settings_recovery_notice,
             save_settings,
             parse_proxy_input,
             list_proxies,
@@ -412,6 +485,30 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_bypass_requires_the_exact_argument_and_a_debug_build() {
+        let session = development_login_bypass_session_from([
+            OsString::from("ayla.exe"),
+            OsString::from("--skip-login"),
+        ]);
+        assert_eq!(session.is_some(), cfg!(debug_assertions));
+
+        assert!(
+            development_login_bypass_session_from([
+                OsString::from("ayla.exe"),
+                OsString::from("--skip-login=true"),
+            ])
+            .is_none()
+        );
+        assert!(
+            development_login_bypass_session_from([
+                OsString::from("ayla.exe"),
+                OsString::from("--skip-auth"),
+            ])
+            .is_none()
+        );
+    }
 
     #[test]
     fn update_install_is_ready_only_when_background_work_is_idle() {

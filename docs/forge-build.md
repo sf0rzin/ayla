@@ -20,7 +20,11 @@ To request a build immediately or retry the current commit, run from the Rindexx
 - Source access: a read-only repository deploy key stored only on Forge.
 - Automatic trigger: the resident Windows scheduled task `Rindexx-Ayla-Build-Watcher`, polling about every 15 seconds.
 - Direct trigger: `infra/nyx/forge/Invoke-AylaBuild.ps1` in the private Rindexx project.
-- GitHub runner: `forge-ayla`, scoped only to `sf0rzin/Ayla`, currently reserved for manual dispatch while the GitHub Actions account issue is unresolved.
+- GitHub runner: `forge-ayla`, scoped only to `sf0rzin/Ayla`, must remain detached/disabled while the GitHub Actions account issue and external policy checks are unresolved.
+- Manual workflow: intentionally disabled. Its reviewed template lives at
+  `.github/disabled-workflows/forge-build.yml`, outside GitHub's executable
+  `.github/workflows` directory. This prevents a manual dispatch from selecting
+  and executing an altered branch version on Forge.
 - Validation: release-profile Rust tests followed by Tauri's single TypeScript/Vite build.
 - Packaging: `npm run tauri -- build --bundles nsis`.
 - Persistent direct-build Rust cache: `C:\actions-cache\Ayla\direct-target` on Forge.
@@ -28,6 +32,22 @@ To request a build immediately or retry the current commit, run from the Rindexx
 - Logs: `C:\ProgramData\Rindexx\logs\ayla-build-*.log` and `ayla-poller.log`.
 
 The persistent target directory and release-profile tests let the test/package stages reuse Rust output. `npm ci` is skipped when both `package-lock.json` and the existing `node_modules` match. These are caches, not backups, and can be deleted when diagnosing stale build output; the next build recreates them.
+
+The template's YAML guard is defense in depth, not an authorization boundary by itself.
+GitHub's manual-dispatch API requires a ref and runs the workflow version stored
+at that ref, so a collaborator can remove an in-YAML branch check on their own
+branch. Repository YAML cannot close that loop. Before re-enabling the runner,
+repository administrators must keep `main` protected against direct/force
+pushes and require reviewed changes, restrict Actions/workflow dispatch to
+trusted maintainers, and keep the runner group scoped only to this repository.
+Until those external controls are verified, do not move the template back into
+`.github/workflows`; use only the main-only Forge watcher/direct build path.
+Restoring it requires an administrator-reviewed change after proving with the
+GitHub API that an unauthorized actor and a non-main ref cannot allocate the
+runner. Anyone able to alter workflow policy or administer the runner remains
+outside what repository files can prevent.
+The Forge account and runner should therefore stay dedicated and hold no updater
+signing key or unrelated credentials.
 
 Observed on the first fully warm optimized run on 2026-07-22: Forge detected the push in 6.7 seconds and completed tests plus the Windows executable and NSIS installer in 14.5 seconds. Changes that invalidate more Rust dependencies will take longer; cold caches still require a full rebuild.
 

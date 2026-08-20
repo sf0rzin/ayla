@@ -1,20 +1,24 @@
 use crate::{
     auth_artifact, catalog,
-    chatgpt_client::{ChatGptPlan, ChatGptProbeResult, ChatGptProbeStatus, ChatGptProber},
+    chatgpt_client::{
+        ChatGptPlan, ChatGptPlanLookup, ChatGptProbeResult, ChatGptProbeStatus, ChatGptProber,
+    },
     cookie_artifact::{self, CookiePolicy, MAX_COOKIE_POLICY, TWITCH_COOKIE_POLICY},
     module_probe::{
         CookieModuleProber, ModulePlan, ModuleProbeResult, ModuleProbeStatus, ProbeControl,
     },
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -22,17 +26,13 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 
-const DEFAULT_MAX_DIRECTORIES: usize = 1_000;
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_SCAN_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-const HARD_MAX_DIRECTORIES: usize = 10_000;
 const HARD_MAX_FILES: usize = 100_000;
-const HARD_MAX_SCAN_BUDGET_MIB: u32 = 4_096;
 const MAX_RAW_ENTRIES: usize = 20_000;
 const MAX_ENTRY_BYTES: usize = 32 * 1024;
 const MAX_TOTAL_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WORKERS: usize = 32;
-const MAX_DISCOVERY_WORKERS: usize = 8;
 const MAX_HISTORY: usize = 100;
 const MAX_DELAY_MS: u64 = 60_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
@@ -42,32 +42,32 @@ const RESULTS_MARKER_CONTENT: &[u8] = b"AYLA_RESULTS_DIRECTORY_V1\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiscoveryLimits {
-    max_directories: usize,
-    max_files: usize,
-    scan_budget_bytes: u64,
+    max_directories: Option<usize>,
+    max_files: Option<usize>,
+    scan_budget_bytes: Option<u64>,
 }
 
 impl DiscoveryLimits {
-    pub(crate) fn new(max_directories: u32, max_files: u32, scan_budget_mib: u32) -> Self {
+    pub(crate) fn new(
+        max_directories: Option<u32>,
+        max_files: Option<u32>,
+        scan_budget_mib: Option<u32>,
+    ) -> Self {
         Self {
-            max_directories: (max_directories as usize).clamp(1, HARD_MAX_DIRECTORIES),
-            max_files: (max_files as usize).clamp(1, HARD_MAX_FILES),
-            scan_budget_bytes: u64::from(scan_budget_mib.clamp(1, HARD_MAX_SCAN_BUDGET_MIB))
-                .saturating_mul(1024 * 1024),
+            max_directories: max_directories.map(|limit| (limit as usize).max(1)),
+            max_files: max_files.map(|limit| (limit as usize).clamp(1, HARD_MAX_FILES)),
+            scan_budget_bytes: scan_budget_mib
+                .map(|limit| u64::from(limit.max(1)).saturating_mul(1024 * 1024)),
         }
-    }
-
-    fn max_directory_items(self) -> usize {
-        self.max_files.saturating_add(self.max_directories)
     }
 }
 
 impl Default for DiscoveryLimits {
     fn default() -> Self {
         Self {
-            max_directories: DEFAULT_MAX_DIRECTORIES,
-            max_files: DEFAULT_MAX_FILES,
-            scan_budget_bytes: DEFAULT_SCAN_BUDGET_BYTES,
+            max_directories: None,
+            max_files: Some(DEFAULT_MAX_FILES),
+            scan_budget_bytes: Some(DEFAULT_SCAN_BUDGET_BYTES),
         }
     }
 }
@@ -155,6 +155,8 @@ impl TaskStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ChatGptTaskSummary {
     pub active: usize,
+    pub authenticated_unknown: usize,
+    pub plan_unavailable: usize,
     pub dead: usize,
     pub rate_limited: usize,
     pub errors: usize,
@@ -226,6 +228,8 @@ pub struct TaskSnapshot {
     pub total: usize,
     pub discovered: usize,
     pub locally_filtered: usize,
+    pub discovery_complete: bool,
+    pub discovery_error: Option<String>,
     pub queued: usize,
     pub running: usize,
     pub processed: usize,
@@ -262,6 +266,8 @@ pub struct TaskHistoryEntry {
     pub discovered: usize,
     #[serde(default)]
     pub locally_filtered: usize,
+    #[serde(default)]
+    pub discovery_error: Option<String>,
     pub succeeded: usize,
     pub failed: usize,
     pub skipped: usize,
@@ -286,15 +292,25 @@ pub struct TaskHistoryEntry {
     pub export_errors: usize,
 }
 
-struct TaskInput(Arc<str>, usize);
+enum PreparedArtifact {
+    ChatGpt(auth_artifact::ChatGptArtifactPreparation),
+    Cookie(Result<cookie_artifact::PreparedCookieArtifact, Option<Vec<u8>>>),
+}
+
+struct TaskInput {
+    value: Arc<str>,
+    ordinal: usize,
+    artifact: Option<PreparedArtifact>,
+}
 
 impl TaskInput {
+    #[cfg(test)]
     fn into_inner(self) -> Arc<str> {
-        self.0
+        self.value
     }
 
     fn ordinal(&self) -> usize {
-        self.1
+        self.ordinal
     }
 }
 
@@ -403,8 +419,11 @@ impl HandlerResult {
     }
 }
 
-#[derive(Clone, Copy)]
 enum WorkerMessage {
+    CandidateReady,
+    CandidateFiltered,
+    DiscoveryComplete,
+    DiscoveryFailed(String),
     Started,
     Finished(HandlerOutcome, ExportRecord),
 }
@@ -501,6 +520,15 @@ fn export_classification(outcome: HandlerOutcome) -> Option<(bool, String, Optio
         HandlerOutcome::ChatGpt(result) => match result.status {
             ChatGptProbeStatus::Active(plan) => {
                 Some((true, ModulePlan::ChatGpt(plan).slug(), None))
+            }
+            ChatGptProbeStatus::Authenticated(ChatGptPlanLookup::Known(plan)) => {
+                Some((true, ModulePlan::ChatGpt(plan).slug(), None))
+            }
+            ChatGptProbeStatus::Authenticated(ChatGptPlanLookup::Unknown) => {
+                Some((true, "unknown-plan".to_string(), Some("plan-unknown")))
+            }
+            ChatGptProbeStatus::Authenticated(ChatGptPlanLookup::Unavailable) => {
+                Some((true, "unknown-plan".to_string(), Some("plan-unavailable")))
             }
             ChatGptProbeStatus::Dead => Some((false, "unknown-plan".to_string(), Some("dead"))),
             ChatGptProbeStatus::RateLimited => {
@@ -618,80 +646,75 @@ fn publish_without_overwrite(source: &Path, destination: &Path) -> io::Result<()
 }
 
 trait TaskHandler: Send + Sync + 'static {
+    fn prepares_artifacts(&self) -> bool {
+        false
+    }
+
     fn process(&self, module_id: &str, input: TaskInput, context: &TaskContext) -> HandlerResult;
 }
 
 struct ModuleInspectionHandler;
 
 impl TaskHandler for ModuleInspectionHandler {
+    fn prepares_artifacts(&self) -> bool {
+        true
+    }
+
     fn process(&self, module_id: &str, input: TaskInput, context: &TaskContext) -> HandlerResult {
         if context.is_cancelled() {
             return HandlerResult::without_artifact(HandlerOutcome::Skipped);
         }
 
-        let value = input.into_inner();
-        let path = Path::new(value.as_ref());
-        let result = match module_id {
-            "chatgpt" if path.is_absolute() => {
-                // Each file is bounded independently by the per-file artifact cap. There is
-                // no shared aggregate budget at execution, so a structurally valid file is
-                // never failed merely because earlier files consumed a common allowance.
-                let budget = AtomicU64::new(auth_artifact::MAX_ARTIFACT_BYTES);
-                match auth_artifact::load_chatgpt_path_with_budget(path, &budget) {
-                    auth_artifact::ChatGptArtifactPreparation::Ready(auth) => {
+        let TaskInput {
+            value, artifact, ..
+        } = input;
+        let result = match (module_id, artifact) {
+            ("chatgpt", Some(PreparedArtifact::ChatGpt(preparation))) => match preparation {
+                auth_artifact::ChatGptArtifactPreparation::Ready(auth) => {
+                    let outcome = match context.probe.as_ref() {
+                        Some(TaskProbe::ChatGpt(probe)) => {
+                            HandlerOutcome::ChatGpt(probe.check(&auth, context))
+                        }
+                        None => HandlerOutcome::Succeeded,
+                        Some(TaskProbe::Cookie(_)) => HandlerOutcome::Failed,
+                    };
+                    HandlerResult {
+                        outcome,
+                        artifact_bytes: Some(auth.into_artifact_bytes()),
+                    }
+                }
+                auth_artifact::ChatGptArtifactPreparation::Rejected {
+                    reason,
+                    artifact_bytes,
+                } => {
+                    let _ = reason;
+                    HandlerResult {
+                        outcome: HandlerOutcome::Failed,
+                        artifact_bytes,
+                    }
+                }
+            },
+            (_, Some(PreparedArtifact::Cookie(preparation)))
+                if cookie_policy_for_module(module_id).is_some() =>
+            {
+                match preparation {
+                    Ok(artifact) => {
                         let outcome = match context.probe.as_ref() {
-                            Some(TaskProbe::ChatGpt(probe)) => {
-                                HandlerOutcome::ChatGpt(probe.check(&auth))
+                            Some(TaskProbe::Cookie(probe)) => {
+                                HandlerOutcome::Module(probe.check(&artifact, context))
                             }
                             None => HandlerOutcome::Succeeded,
-                            Some(TaskProbe::Cookie(_)) => HandlerOutcome::Failed,
+                            Some(TaskProbe::ChatGpt(_)) => HandlerOutcome::Failed,
                         };
                         HandlerResult {
                             outcome,
-                            artifact_bytes: Some(auth.into_artifact_bytes()),
+                            artifact_bytes: Some(artifact.into_artifact_bytes()),
                         }
                     }
-                    auth_artifact::ChatGptArtifactPreparation::Rejected {
-                        artifact_bytes, ..
-                    } => HandlerResult {
+                    Err(artifact_bytes) => HandlerResult {
                         outcome: HandlerOutcome::Failed,
                         artifact_bytes,
                     },
-                }
-            }
-            _ if path.is_absolute() && cookie_policy_for_module(module_id).is_some() => {
-                let budget = AtomicU64::new(auth_artifact::MAX_ARTIFACT_BYTES);
-                match auth_artifact::read_artifact_path_with_budget(path, &budget) {
-                    Ok(artifact_bytes) => {
-                        // Keep the bounded original available for failed-result export. The
-                        // parser intentionally owns successful artifacts so validated bytes
-                        // cannot be separated from their parsed cookie metadata.
-                        let rejected_artifact_bytes = artifact_bytes.clone();
-                        match cookie_artifact::prepare_cookie_artifact(
-                            artifact_bytes,
-                            cookie_policy_for_module(module_id)
-                                .expect("guarded module cookie policy"),
-                        ) {
-                            Ok(artifact) => {
-                                let outcome = match context.probe.as_ref() {
-                                    Some(TaskProbe::Cookie(probe)) => {
-                                        HandlerOutcome::Module(probe.check(&artifact, context))
-                                    }
-                                    None => HandlerOutcome::Succeeded,
-                                    Some(TaskProbe::ChatGpt(_)) => HandlerOutcome::Failed,
-                                };
-                                HandlerResult {
-                                    outcome,
-                                    artifact_bytes: Some(artifact.into_artifact_bytes()),
-                                }
-                            }
-                            Err(_) => HandlerResult {
-                                outcome: HandlerOutcome::Failed,
-                                artifact_bytes: Some(rejected_artifact_bytes),
-                            },
-                        }
-                    }
-                    Err(_) => HandlerResult::without_artifact(HandlerOutcome::Failed),
                 }
             }
             _ => HandlerResult::without_artifact(HandlerOutcome::Failed),
@@ -767,6 +790,7 @@ struct EngineState {
 
 struct EngineInner {
     history_path: PathBuf,
+    lifecycle: Mutex<()>,
     state: Mutex<EngineState>,
     history_io: Mutex<()>,
     handler: Arc<dyn TaskHandler>,
@@ -795,6 +819,7 @@ impl TaskEngine {
         Self {
             inner: Arc::new(EngineInner {
                 history_path,
+                lifecycle: Mutex::new(()),
                 state: Mutex::new(EngineState {
                     active: None,
                     history,
@@ -848,15 +873,25 @@ impl TaskEngine {
         proxy_count: usize,
         discovery_limits: DiscoveryLimits,
     ) -> Result<TaskSnapshot, String> {
+        // Serialize starts without holding the state mutex across filesystem validation,
+        // exporter creation, or sync operations. Read/cancel APIs remain responsive while
+        // a new run is being prepared.
+        let _lifecycle = lock_unpoison(&self.inner.lifecycle);
+        {
+            let state = lock_unpoison(&self.inner.state);
+            if state.active.is_some() {
+                return Err("a task is already running".to_string());
+            }
+        }
+
         let PreparedTask {
             module_id,
-            inputs,
-            discovered,
-            locally_filtered,
+            roots,
             requested_concurrency,
             delay_ms,
             use_proxy,
             output_directory,
+            discovery_limits,
         } = prepare_with_limits(request, discovery_limits)?;
 
         if use_proxy && proxy_count == 0 {
@@ -864,17 +899,18 @@ impl TaskEngine {
         }
         let concurrency = effective_concurrency(requested_concurrency, use_proxy, proxy_count);
 
-        let total = inputs.len();
         let run_id = new_task_id();
         let cancellation = CancellationToken::new();
         let snapshot = TaskSnapshot {
             run_id: run_id.clone(),
             module_id: module_id.clone(),
             status: TaskStatus::Running,
-            total,
-            discovered,
-            locally_filtered,
-            queued: total,
+            total: 0,
+            discovered: 0,
+            locally_filtered: 0,
+            discovery_complete: false,
+            discovery_error: None,
+            queued: 0,
             running: 0,
             processed: 0,
             succeeded: 0,
@@ -899,23 +935,25 @@ impl TaskEngine {
             module_summary: Some(ModuleTaskSummary::default()),
         };
 
-        let result_exporter = {
+        let result_exporter = output_directory
+            .as_deref()
+            .map(|directory| ResultExporter::new(directory, &module_id, &run_id))
+            .transpose()?
+            .map(Arc::new);
+
+        {
             let mut state = lock_unpoison(&self.inner.state);
+            // Starts are serialized by `lifecycle`; retain the check so this remains
+            // fail-closed if another installation path is introduced later.
             if state.active.is_some() {
                 return Err("a task is already running".to_string());
             }
-            let result_exporter = output_directory
-                .as_deref()
-                .map(|directory| ResultExporter::new(directory, &module_id, &run_id))
-                .transpose()?
-                .map(Arc::new);
             state.active = Some(ActiveTask {
                 snapshot: snapshot.clone(),
                 cancellation: cancellation.clone(),
                 last_progress_event: Instant::now(),
             });
-            result_exporter
-        };
+        }
 
         self.inner.events.progress(snapshot.clone());
 
@@ -936,12 +974,14 @@ impl TaskEngine {
                     inner,
                     worker_run_id,
                     module_id,
-                    inputs,
+                    roots,
                     concurrency,
                     worker_delay_ms,
                     probe,
                     cancellation,
                     result_exporter,
+                    discovery_limits,
+                    output_directory,
                 );
             });
 
@@ -1026,10 +1066,32 @@ impl EngineInner {
                 return;
             };
 
-            match message {
+            let force_progress = match message {
+                WorkerMessage::CandidateReady => {
+                    active.snapshot.discovered = active.snapshot.discovered.saturating_add(1);
+                    active.snapshot.total = active.snapshot.total.saturating_add(1);
+                    active.snapshot.queued = active.snapshot.queued.saturating_add(1);
+                    false
+                }
+                WorkerMessage::CandidateFiltered => {
+                    active.snapshot.discovered = active.snapshot.discovered.saturating_add(1);
+                    active.snapshot.locally_filtered =
+                        active.snapshot.locally_filtered.saturating_add(1);
+                    false
+                }
+                WorkerMessage::DiscoveryComplete => {
+                    active.snapshot.discovery_complete = true;
+                    true
+                }
+                WorkerMessage::DiscoveryFailed(error) => {
+                    active.snapshot.discovery_complete = true;
+                    active.snapshot.discovery_error = Some(error);
+                    true
+                }
                 WorkerMessage::Started => {
                     active.snapshot.queued = active.snapshot.queued.saturating_sub(1);
                     active.snapshot.running = active.snapshot.running.saturating_add(1);
+                    false
                 }
                 WorkerMessage::Finished(outcome, export_record) => {
                     active.snapshot.running = active.snapshot.running.saturating_sub(1);
@@ -1064,6 +1126,51 @@ impl EngineInner {
                                     }
                                     if let Some(summary) = active.snapshot.module_summary.as_mut() {
                                         summary.record_active(ModulePlan::ChatGpt(plan));
+                                    }
+                                }
+                                ChatGptProbeStatus::Authenticated(lookup) => {
+                                    active.snapshot.succeeded =
+                                        active.snapshot.succeeded.saturating_add(1);
+                                    match lookup {
+                                        ChatGptPlanLookup::Known(plan) => {
+                                            if let Some(summary) = active.snapshot.chatgpt.as_mut()
+                                            {
+                                                summary.record_active(plan);
+                                            }
+                                            if let Some(summary) =
+                                                active.snapshot.module_summary.as_mut()
+                                            {
+                                                summary.record_active(ModulePlan::ChatGpt(plan));
+                                            }
+                                        }
+                                        ChatGptPlanLookup::Unknown => {
+                                            if let Some(summary) = active.snapshot.chatgpt.as_mut()
+                                            {
+                                                summary.active = summary.active.saturating_add(1);
+                                                summary.authenticated_unknown =
+                                                    summary.authenticated_unknown.saturating_add(1);
+                                            }
+                                            if let Some(summary) =
+                                                active.snapshot.module_summary.as_mut()
+                                            {
+                                                summary.authenticated_unknown =
+                                                    summary.authenticated_unknown.saturating_add(1);
+                                            }
+                                        }
+                                        ChatGptPlanLookup::Unavailable => {
+                                            if let Some(summary) = active.snapshot.chatgpt.as_mut()
+                                            {
+                                                summary.active = summary.active.saturating_add(1);
+                                                summary.plan_unavailable =
+                                                    summary.plan_unavailable.saturating_add(1);
+                                            }
+                                            if let Some(summary) =
+                                                active.snapshot.module_summary.as_mut()
+                                            {
+                                                summary.authenticated_unknown =
+                                                    summary.authenticated_unknown.saturating_add(1);
+                                            }
+                                        }
                                     }
                                 }
                                 ChatGptProbeStatus::Dead => {
@@ -1167,24 +1274,31 @@ impl EngineInner {
                                 active.snapshot.export_errors.saturating_add(1);
                         }
                     }
+                    false
                 }
-            }
+            };
 
             active.snapshot.sequence = active.snapshot.sequence.saturating_add(1);
-            active.snapshot.percent = percentage(
-                active
-                    .snapshot
-                    .processed
-                    .saturating_add(active.snapshot.skipped),
-                active.snapshot.total,
-            );
+            active.snapshot.percent = if active.snapshot.discovery_complete {
+                percentage(
+                    active
+                        .snapshot
+                        .processed
+                        .saturating_add(active.snapshot.skipped),
+                    active.snapshot.total,
+                )
+            } else {
+                0.0
+            };
 
-            let should_emit = active.last_progress_event.elapsed() >= PROGRESS_INTERVAL
-                || active
-                    .snapshot
-                    .processed
-                    .saturating_add(active.snapshot.skipped)
-                    == active.snapshot.total;
+            let should_emit = force_progress
+                || active.last_progress_event.elapsed() >= PROGRESS_INTERVAL
+                || (active.snapshot.discovery_complete
+                    && active
+                        .snapshot
+                        .processed
+                        .saturating_add(active.snapshot.skipped)
+                        == active.snapshot.total);
             if should_emit {
                 active.last_progress_event = Instant::now();
                 Some(active.snapshot.clone())
@@ -1237,7 +1351,11 @@ impl EngineInner {
             .skipped
             .saturating_add(active.snapshot.total.saturating_sub(accounted));
 
-        active.snapshot.status = if active.snapshot.processed == active.snapshot.total {
+        active.snapshot.status = if active.snapshot.discovery_error.is_some() {
+            TaskStatus::Failed
+        } else if active.snapshot.discovery_complete
+            && active.snapshot.processed == active.snapshot.total
+        {
             // Every input was processed, so the run succeeded even if a later worker thread
             // failed to spawn: the surviving workers drained the shared queue to completion.
             TaskStatus::Completed
@@ -1264,6 +1382,7 @@ impl EngineInner {
             total: active.snapshot.total,
             discovered: active.snapshot.discovered,
             locally_filtered: active.snapshot.locally_filtered,
+            discovery_error: active.snapshot.discovery_error.clone(),
             succeeded: active.snapshot.succeeded,
             failed: active.snapshot.failed,
             skipped: active.snapshot.skipped,
@@ -1293,18 +1412,24 @@ impl EngineInner {
 
 struct PreparedTask {
     module_id: String,
-    inputs: VecDeque<TaskInput>,
-    discovered: usize,
-    locally_filtered: usize,
+    roots: Vec<SourceRoot>,
     requested_concurrency: usize,
     delay_ms: u64,
     use_proxy: bool,
     output_directory: Option<PathBuf>,
+    discovery_limits: DiscoveryLimits,
 }
 
 struct SourceCandidate {
     value: Arc<str>,
     from_directory: bool,
+}
+
+struct SourceRoot {
+    value: Arc<str>,
+    path: PathBuf,
+    is_directory: bool,
+    key: String,
 }
 
 #[cfg(test)]
@@ -1343,13 +1468,10 @@ fn prepare_with_limits(
     let output_directory = prepare_output_directory(output_directory)?;
     let excluded_result_directory = output_directory.clone();
 
-    let mut candidate_indexes =
-        HashMap::<Arc<str>, usize>::with_capacity(entries.len().min(discovery_limits.max_files));
-    let mut candidates =
-        Vec::<SourceCandidate>::with_capacity(entries.len().min(discovery_limits.max_files));
+    let mut root_keys = HashSet::<String>::with_capacity(entries.len().min(MAX_RAW_ENTRIES));
+    let mut roots = Vec::<SourceRoot>::with_capacity(entries.len().min(MAX_RAW_ENTRIES));
     let mut raw_input_bytes = 0usize;
-    let mut expanded_input_bytes = 0usize;
-    let mut visited_directories = 0usize;
+    let mut explicit_files = 0usize;
     for entry in entries {
         let entry_bytes = entry.len();
         if entry_bytes > MAX_ENTRY_BYTES {
@@ -1363,96 +1485,83 @@ fn prepare_with_limits(
         if trimmed.is_empty() {
             continue;
         }
-        let path = Path::new(trimmed);
-        if is_inside_results_directory(path) {
-            return Err("a results directory cannot also be used as a task source".to_string());
+        let path = PathBuf::from(trimmed);
+        let is_local = auth_artifact::artifact_path_is_local(&path);
+        if path.is_absolute() && !is_local {
+            return Err(
+                "task sources must be absolute local paths without links or reparse points"
+                    .to_string(),
+            );
         }
-        if excluded_result_directory
-            .as_deref()
-            .is_some_and(|excluded| path_is_within(path, excluded))
-        {
-            return Err("a results directory cannot also be used as a task source".to_string());
+        if is_local {
+            if is_inside_results_directory(&path) {
+                return Err("a results directory cannot also be used as a task source".to_string());
+            }
+            if excluded_result_directory
+                .as_deref()
+                .is_some_and(|excluded| path_is_within(&path, excluded))
+            {
+                return Err("a results directory cannot also be used as a task source".to_string());
+            }
         }
-        let (expanded, from_directory) = match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => (
-                collect_directory_files(
-                    path,
-                    &mut visited_directories,
-                    discovery_limits,
-                    excluded_result_directory.as_deref(),
-                )?,
-                true,
-            ),
-            _ => (vec![PathBuf::from(trimmed)], false),
-        };
-
-        for candidate in expanded {
-            let Some(value) = candidate.to_str() else {
-                // A scanned directory can surface a non-UTF-8 filename; skip it rather than
-                // aborting discovery of every other valid file in the batch. Explicit
-                // entries always originate from valid UTF-8 input, so this only drops
-                // unrepresentable discovered paths.
-                continue;
-            };
-            let candidate_bytes = value.len();
-            if candidate_bytes > MAX_ENTRY_BYTES {
+        let is_directory = is_local
+            && fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_dir() && !is_link_or_reparse(&metadata));
+        let key = stable_path_key(&path);
+        if !root_keys.insert(key.clone()) {
+            continue;
+        }
+        if !is_directory {
+            explicit_files = explicit_files.saturating_add(1);
+            if discovery_limits
+                .max_files
+                .is_some_and(|limit| explicit_files > limit)
+            {
                 return Err(format!(
-                    "each path can contain at most {MAX_ENTRY_BYTES} bytes"
+                    "the limit is {} file paths",
+                    discovery_limits.max_files.expect("checked finite limit")
                 ));
             }
-            let value: Arc<str> = Arc::from(value);
-            if let Some(index) = candidate_indexes.get(&value).copied() {
-                if !from_directory {
-                    candidates[index].from_directory = false;
-                }
-                continue;
-            }
-            if candidates.len() >= discovery_limits.max_files {
-                return Err(format!(
-                    "the limit is {} unique files",
-                    discovery_limits.max_files
-                ));
-            }
-            expanded_input_bytes =
-                checked_total_input_bytes(expanded_input_bytes, candidate_bytes)?;
-            candidate_indexes.insert(Arc::clone(&value), candidates.len());
-            candidates.push(SourceCandidate {
-                value,
-                from_directory,
-            });
         }
+        let value: Arc<str> = Arc::from(trimmed);
+        roots.push(SourceRoot {
+            value,
+            path,
+            is_directory,
+            key,
+        });
     }
 
-    if candidates.is_empty() {
+    if roots.is_empty() {
         return Err("provide at least one valid entry".to_string());
     }
 
-    let discovered = candidates.len();
-    let ready =
-        structurally_ready_candidates(&module_id, &candidates, discovery_limits.scan_budget_bytes)?;
-    let inputs: VecDeque<_> = candidates
-        .into_iter()
-        .zip(ready)
-        .filter_map(|(candidate, ready)| ready.then_some(candidate.value))
-        .enumerate()
-        .map(|(index, value)| TaskInput(value, index.saturating_add(1)))
+    // Only explicit roots are retained. Nested directory roots are redundant and would
+    // otherwise discover the same subtree twice; pruning them is O(number of root path
+    // components) and does not require a set of every file found later.
+    let directory_keys: HashSet<_> = roots
+        .iter()
+        .filter(|root| root.is_directory)
+        .map(|root| root.key.clone())
         .collect();
-    let locally_filtered = discovered.saturating_sub(inputs.len());
-    if inputs.is_empty() {
-        return Err(format!(
-            "no structurally usable authentication files were found; {locally_filtered} unrelated or unusable files were ignored"
-        ));
-    }
+    roots.retain(|root| {
+        !root.is_directory
+            || !root
+                .path
+                .ancestors()
+                .skip(1)
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| directory_keys.contains(&stable_path_key(ancestor)))
+    });
 
     Ok(PreparedTask {
         module_id,
-        inputs,
-        discovered,
-        locally_filtered,
+        roots,
         requested_concurrency: concurrency.min(MAX_WORKERS),
         delay_ms,
         use_proxy,
         output_directory,
+        discovery_limits,
     })
 }
 
@@ -1571,94 +1680,6 @@ fn is_inside_results_directory(path: &Path) -> bool {
     path.ancestors().any(is_results_directory)
 }
 
-fn structurally_ready_candidates(
-    module_id: &str,
-    candidates: &[SourceCandidate],
-    scan_budget_bytes: u64,
-) -> Result<Vec<bool>, String> {
-    let scan_indices: Vec<_> = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| candidate.from_directory.then_some(index))
-        .collect();
-    if (module_id != "chatgpt" && cookie_policy_for_module(module_id).is_none())
-        || scan_indices.is_empty()
-    {
-        return Ok(vec![true; candidates.len()]);
-    }
-
-    let mut scan_bytes = 0u64;
-    for index in &scan_indices {
-        if let Ok(metadata) = fs::metadata(Path::new(candidates[*index].value.as_ref())) {
-            // Files above the per-file cap are rejected by the scan without consuming any
-            // budget, so counting them here would let a single large unrelated file falsely
-            // abort discovery of the whole batch.
-            if metadata.len() > auth_artifact::MAX_ARTIFACT_BYTES {
-                continue;
-            }
-            scan_bytes = scan_bytes
-                .checked_add(metadata.len())
-                .filter(|total| *total <= scan_budget_bytes)
-                .ok_or_else(|| {
-                    format!(
-                        "the local discovery scan can inspect at most {} MiB",
-                        scan_budget_bytes / (1024 * 1024)
-                    )
-                })?;
-        }
-    }
-
-    let ready: Vec<_> = candidates
-        .iter()
-        .map(|candidate| AtomicBool::new(!candidate.from_directory))
-        .collect();
-    let next = AtomicUsize::new(0);
-    let remaining_bytes = AtomicU64::new(scan_budget_bytes);
-    let workers = thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .min(MAX_DISCOVERY_WORKERS)
-        .min(scan_indices.len())
-        .max(1);
-
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            let ready = &ready;
-            let next = &next;
-            let remaining_bytes = &remaining_bytes;
-            let scan_indices = &scan_indices;
-            scope.spawn(move || {
-                loop {
-                    let scan_index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(candidate_index) = scan_indices.get(scan_index).copied() else {
-                        break;
-                    };
-                    let path = Path::new(candidates[candidate_index].value.as_ref());
-                    let is_ready = if module_id == "chatgpt" {
-                        auth_artifact::inspect_chatgpt_path_with_budget(path, remaining_bytes)
-                            == auth_artifact::InspectionResult::Ready
-                    } else if let Some(policy) = cookie_policy_for_module(module_id) {
-                        auth_artifact::read_artifact_path_with_budget(path, remaining_bytes)
-                            .ok()
-                            .and_then(|bytes| {
-                                cookie_artifact::prepare_cookie_artifact(bytes, policy).ok()
-                            })
-                            .is_some()
-                    } else {
-                        false
-                    };
-                    ready[candidate_index].store(is_ready, Ordering::Release);
-                }
-            });
-        }
-    });
-
-    Ok(ready
-        .into_iter()
-        .map(|value| value.load(Ordering::Acquire))
-        .collect())
-}
-
 fn effective_concurrency(requested: usize, use_proxy: bool, proxy_count: usize) -> usize {
     if use_proxy {
         requested.min(proxy_count)
@@ -1667,76 +1688,339 @@ fn effective_concurrency(requested: usize, use_proxy: bool, proxy_count: usize) 
     }
 }
 
-fn collect_directory_files(
-    root: &Path,
-    visited_directories: &mut usize,
-    discovery_limits: DiscoveryLimits,
-    excluded_directory: Option<&Path>,
-) -> Result<Vec<PathBuf>, String> {
-    let mut directories = vec![root.to_path_buf()];
-    let mut files = Vec::new();
+fn stable_path_key(path: &Path) -> String {
+    let normalized = if auth_artifact::artifact_path_is_local(path) {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    #[cfg(windows)]
+    {
+        normalized
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized.to_string_lossy().into_owned()
+    }
+}
 
-    while let Some(directory) = directories.pop() {
-        if is_results_directory(&directory) {
-            continue;
-        }
-        if excluded_directory.is_some_and(|excluded| path_is_within(&directory, excluded)) {
-            continue;
-        }
-        *visited_directories = (*visited_directories).saturating_add(1);
-        if *visited_directories > discovery_limits.max_directories {
-            return Err(format!(
-                "the limit is {} directories per validation",
-                discovery_limits.max_directories
-            ));
-        }
+enum DiscoveryAbort {
+    Cancelled,
+    Failed(String),
+}
 
-        let reader = fs::read_dir(&directory)
-            .map_err(|_| "unable to read one of the provided directories".to_string())?;
-        let mut entries = Vec::new();
-        for entry in reader {
-            if entries.len() >= discovery_limits.max_directory_items() {
-                return Err(format!(
-                    "a directory can contain at most {} items",
-                    discovery_limits.max_directory_items()
-                ));
-            }
-            entries.push(
-                entry.map_err(|_| "unable to list one of the provided directories".to_string())?,
-            );
-        }
-        entries.sort_by_key(|entry| entry.file_name());
+struct DiscoveryProducer<'a> {
+    module_id: &'a str,
+    limits: DiscoveryLimits,
+    remaining_bytes: Option<AtomicU64>,
+    input_sender: &'a mpsc::SyncSender<TaskInput>,
+    status_sender: &'a mpsc::SyncSender<WorkerMessage>,
+    cancellation: &'a CancellationToken,
+    prepare_artifacts: bool,
+    explicit_keys: HashSet<String>,
+    excluded_directory: Option<&'a Path>,
+    visited_directories: usize,
+    discovered_files: usize,
+    next_ordinal: usize,
+    ready: usize,
+}
 
-        for entry in entries {
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|_| "unable to read an item in the directory".to_string())?;
-            if is_link_or_reparse(&metadata) {
-                continue;
-            }
-            if is_platform_metadata(&path, metadata.is_dir()) {
-                continue;
-            }
-            if metadata.is_dir() {
-                if !is_results_directory(&path)
-                    && !excluded_directory.is_some_and(|excluded| path_is_within(&path, excluded))
-                {
-                    directories.push(path);
-                }
-            } else if metadata.is_file() {
-                if files.len() >= discovery_limits.max_files {
-                    return Err(format!(
-                        "the limit is {} files per directory",
-                        discovery_limits.max_files
-                    ));
-                }
-                files.push(path);
-            }
+impl DiscoveryProducer<'_> {
+    fn check_cancelled(&self) -> Result<(), DiscoveryAbort> {
+        if self.cancellation.is_cancelled() {
+            Err(DiscoveryAbort::Cancelled)
+        } else {
+            Ok(())
         }
     }
 
-    files.sort();
-    Ok(files)
+    fn enter_directory(
+        &mut self,
+        path: &Path,
+        root: bool,
+    ) -> Result<Option<fs::ReadDir>, DiscoveryAbort> {
+        self.check_cancelled()?;
+        if !auth_artifact::artifact_path_is_local(path) {
+            return if root {
+                Err(DiscoveryAbort::Failed(
+                    "a discovery root must be an absolute local directory without links or reparse points"
+                        .to_string(),
+                ))
+            } else {
+                Ok(None)
+            };
+        }
+        self.visited_directories = self.visited_directories.checked_add(1).ok_or_else(|| {
+            DiscoveryAbort::Failed("too many directories were visited".to_string())
+        })?;
+        if self
+            .limits
+            .max_directories
+            .is_some_and(|limit| self.visited_directories > limit)
+        {
+            return Err(DiscoveryAbort::Failed(format!(
+                "the limit is {} directories per validation",
+                self.limits.max_directories.expect("checked finite limit")
+            )));
+        }
+        match fs::read_dir(path) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(error) if !root && transient_discovery_error(&error) => Ok(None),
+            Err(_) => Err(DiscoveryAbort::Failed(
+                "unable to read one of the provided directories".to_string(),
+            )),
+        }
+    }
+
+    fn walk_directory(&mut self, root: &Path) -> Result<(), DiscoveryAbort> {
+        let mut readers = vec![
+            self.enter_directory(root, true)?
+                .expect("a readable root returns a directory iterator"),
+        ];
+        while !readers.is_empty() {
+            self.check_cancelled()?;
+            let entry = {
+                let reader = readers.last_mut().expect("non-empty reader stack");
+                reader.next()
+            };
+            let Some(entry) = entry else {
+                readers.pop();
+                continue;
+            };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if transient_discovery_error(&error) => continue,
+                Err(_) => {
+                    return Err(DiscoveryAbort::Failed(
+                        "unable to list one of the provided directories".to_string(),
+                    ));
+                }
+            };
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if transient_discovery_error(&error) => continue,
+                Err(_) => {
+                    return Err(DiscoveryAbort::Failed(
+                        "unable to read an item in the directory".to_string(),
+                    ));
+                }
+            };
+            if is_link_or_reparse(&metadata) || is_platform_metadata(&path, metadata.is_dir()) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if !auth_artifact::artifact_path_is_local(&path) {
+                    continue;
+                }
+                if !is_results_directory(&path)
+                    && !self
+                        .excluded_directory
+                        .is_some_and(|excluded| path_is_within(&path, excluded))
+                {
+                    if let Some(reader) = self.enter_directory(&path, false)? {
+                        readers.push(reader);
+                    }
+                }
+            } else if metadata.is_file()
+                && (self.explicit_keys.is_empty()
+                    || !self.explicit_keys.contains(&stable_path_key(&path)))
+            {
+                let Some(value) = path.to_str() else {
+                    continue;
+                };
+                self.submit_candidate(SourceCandidate {
+                    value: Arc::from(value),
+                    from_directory: true,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_candidate(&mut self, candidate: SourceCandidate) -> Result<(), DiscoveryAbort> {
+        self.check_cancelled()?;
+        if candidate.value.len() > MAX_ENTRY_BYTES {
+            return Err(DiscoveryAbort::Failed(format!(
+                "each path can contain at most {MAX_ENTRY_BYTES} bytes"
+            )));
+        }
+        if let Some(limit) = self.limits.max_files {
+            if self.discovered_files >= limit {
+                return Err(DiscoveryAbort::Failed(format!(
+                    "the limit is {limit} file paths"
+                )));
+            }
+        }
+        self.discovered_files = self.discovered_files.saturating_add(1);
+        let artifact = if self.prepare_artifacts {
+            match self.prepare_candidate(&candidate)? {
+                Some(artifact) => Some(artifact),
+                None => {
+                    self.check_cancelled()?;
+                    self.status_sender
+                        .send(WorkerMessage::CandidateFiltered)
+                        .map_err(|_| DiscoveryAbort::Cancelled)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        self.check_cancelled()?;
+
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        let input = TaskInput {
+            value: candidate.value,
+            ordinal: self.next_ordinal,
+            artifact,
+        };
+        // Account the item before making it visible to a worker. If cancellation wins after
+        // this point, finish() accounts the accepted-but-not-processed item as skipped.
+        self.status_sender
+            .send(WorkerMessage::CandidateReady)
+            .map_err(|_| DiscoveryAbort::Cancelled)?;
+        if !send_task_input(self.input_sender, input, self.cancellation) {
+            return Err(DiscoveryAbort::Cancelled);
+        }
+        self.ready = self.ready.saturating_add(1);
+        Ok(())
+    }
+
+    fn prepare_candidate(
+        &self,
+        candidate: &SourceCandidate,
+    ) -> Result<Option<PreparedArtifact>, DiscoveryAbort> {
+        let aggregate_budget = candidate
+            .from_directory
+            .then_some(self.remaining_bytes.as_ref())
+            .flatten();
+        let bytes = match auth_artifact::read_artifact_path(
+            Path::new(candidate.value.as_ref()),
+            aggregate_budget,
+        ) {
+            Ok(bytes) => bytes,
+            Err(auth_artifact::ArtifactReadError::BudgetExceeded) => {
+                let limit = self
+                    .limits
+                    .scan_budget_bytes
+                    .expect("a budget error requires a finite limit");
+                return Err(DiscoveryAbort::Failed(format!(
+                    "the local discovery scan can inspect at most {} MiB",
+                    limit / (1024 * 1024)
+                )));
+            }
+            Err(auth_artifact::ArtifactReadError::Inspection(reason)) => {
+                if candidate.from_directory {
+                    return Ok(None);
+                }
+                return Ok(Some(if self.module_id == "chatgpt" {
+                    PreparedArtifact::ChatGpt(auth_artifact::ChatGptArtifactPreparation::Rejected {
+                        reason,
+                        artifact_bytes: None,
+                    })
+                } else {
+                    PreparedArtifact::Cookie(Err(None))
+                }));
+            }
+        };
+
+        if self.module_id == "chatgpt" {
+            let preparation = auth_artifact::load_chatgpt_bytes(bytes);
+            if candidate.from_directory
+                && !matches!(
+                    &preparation,
+                    auth_artifact::ChatGptArtifactPreparation::Ready(_)
+                )
+            {
+                Ok(None)
+            } else {
+                Ok(Some(PreparedArtifact::ChatGpt(preparation)))
+            }
+        } else if let Some(policy) = cookie_policy_for_module(self.module_id) {
+            let rejected_bytes = bytes.clone();
+            match cookie_artifact::prepare_cookie_artifact(bytes, policy) {
+                Ok(artifact) => Ok(Some(PreparedArtifact::Cookie(Ok(artifact)))),
+                Err(_) if candidate.from_directory => Ok(None),
+                Err(_) => Ok(Some(PreparedArtifact::Cookie(Err(Some(rejected_bytes))))),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn transient_discovery_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
+}
+
+fn produce_task_inputs(
+    module_id: &str,
+    roots: &[SourceRoot],
+    limits: DiscoveryLimits,
+    excluded_directory: Option<&Path>,
+    prepare_artifacts: bool,
+    input_sender: &mpsc::SyncSender<TaskInput>,
+    status_sender: &mpsc::SyncSender<WorkerMessage>,
+    cancellation: &CancellationToken,
+) {
+    let explicit_keys = roots
+        .iter()
+        .filter(|root| !root.is_directory)
+        .map(|root| root.key.clone())
+        .collect();
+    let mut producer = DiscoveryProducer {
+        module_id,
+        limits,
+        remaining_bytes: limits.scan_budget_bytes.map(AtomicU64::new),
+        input_sender,
+        status_sender,
+        cancellation,
+        prepare_artifacts,
+        explicit_keys,
+        excluded_directory,
+        visited_directories: 0,
+        discovered_files: 0,
+        next_ordinal: 0,
+        ready: 0,
+    };
+
+    let outcome = roots.iter().try_for_each(|root| {
+        producer.check_cancelled()?;
+        if root.is_directory {
+            producer.walk_directory(&root.path)
+        } else {
+            producer.submit_candidate(SourceCandidate {
+                value: Arc::clone(&root.value),
+                from_directory: false,
+            })
+        }
+    });
+
+    match outcome {
+        Ok(()) if producer.ready == 0 => {
+            let error = format!(
+                "no structurally usable authentication files were found; {} unrelated or unusable files were ignored",
+                producer.discovered_files
+            );
+            cancellation.cancel();
+            let _ = status_sender.send(WorkerMessage::DiscoveryFailed(error));
+        }
+        Ok(()) => {
+            let _ = status_sender.send(WorkerMessage::DiscoveryComplete);
+        }
+        Err(DiscoveryAbort::Cancelled) => {}
+        Err(DiscoveryAbort::Failed(error)) => {
+            cancellation.cancel();
+            let _ = status_sender.send(WorkerMessage::DiscoveryFailed(error));
+        }
+    }
 }
 
 fn path_is_within(path: &Path, directory: &Path) -> bool {
@@ -1805,26 +2089,26 @@ fn run_task(
     inner: Arc<EngineInner>,
     run_id: String,
     module_id: String,
-    inputs: VecDeque<TaskInput>,
+    roots: Vec<SourceRoot>,
     concurrency: usize,
     delay_ms: u64,
     probe: Option<TaskProbe>,
     cancellation: CancellationToken,
     result_exporter: Option<Arc<ResultExporter>>,
+    discovery_limits: DiscoveryLimits,
+    excluded_directory: Option<PathBuf>,
 ) {
     let module_id: Arc<str> = Arc::from(module_id);
-    let queue = Arc::new(Mutex::new(inputs));
-    let worker_count = {
-        let total = lock_unpoison(&queue).len();
-        concurrency.min(total)
-    };
+    let worker_count = concurrency.max(1);
     let delay = Duration::from_millis(delay_ms);
+    let (input_sender, input_receiver) = mpsc::sync_channel((worker_count * 2).max(1));
+    let input_receiver = Arc::new(Mutex::new(input_receiver));
     let (sender, receiver) = mpsc::sync_channel((worker_count * 2).max(1));
     let mut workers = Vec::with_capacity(worker_count);
     let mut fatal_worker_error = false;
 
     for worker_index in 0..worker_count {
-        let queue = Arc::clone(&queue);
+        let input_receiver = Arc::clone(&input_receiver);
         let module_id = Arc::clone(&module_id);
         let sender = sender.clone();
         let handler = Arc::clone(&inner.handler);
@@ -1837,7 +2121,7 @@ fn run_task(
             .name(format!("ayla-task-worker-{worker_index}"))
             .spawn(move || {
                 worker_loop(
-                    queue,
+                    input_receiver,
                     module_id,
                     sender,
                     handler,
@@ -1855,10 +2139,65 @@ fn run_task(
             }
         }
     }
+    drop(input_receiver);
+
+    if workers.is_empty() {
+        drop(input_sender);
+        cancellation.cancel();
+        inner.record(
+            &run_id,
+            WorkerMessage::DiscoveryFailed("unable to start task workers".to_string()),
+        );
+        inner.finish(&run_id, true);
+        return;
+    }
+
+    let producer_module_id = Arc::clone(&module_id);
+    let producer_sender = sender.clone();
+    let producer_cancellation = cancellation.clone();
+    let prepare_artifacts = inner.handler.prepares_artifacts();
+    let producer = thread::Builder::new()
+        .name(format!("ayla-task-discovery-{run_id}"))
+        .spawn(move || {
+            produce_task_inputs(
+                producer_module_id.as_ref(),
+                &roots,
+                discovery_limits,
+                excluded_directory.as_deref(),
+                prepare_artifacts,
+                &input_sender,
+                &producer_sender,
+                &producer_cancellation,
+            );
+        });
+    if producer.is_err() {
+        fatal_worker_error = true;
+        cancellation.cancel();
+        let _ = sender.send(WorkerMessage::DiscoveryFailed(
+            "unable to start task discovery".to_string(),
+        ));
+    }
     drop(sender);
 
-    for outcome in receiver {
-        inner.record(&run_id, outcome);
+    for message in receiver {
+        match message {
+            WorkerMessage::DiscoveryFailed(error) => {
+                fatal_worker_error = true;
+                inner.record(&run_id, WorkerMessage::DiscoveryFailed(error));
+            }
+            message => inner.record(&run_id, message),
+        }
+    }
+
+    if let Ok(producer) = producer {
+        if producer.join().is_err() {
+            fatal_worker_error = true;
+            cancellation.cancel();
+            inner.record(
+                &run_id,
+                WorkerMessage::DiscoveryFailed("task discovery stopped unexpectedly".to_string()),
+            );
+        }
     }
 
     for worker in workers {
@@ -1870,8 +2209,30 @@ fn run_task(
     inner.finish(&run_id, fatal_worker_error);
 }
 
+fn send_task_input(
+    sender: &mpsc::SyncSender<TaskInput>,
+    mut input: TaskInput,
+    cancellation: &CancellationToken,
+) -> bool {
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        match sender.try_send(input) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                input = returned;
+                if cancellation.wait_cancelled(Duration::from_millis(10)) {
+                    return false;
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 fn worker_loop(
-    queue: Arc<Mutex<VecDeque<TaskInput>>>,
+    input_receiver: Arc<Mutex<mpsc::Receiver<TaskInput>>>,
     module_id: Arc<str>,
     sender: mpsc::SyncSender<WorkerMessage>,
     handler: Arc<dyn TaskHandler>,
@@ -1884,8 +2245,8 @@ fn worker_loop(
             break;
         }
 
-        let input = lock_unpoison(&queue).pop_front();
-        let Some(input) = input else {
+        let input = lock_unpoison(&input_receiver).recv();
+        let Ok(input) = input else {
             break;
         };
 
@@ -2118,7 +2479,11 @@ mod tests {
     }
 
     impl ChatGptProber for CountingProber {
-        fn check(&self, _auth: &auth_artifact::PreparedChatGptAuth) -> ChatGptProbeResult {
+        fn check(
+            &self,
+            _auth: &auth_artifact::PreparedChatGptAuth,
+            _control: &dyn ProbeControl,
+        ) -> ChatGptProbeResult {
             self.calls.fetch_add(1, Ordering::AcqRel);
             ChatGptProbeResult {
                 status: ChatGptProbeStatus::Active(ChatGptPlan::Free),
@@ -2133,7 +2498,11 @@ mod tests {
     }
 
     impl ChatGptProber for MutatingProber {
-        fn check(&self, _auth: &auth_artifact::PreparedChatGptAuth) -> ChatGptProbeResult {
+        fn check(
+            &self,
+            _auth: &auth_artifact::PreparedChatGptAuth,
+            _control: &dyn ProbeControl,
+        ) -> ChatGptProbeResult {
             fs::write(&self.source, &self.replacement).expect("replace source during probe");
             ChatGptProbeResult {
                 status: ChatGptProbeStatus::Active(ChatGptPlan::Plus),
@@ -2230,6 +2599,20 @@ mod tests {
         TaskEngine::with_components(path, handler, events)
     }
 
+    fn run_local_inspection(request: StartTaskRequest, limits: DiscoveryLimits) -> TaskSnapshot {
+        let state = tempfile::tempdir().expect("temporary task state");
+        let events = Arc::new(RecordingEvents::default());
+        let engine = test_engine(
+            state.path().join("task_history.json"),
+            Arc::new(ModuleInspectionHandler),
+            events.clone(),
+        );
+        let started = engine
+            .start_with_probe(request, None, 0, limits)
+            .expect("start local inspection");
+        wait_for_done(&events, &started.run_id)
+    }
+
     fn wait_for_history(engine: &TaskEngine, run_id: &str) -> TaskHistoryEntry {
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(5) {
@@ -2305,11 +2688,11 @@ mod tests {
         .expect("prepare task");
 
         assert_eq!(prepared.module_id, "chatgpt");
-        assert_eq!(prepared.inputs.len(), 2);
+        assert_eq!(prepared.roots.len(), 2);
         let order: Vec<_> = prepared
-            .inputs
+            .roots
             .iter()
-            .map(|input| input.0.as_ref())
+            .map(|root| root.value.as_ref())
             .collect();
         assert_eq!(order, vec!["alpha", "beta"]);
 
@@ -2345,31 +2728,23 @@ mod tests {
     }
 
     #[test]
-    fn preparation_expands_directories_recursively() {
+    fn streaming_discovery_expands_directories_recursively() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let nested = directory.path().join("nested");
         fs::create_dir_all(&nested).expect("create nested directory");
         write_ready_artifact(&directory.path().join("one.txt"), 1);
         write_ready_artifact(&nested.join("two.json"), 2);
 
-        let prepared = prepare(request(
-            "chatgpt",
-            [directory.path().display().to_string()],
-            4,
-            0,
-        ))
-        .expect("expand directory");
+        let done = run_local_inspection(
+            request("chatgpt", [directory.path().display().to_string()], 4, 0),
+            DiscoveryLimits::default(),
+        );
 
-        assert_eq!(prepared.inputs.len(), 2);
-        assert_eq!(prepared.discovered, 2);
-        assert_eq!(prepared.locally_filtered, 0);
-        let paths: Vec<_> = prepared
-            .inputs
-            .iter()
-            .map(|input| input.0.as_ref())
-            .collect();
-        assert!(paths.iter().any(|path| path.ends_with("one.txt")));
-        assert!(paths.iter().any(|path| path.ends_with("two.json")));
+        assert!(done.discovery_complete);
+        assert_eq!(done.discovered, 2);
+        assert_eq!(done.total, 2);
+        assert_eq!(done.locally_filtered, 0);
+        assert_eq!(done.succeeded, 2);
     }
 
     #[test]
@@ -2381,21 +2756,29 @@ mod tests {
         write_ready_artifact(&directory.path().join("two.txt"), 2);
         write_ready_artifact(&nested.join("three.txt"), 3);
 
-        let file_error = prepare_with_limits(
+        let file_done = run_local_inspection(
             request("chatgpt", [directory.path().display().to_string()], 1, 0),
-            DiscoveryLimits::new(10, 2, 8),
-        )
-        .err()
-        .expect("file limit must be enforced");
-        assert!(file_error.contains("2"));
+            DiscoveryLimits::new(Some(10), Some(2), Some(8)),
+        );
+        assert_eq!(file_done.status, TaskStatus::Failed);
+        assert!(
+            file_done
+                .discovery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("2"))
+        );
 
-        let directory_error = prepare_with_limits(
+        let directory_done = run_local_inspection(
             request("chatgpt", [directory.path().display().to_string()], 1, 0),
-            DiscoveryLimits::new(1, 10, 8),
-        )
-        .err()
-        .expect("directory limit must be enforced");
-        assert!(directory_error.contains("1 directories"));
+            DiscoveryLimits::new(Some(1), Some(10), Some(8)),
+        );
+        assert_eq!(directory_done.status, TaskStatus::Failed);
+        assert!(
+            directory_done
+                .discovery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("1 directories"))
+        );
 
         let budget_directory = tempfile::tempdir().expect("temporary budget directory");
         fs::write(
@@ -2408,29 +2791,224 @@ mod tests {
             vec![b'b'; 600 * 1024],
         )
         .expect("write second large file");
-        let budget_error = prepare_with_limits(
+        let budget_done = run_local_inspection(
             request(
                 "chatgpt",
                 [budget_directory.path().display().to_string()],
                 1,
                 0,
             ),
-            DiscoveryLimits::new(10, 10, 1),
-        )
-        .err()
-        .expect("scan budget must be enforced");
-        assert!(budget_error.contains("1 MiB"));
+            DiscoveryLimits::new(Some(10), Some(10), Some(1)),
+        );
+        assert_eq!(budget_done.status, TaskStatus::Failed);
+        assert!(
+            budget_done
+                .discovery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("1 MiB"))
+        );
     }
 
     #[test]
-    fn discovery_limit_constructor_clamps_to_absolute_safety_caps() {
-        let limits = DiscoveryLimits::new(0, u32::MAX, u32::MAX);
-        assert_eq!(limits.max_directories, 1);
-        assert_eq!(limits.max_files, HARD_MAX_FILES);
+    fn discovery_limit_constructor_preserves_unlimited_and_finite_values() {
+        let unlimited = DiscoveryLimits::new(None, None, None);
+        assert_eq!(unlimited.max_directories, None);
+        assert_eq!(unlimited.scan_budget_bytes, None);
+        assert_eq!(unlimited.max_files, None);
+
+        let limits = DiscoveryLimits::new(Some(u32::MAX), Some(u32::MAX), Some(u32::MAX));
+        assert_eq!(limits.max_directories, Some(u32::MAX as usize));
+        assert_eq!(limits.max_files, Some(HARD_MAX_FILES));
         assert_eq!(
             limits.scan_budget_bytes,
-            u64::from(HARD_MAX_SCAN_BUDGET_MIB) * 1024 * 1024
+            Some(u64::from(u32::MAX) * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn unlimited_file_limit_bypasses_finite_and_legacy_hard_caps() {
+        let state = tempfile::tempdir().expect("temporary task state");
+        let finite_engine = test_engine(
+            state.path().join("finite-history.json"),
+            Arc::new(PreflightHandler),
+            Arc::new(RecordingEvents::default()),
+        );
+        let entries = (0..3).map(|index| format!("synthetic-value-{index}"));
+        let finite_error = finite_engine
+            .start_with_probe(
+                request("chatgpt", entries, 1, 0),
+                None,
+                0,
+                DiscoveryLimits::new(None, Some(2), None),
+            )
+            .expect_err("three inputs must exceed a finite two-file limit");
+        assert!(finite_error.contains("2 file paths"));
+
+        let unlimited_engine = test_engine(
+            state.path().join("unlimited-history.json"),
+            Arc::new(PreflightHandler),
+            Arc::new(RecordingEvents::default()),
+        );
+        let entries = (0..3).map(|index| format!("synthetic-value-{index}"));
+        let started = unlimited_engine
+            .start_with_probe(
+                request("chatgpt", entries, 1, 0),
+                None,
+                0,
+                DiscoveryLimits::new(None, None, None),
+            )
+            .expect("unlimited file discovery must accept every bounded IPC entry");
+        let summary = wait_for_history(&unlimited_engine, &started.run_id);
+        assert_eq!(summary.status, TaskStatus::Completed);
+        assert_eq!(summary.total, 3);
+
+        // Simulate an already-streamed discovery at the previous hard cap. This avoids a
+        // 100,001-file fixture while proving `None` does not retain that hidden ceiling.
+        let (input_sender, input_receiver) = mpsc::sync_channel(1);
+        let (status_sender, status_receiver) = mpsc::sync_channel(1);
+        let cancellation = CancellationToken::new();
+        let mut producer = DiscoveryProducer {
+            module_id: "chatgpt",
+            limits: DiscoveryLimits::new(None, None, None),
+            remaining_bytes: None,
+            input_sender: &input_sender,
+            status_sender: &status_sender,
+            cancellation: &cancellation,
+            prepare_artifacts: false,
+            explicit_keys: HashSet::new(),
+            excluded_directory: None,
+            visited_directories: 0,
+            discovered_files: HARD_MAX_FILES,
+            next_ordinal: HARD_MAX_FILES,
+            ready: HARD_MAX_FILES,
+        };
+        assert!(
+            producer
+                .submit_candidate(SourceCandidate {
+                    value: Arc::from("synthetic-past-old-cap"),
+                    from_directory: true,
+                })
+                .is_ok()
+        );
+        assert_eq!(producer.discovered_files, HARD_MAX_FILES + 1);
+        assert!(matches!(
+            status_receiver.recv().expect("candidate-ready status"),
+            WorkerMessage::CandidateReady
+        ));
+        assert_eq!(
+            input_receiver.recv().expect("queued task input").ordinal(),
+            HARD_MAX_FILES + 1
+        );
+    }
+
+    #[test]
+    fn unlimited_discovery_limits_stream_the_complete_tree() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).expect("create nested directory");
+        for (index, parent) in [directory.path(), nested.as_path()].into_iter().enumerate() {
+            let path = parent.join(format!("cookies-{index}.txt"));
+            let token = format!("synthetic_unlimited_{index:04}_{}", "U".repeat(48));
+            let mut content = format!(
+                ".chatgpt.com\tTRUE\t/\tTRUE\t4102444800\t__Secure-next-auth.session-token\t{token}\n"
+            );
+            content.push_str(&"#padding\n".repeat(70_000));
+            fs::write(path, content).expect("write padded artifact");
+        }
+
+        let done = run_local_inspection(
+            request("chatgpt", [directory.path().display().to_string()], 2, 0),
+            DiscoveryLimits::new(None, None, None),
+        );
+
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert!(done.discovery_complete);
+        assert!(done.discovery_error.is_none());
+        assert_eq!(done.discovered, 2);
+        assert_eq!(done.total, 2);
+        assert_eq!(done.succeeded, 2);
+    }
+
+    #[test]
+    fn empty_and_all_invalid_directories_finish_with_a_persisted_discovery_error() {
+        let empty = tempfile::tempdir().expect("empty source directory");
+        let empty_done = run_local_inspection(
+            request("chatgpt", [empty.path().display().to_string()], 1, 0),
+            DiscoveryLimits::new(None, Some(10), None),
+        );
+        assert_eq!(empty_done.status, TaskStatus::Failed);
+        assert!(empty_done.discovery_complete);
+        assert_eq!(empty_done.total, 0);
+        assert!(empty_done.discovery_error.is_some());
+
+        let source = tempfile::tempdir().expect("invalid source directory");
+        fs::write(source.path().join("one.txt"), b"not an artifact")
+            .expect("write first invalid artifact");
+        fs::write(source.path().join("two.txt"), b"still not an artifact")
+            .expect("write second invalid artifact");
+        let state = tempfile::tempdir().expect("temporary task state");
+        let events = Arc::new(RecordingEvents::default());
+        let engine = test_engine(
+            state.path().join("task_history.json"),
+            Arc::new(ModuleInspectionHandler),
+            events.clone(),
+        );
+        let started = engine
+            .start_with_probe(
+                request("chatgpt", [source.path().display().to_string()], 1, 0),
+                None,
+                0,
+                DiscoveryLimits::new(None, Some(10), None),
+            )
+            .expect("start invalid directory scan");
+        let history = wait_for_history(&engine, &started.run_id);
+        let done = wait_for_done(&events, &started.run_id);
+        assert_eq!(done.status, TaskStatus::Failed);
+        assert!(done.discovery_complete);
+        assert_eq!(done.discovered, 2);
+        assert_eq!(done.locally_filtered, 2);
+        assert_eq!(done.total, 0);
+        assert!(done.discovery_error.is_some());
+        assert_eq!(history.discovery_error, done.discovery_error);
+    }
+
+    #[test]
+    fn directory_plus_the_same_explicit_file_is_processed_once() {
+        for explicit_first in [false, true] {
+            let source = tempfile::tempdir().expect("temporary source directory");
+            let artifact = source.path().join("cookies.txt");
+            write_ready_artifact(&artifact, explicit_first as usize);
+            let entries = if explicit_first {
+                vec![
+                    artifact.display().to_string(),
+                    source.path().display().to_string(),
+                ]
+            } else {
+                vec![
+                    source.path().display().to_string(),
+                    artifact.display().to_string(),
+                ]
+            };
+            let state = tempfile::tempdir().expect("temporary task state");
+            let probe = Arc::new(CountingProber::default());
+            let engine = test_engine(
+                state.path().join("task_history.json"),
+                Arc::new(ModuleInspectionHandler),
+                Arc::new(RecordingEvents::default()),
+            );
+            let started = engine
+                .start_with_chatgpt_probe(
+                    request("chatgpt", entries, 1, 0),
+                    probe.clone(),
+                    0,
+                    DiscoveryLimits::default(),
+                )
+                .expect("start deduplicated scan");
+            let history = wait_for_history(&engine, &started.run_id);
+            assert_eq!(history.discovered, 1);
+            assert_eq!(history.total, 1);
+            assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        }
     }
 
     #[test]
@@ -2453,30 +3031,15 @@ mod tests {
             .expect("write Finder metadata fixture");
         write_ready_artifact(&real_nested.join("nested-cookie.txt"), 99);
 
-        let prepared = prepare(request(
-            "chatgpt",
-            [directory.path().display().to_string()],
-            4,
-            0,
-        ))
-        .expect("expand directory without platform metadata");
-
-        assert_eq!(prepared.inputs.len(), 6);
-        assert_eq!(prepared.discovered, 6);
-        assert_eq!(prepared.locally_filtered, 0);
-        assert!(
-            prepared
-                .inputs
-                .iter()
-                .any(|input| input.0.ends_with("nested-cookie.txt"))
+        let done = run_local_inspection(
+            request("chatgpt", [directory.path().display().to_string()], 4, 0),
+            DiscoveryLimits::default(),
         );
-        assert!(prepared.inputs.iter().all(|input| {
-            !input.0.contains("__MACOSX")
-                && !Path::new(input.0.as_ref())
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("._") || name == ".DS_Store")
-        }));
+
+        assert_eq!(done.discovered, 6);
+        assert_eq!(done.total, 6);
+        assert_eq!(done.locally_filtered, 0);
+        assert_eq!(done.succeeded, 6);
     }
 
     #[test]
@@ -2489,17 +3052,13 @@ mod tests {
         fs::write(&malformed, b"not an authentication export").expect("write malformed fixture");
         write_expired_artifact(&expired);
 
-        let prepared = prepare(request(
-            "chatgpt",
-            [directory.path().display().to_string()],
-            4,
-            0,
-        ))
-        .expect("preflight directory");
-        assert_eq!(prepared.discovered, 3);
-        assert_eq!(prepared.locally_filtered, 2);
-        assert_eq!(prepared.inputs.len(), 1);
-        assert!(prepared.inputs[0].0.ends_with("ready.txt"));
+        let done = run_local_inspection(
+            request("chatgpt", [directory.path().display().to_string()], 4, 0),
+            DiscoveryLimits::default(),
+        );
+        assert_eq!(done.discovered, 3);
+        assert_eq!(done.locally_filtered, 2);
+        assert_eq!(done.total, 1);
 
         for entries in [
             vec![
@@ -2511,17 +3070,15 @@ mod tests {
                 directory.path().display().to_string(),
             ],
         ] {
-            let explicit = prepare(request("chatgpt", entries, 4, 0))
-                .expect("explicit file must preserve the previous behavior");
+            let explicit = run_local_inspection(
+                request("chatgpt", entries, 4, 0),
+                DiscoveryLimits::default(),
+            );
             assert_eq!(explicit.discovered, 3);
             assert_eq!(explicit.locally_filtered, 1);
-            assert_eq!(explicit.inputs.len(), 2);
-            assert!(
-                explicit
-                    .inputs
-                    .iter()
-                    .any(|input| input.0.ends_with("notes.txt"))
-            );
+            assert_eq!(explicit.total, 2);
+            assert_eq!(explicit.succeeded, 1);
+            assert_eq!(explicit.failed, 1);
         }
     }
 
@@ -2549,9 +3106,10 @@ mod tests {
             )
             .expect("start preflighted task");
 
-        assert_eq!(started.discovered, 3);
-        assert_eq!(started.locally_filtered, 2);
-        assert_eq!(started.total, 1);
+        assert_eq!(started.discovered, 0);
+        assert_eq!(started.locally_filtered, 0);
+        assert_eq!(started.total, 0);
+        assert!(!started.discovery_complete);
         let summary = wait_for_history(&engine, &started.run_id);
         assert_eq!(summary.total, 1);
         assert_eq!(summary.succeeded, 1);
@@ -2617,7 +3175,7 @@ mod tests {
                 request("chatgpt", entries, 4, 0),
                 probe.clone(),
                 0,
-                DiscoveryLimits::new(10, 10, 1),
+                DiscoveryLimits::new(Some(10), Some(10), Some(1)),
             )
             .expect("start task");
 
@@ -2639,14 +3197,14 @@ mod tests {
         )
         .expect("write oversized file");
 
-        let prepared = prepare_with_limits(
+        let done = run_local_inspection(
             request("chatgpt", [directory.path().display().to_string()], 4, 0),
-            DiscoveryLimits::new(10, 10, 1),
-        )
-        .expect("discovery should succeed despite the oversized file");
-        assert_eq!(prepared.discovered, 2);
-        assert_eq!(prepared.inputs.len(), 1);
-        assert!(prepared.inputs[0].0.ends_with("cookies.txt"));
+            DiscoveryLimits::new(Some(10), Some(10), Some(1)),
+        );
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.discovered, 2);
+        assert_eq!(done.total, 1);
+        assert_eq!(done.locally_filtered, 1);
     }
 
     #[test]
@@ -2655,24 +3213,16 @@ mod tests {
         let Some(root) = std::env::var_os("AYLA_AUTH_EXAMPLES") else {
             return;
         };
-        let prepared = prepare(request(
-            "chatgpt",
-            [PathBuf::from(root).display().to_string()],
-            4,
-            0,
-        ))
-        .expect("discover authorized examples");
-
-        assert!(!prepared.inputs.is_empty());
-        assert_eq!(
-            prepared.discovered,
-            prepared.inputs.len() + prepared.locally_filtered
+        let done = run_local_inspection(
+            request("chatgpt", [PathBuf::from(root).display().to_string()], 4, 0),
+            DiscoveryLimits::default(),
         );
+
+        assert!(done.total > 0);
+        assert_eq!(done.discovered, done.total + done.locally_filtered);
         println!(
             "authorized aggregate only: discovered={}, structurally_ready={}, locally_filtered={}",
-            prepared.discovered,
-            prepared.inputs.len(),
-            prepared.locally_filtered
+            done.discovered, done.total, done.locally_filtered
         );
     }
 
@@ -2684,7 +3234,7 @@ mod tests {
         let engine = test_engine(
             directory.path().join("task_history.json"),
             handler.clone(),
-            events,
+            events.clone(),
         );
 
         let mut entries: Vec<String> = (0..40).map(|index| format!("value-{index}")).collect();
@@ -2692,7 +3242,9 @@ mod tests {
         let started = engine
             .start(request("chatgpt", entries, 4, 0))
             .expect("start task");
-        assert_eq!(started.total, 40);
+        assert_eq!(started.total, 0);
+        assert_eq!(started.discovered, 0);
+        assert!(!started.discovery_complete);
 
         let second = engine.start(request("chatgpt", ["blocked".to_string()], 1, 0));
         assert!(second.is_err(), "only one global run may be active");
@@ -2703,6 +3255,29 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         assert!(handler.peak.load(Ordering::Acquire) > 1);
         assert!(handler.peak.load(Ordering::Acquire) <= 4);
+
+        let snapshots = lock_unpoison(&events.progress);
+        let mut completed_total = None;
+        for snapshot in snapshots
+            .iter()
+            .filter(|item| item.run_id == started.run_id)
+        {
+            assert_eq!(
+                snapshot.discovered,
+                snapshot.total + snapshot.locally_filtered
+            );
+            assert_eq!(
+                snapshot.total,
+                snapshot.queued + snapshot.running + snapshot.processed + snapshot.skipped
+            );
+            if !snapshot.discovery_complete && snapshot.status == TaskStatus::Running {
+                assert_eq!(snapshot.percent, 0.0);
+            }
+            if snapshot.discovery_complete {
+                let final_total = *completed_total.get_or_insert(snapshot.total);
+                assert_eq!(snapshot.total, final_total);
+            }
+        }
 
         let seen = lock_unpoison(&handler.seen);
         assert_eq!(seen.len(), 40);
@@ -2723,7 +3298,31 @@ mod tests {
             .start(request("chatgpt", entries, 4, 2_000))
             .expect("start task");
 
+        // Four workers plus an 8-item bounded queue can retain twelve items. Wait until the
+        // producer has published the thirteenth and is backpressured before cancelling.
+        let fill_started = Instant::now();
+        loop {
+            let accepted = engine
+                .get_active(&started.run_id)
+                .map_or(0, |snapshot| snapshot.total);
+            if accepted >= 13 {
+                break;
+            }
+            assert!(
+                fill_started.elapsed() < Duration::from_secs(1),
+                "the bounded producer did not reach backpressure"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
         thread::sleep(Duration::from_millis(25));
+        let retained = engine
+            .get_active(&started.run_id)
+            .expect("task remains active while workers are delayed")
+            .total;
+        assert!(
+            retained <= 13,
+            "the producer retained {retained} items instead of respecting the bounded queue"
+        );
         let cancel_started = Instant::now();
         let cancelling = engine
             .cancel(&started.run_id)
@@ -3005,18 +3604,20 @@ mod tests {
         )
         .expect("write wrong-scope Twitch fixture");
 
-        let prepared = prepare(request(
-            "twitch",
-            [source_directory.path().display().to_string()],
-            1,
-            0,
-        ))
-        .expect("prepare Twitch directory");
+        let done = run_local_inspection(
+            request(
+                "twitch",
+                [source_directory.path().display().to_string()],
+                1,
+                0,
+            ),
+            DiscoveryLimits::default(),
+        );
 
-        assert_eq!(prepared.discovered, 2);
-        assert_eq!(prepared.locally_filtered, 1);
-        assert_eq!(prepared.inputs.len(), 1);
-        assert!(prepared.inputs[0].0.ends_with("valid.txt"));
+        assert_eq!(done.discovered, 2);
+        assert_eq!(done.locally_filtered, 1);
+        assert_eq!(done.total, 1);
+        assert_eq!(done.succeeded, 1);
     }
 
     #[test]
@@ -3049,12 +3650,40 @@ mod tests {
             ),
             ExportRecord::Failed
         );
+        assert_eq!(
+            exporter.export(
+                3,
+                HandlerOutcome::ChatGpt(ChatGptProbeResult {
+                    status: ChatGptProbeStatus::Authenticated(ChatGptPlanLookup::Unknown),
+                    retries: 0,
+                }),
+                Some(b"unknown-plan-cookie-bytes")
+            ),
+            ExportRecord::Active
+        );
+        assert_eq!(
+            exporter.export(
+                4,
+                HandlerOutcome::ChatGpt(ChatGptProbeResult {
+                    status: ChatGptProbeStatus::Authenticated(ChatGptPlanLookup::Unavailable),
+                    retries: 0,
+                }),
+                Some(b"unavailable-plan-cookie-bytes")
+            ),
+            ExportRecord::Active
+        );
 
         let active_path = output_directory
             .path()
             .join(format!("chatgpt/active/plus__{run_tag}__000001.txt"));
         let failed_path = output_directory.path().join(format!(
             "chatgpt/failed/unknown-plan__dead__{run_tag}__000002.txt"
+        ));
+        let unknown_path = output_directory.path().join(format!(
+            "chatgpt/active/unknown-plan__plan-unknown__{run_tag}__000003.txt"
+        ));
+        let unavailable_path = output_directory.path().join(format!(
+            "chatgpt/active/unknown-plan__plan-unavailable__{run_tag}__000004.txt"
         ));
         assert_eq!(
             fs::read(&active_path).expect("read active copy"),
@@ -3063,6 +3692,14 @@ mod tests {
         assert_eq!(
             fs::read(&failed_path).expect("read failed copy"),
             b"failed-cookie-bytes"
+        );
+        assert_eq!(
+            fs::read(&unknown_path).expect("read unknown-plan copy"),
+            b"unknown-plan-cookie-bytes"
+        );
+        assert_eq!(
+            fs::read(&unavailable_path).expect("read unavailable-plan copy"),
+            b"unavailable-plan-cookie-bytes"
         );
 
         assert_eq!(
@@ -3297,10 +3934,10 @@ mod tests {
 
         let mut next = request("chatgpt", [workspace.path().display().to_string()], 2, 0);
         next.output_directory = Some(next_results.display().to_string());
-        let prepared = prepare(next).expect("prepare without rediscovering prior results");
-        assert_eq!(prepared.discovered, 1);
-        assert_eq!(prepared.inputs.len(), 1);
-        assert!(prepared.inputs[0].0.ends_with("source.txt"));
+        let done = run_local_inspection(next, DiscoveryLimits::default());
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.discovered, 1);
+        assert_eq!(done.total, 1);
     }
 
     #[test]
@@ -3312,16 +3949,13 @@ mod tests {
             .expect("write unrelated marker name");
         write_ready_artifact(&nested.join("source.txt"), 8);
 
-        let prepared = prepare(request(
-            "chatgpt",
-            [workspace.path().display().to_string()],
-            1,
-            0,
-        ))
-        .expect("scan through an invalid marker");
-        assert_eq!(prepared.discovered, 1);
-        assert_eq!(prepared.inputs.len(), 1);
-        assert!(prepared.inputs[0].0.ends_with("source.txt"));
+        let done = run_local_inspection(
+            request("chatgpt", [workspace.path().display().to_string()], 1, 0),
+            DiscoveryLimits::default(),
+        );
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.discovered, 1);
+        assert_eq!(done.total, 1);
     }
 
     #[test]

@@ -20,6 +20,8 @@ Ayla brings bounded Rust task execution, service-specific validation, optional p
 
 Source artifacts are never modified.
 
+Directory, file-count, and aggregate scan-byte limits can each be set to **Unlimited** independently. Directory traversal starts in Unlimited mode for new or missing settings. In that mode Ayla does not substitute a hidden numeric ceiling: traversal is incremental and prepared artifacts move through a fixed-capacity worker queue, so memory usage stays proportional to directory depth and concurrency instead of the total tree size.
+
 ## Module coverage
 
 | Module | Status | Validation |
@@ -32,7 +34,7 @@ Twitch and HBO Max have isolated adapters and synthetic test coverage. Verificat
 
 ## Core capabilities
 
-- Bounded recursive discovery with configurable directory, file, and scan limits.
+- Streaming recursive discovery with finite or truly unlimited directory, file-count, and aggregate scan-byte limits.
 - Cancellable background tasks with controlled concurrency, retries, delays, and aggregate-only history.
 - Proxy import, normalization, deduplication, persistence, and concurrent health checks.
 - Direct connections and user-provided HTTP, SOCKS4a, and SOCKS5h proxy routes.
@@ -41,11 +43,15 @@ Twitch and HBO Max have isolated adapters and synthetic test coverage. Verificat
 
 ## Chromium companion extension
 
-`extensions/ayla-cookie-manager` contains a Manifest V3 cookie manager for
-Chrome, Edge, Brave, and other Chromium browsers. It follows Ayla's visual
-language and supports cookie inspection, creation, editing, deletion,
-protection, JSON/Netscape backup and restore, LocalStorage cleanup, and
-partitioned cookies. See the extension's [installation and security notes](extensions/ayla-cookie-manager/README.md).
+`extensions/ayla-cookie-manager` contains **Ayla Cookies for Microsoft Edge**, a
+Manifest V3 companion extension that also works in modern Chromium browsers. It
+follows Ayla's visual language, imports complete Netscape `cookies.txt` or JSON
+backups, can remove every cookie in the current browser context after an
+explicit confirmation, and supports inspection, editing, protection,
+LocalStorage cleanup, and partitioned cookies (CHIPS). See the extension's
+[installation and security notes](extensions/ayla-cookie-manager/README.md), or
+download the ready-to-upload
+[Microsoft Edge package](extensions/Ayla-Cookies-for-Edge-v0.2.0.zip).
 
 ## Result layout
 
@@ -73,12 +79,15 @@ Exported filenames contain classification labels and an opaque run identifier. A
 ### Requirements
 
 - Windows with the MSVC toolchain; release packages are validated on Forge running Windows 11
-- Node.js and npm
-- Stable Rust with the MSVC target
+- Node.js 24.19.0 and npm 11.17.0 (`.node-version` records the Node release)
+- Rust 1.97.1 with the `x86_64-pc-windows-msvc` target (enforced by `rust-toolchain.toml`)
 - Visual Studio C++ Build Tools and WebView2
-- CMake, NASM, and libclang
+- CMake 4.4.2, NASM 2.16.03, and LLVM/libclang 22.1.8
 
-`LIBCLANG_PATH` must point to the directory containing `libclang.dll` when LLVM is not available on `PATH`.
+The native combination above is the reproducible Forge baseline and is known to
+compile `btls-sys`. NASM 3.x is not part of the supported baseline.
+`LIBCLANG_PATH` must point to the directory containing `libclang.dll` when LLVM
+is not available on `PATH`.
 
 ### Run locally
 
@@ -86,6 +95,19 @@ Exported filenames contain classification labels and an opaque run identifier. A
 npm ci
 npm run tauri dev
 ```
+
+To skip the account screen during local development, pass the dedicated
+application argument through Tauri:
+
+```powershell
+npm run tauri -- dev -- -- --skip-login
+```
+
+The argument creates an in-memory local test session and never calls the
+authentication API. Both sides are development-gated: the Vite development
+frontend requests it only under `tauri dev`, and the Rust backend returns it
+only with debug assertions. Production bundles do not contain the command or
+test-session markers, and release executables ignore `--skip-login`.
 
 ### Validate
 

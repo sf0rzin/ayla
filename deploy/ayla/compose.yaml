@@ -20,6 +20,36 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  database-init:
+    image: postgres:17-alpine
+    restart: "no"
+    user: postgres
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ayla
+      PGUSER: ayla
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in /opt/ayla/.env}
+      # Bump whenever bootstrap-database.sh changes so Compose recreates the
+      # completed one-shot container during ordinary deployments.
+      AYLA_SCHEMA_VERSION: "1"
+    volumes:
+      - ./app/deploy/ayla/bootstrap-database.sh:/usr/local/bin/bootstrap-ayla-database:ro
+    command: ["/bin/sh", "/usr/local/bin/bootstrap-ayla-database"]
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   api:
     build:
       context: ./app
@@ -35,8 +65,8 @@ services:
       PGHOST: postgres
       PGPORT: 5432
       PGDATABASE: ayla
-      PGUSER: ayla
-      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGUSER: ayla_app
+      PGPASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in /opt/ayla/.env}
       CORS_ORIGINS: http://localhost:1420,http://127.0.0.1:1420,http://tauri.localhost,https://tauri.localhost,tauri://localhost
       SESSION_TTL_DAYS: 30
     ports:
@@ -45,8 +75,8 @@ services:
       - internal
       - edge
     depends_on:
-      postgres:
-        condition: service_healthy
+      database-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/v1/health"]
       interval: 15s

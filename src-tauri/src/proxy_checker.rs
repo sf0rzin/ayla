@@ -1,10 +1,11 @@
 use crate::proxy_store::{CheckLease, CheckUpdate, ProxyItem, ProxyManager, StoredProxy};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     io::{self, Read, Write},
-    net::{IpAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -21,6 +22,8 @@ const MIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const ATTEMPTS: usize = 2;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
+const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_GEO_CACHE_ENTRIES: usize = 10_000;
 const SECURE_JUDGES: [&str; 2] = [
     "https://api.ipify.org/",
     "https://api.proxyscrape.com/ip.php",
@@ -38,7 +41,11 @@ pub struct CheckProxiesRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CheckProxiesResponse {
     pub results: Vec<ProxyItem>,
+    pub done: usize,
     pub live: usize,
+    pub http_only: usize,
+    pub failed: usize,
+    /// Retained for wire compatibility. Health checks no longer delete proxies.
     pub removed: usize,
     pub total: usize,
     pub stopped: bool,
@@ -51,6 +58,8 @@ struct ProxyProgressEvent {
     total: usize,
     percent: f64,
     live: usize,
+    http_only: usize,
+    failed: usize,
     removed: usize,
     item: Option<ProxyItem>,
     id: String,
@@ -62,6 +71,7 @@ struct ProxyProgressEvent {
 #[derive(Debug)]
 struct CheckOutcome {
     live: bool,
+    http_only: bool,
     latency_ms: u64,
     message: String,
     ip: String,
@@ -79,6 +89,7 @@ struct GeoResponse {
     city: String,
 }
 
+#[derive(Clone)]
 struct GeoLocation {
     country: String,
     country_code: String,
@@ -150,6 +161,8 @@ fn run_check_inner(
             total,
             percent: 0.0,
             live: 0,
+            http_only: 0,
+            failed: 0,
             removed: 0,
             item: None,
             id: String::new(),
@@ -183,7 +196,7 @@ fn run_check_inner(
                 let id = item.id.clone();
                 let display = item.item().display;
                 let mut outcome = check_one(item, timeout, &cancellation);
-                if outcome.live && !cancellation.load(Ordering::Acquire) {
+                if (outcome.live || outcome.http_only) && !cancellation.load(Ordering::Acquire) {
                     if item.ip == outcome.ip
                         && (!item.country.is_empty()
                             || !item.country_code.is_empty()
@@ -211,7 +224,8 @@ fn run_check_inner(
 
     let mut done = 0;
     let mut live = 0;
-    let mut removed = 0;
+    let mut http_only = 0;
+    let mut failed = 0;
     let mut run_error = None;
 
     for (id, display, outcome) in receiver {
@@ -223,6 +237,7 @@ fn run_check_inner(
             &id,
             CheckUpdate {
                 live: outcome.live,
+                http_only: outcome.http_only,
                 latency_ms: outcome.latency_ms,
                 message: outcome.message.clone(),
                 ip: outcome.ip,
@@ -235,8 +250,10 @@ fn run_check_inner(
                 done += 1;
                 if outcome.live {
                     live += 1;
+                } else if outcome.http_only {
+                    http_only += 1;
                 } else {
-                    removed += 1;
+                    failed += 1;
                 }
                 emit_progress(
                     app,
@@ -245,11 +262,20 @@ fn run_check_inner(
                         total,
                         percent: percentage(done, total),
                         live,
-                        removed,
+                        http_only,
+                        failed,
+                        removed: 0,
                         item,
                         id,
                         proxy: display,
-                        status: if outcome.live { "live" } else { "dead" }.to_string(),
+                        status: if outcome.live {
+                            "live"
+                        } else if outcome.http_only {
+                            "httpOnly"
+                        } else {
+                            "failed"
+                        }
+                        .to_string(),
                         running: true,
                     },
                 );
@@ -271,12 +297,14 @@ fn run_check_inner(
 
     let stopped = lease.cancellation.load(Ordering::Acquire);
     let results = manager.snapshot()?;
-    let final_live = results.iter().filter(|item| item.status == "live").count();
     let response = CheckProxiesResponse {
-        total: results.len(),
+        done,
+        total,
         results,
-        live: final_live,
-        removed,
+        live,
+        http_only,
+        failed,
+        removed: 0,
         stopped,
     };
 
@@ -286,8 +314,10 @@ fn run_check_inner(
             done,
             total,
             percent: percentage(done, total),
-            live: final_live,
-            removed,
+            live,
+            http_only,
+            failed,
+            removed: 0,
             item: None,
             id: String::new(),
             proxy: String::new(),
@@ -306,6 +336,7 @@ fn emit_progress(app: &AppHandle, event: ProxyProgressEvent) {
 fn cancelled_outcome() -> CheckOutcome {
     CheckOutcome {
         live: false,
+        http_only: false,
         latency_ms: 0,
         message: "cancelled".to_string(),
         ip: String::new(),
@@ -324,6 +355,7 @@ fn check_one(
     let deadline = Instant::now() + timeout;
     let mut last = CheckOutcome {
         live: false,
+        http_only: false,
         latency_ms: 0,
         message: "no response".to_string(),
         ip: String::new(),
@@ -332,6 +364,7 @@ fn check_one(
         city: String::new(),
     };
 
+    let mut https_failure = "HTTPS capability was not verified".to_string();
     if let Some(remaining) = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
@@ -347,6 +380,7 @@ fn check_one(
         if last.live {
             return last;
         }
+        https_failure = last.message.clone();
     }
 
     for attempt in 0..ATTEMPTS {
@@ -362,10 +396,14 @@ fn check_one(
                 last.message = "timed out".to_string();
                 return last;
             };
-            last = probe(proxy, judge, remaining);
-            if last.live {
-                return last;
+            let mut http_outcome = probe(proxy, judge, remaining);
+            if http_outcome.live {
+                http_outcome.live = false;
+                http_outcome.http_only = true;
+                http_outcome.message = format!("HTTP only; HTTPS unavailable ({https_failure})");
+                return http_outcome;
             }
+            last = http_outcome;
         }
     }
     last
@@ -416,6 +454,7 @@ fn probe_https(proxy: &StoredProxy, judge: &str, timeout: Duration) -> CheckOutc
     match result {
         Ok(ip) => CheckOutcome {
             live: true,
+            http_only: false,
             latency_ms: elapsed_ms(started),
             message: "ok (https)".to_string(),
             ip,
@@ -425,6 +464,7 @@ fn probe_https(proxy: &StoredProxy, judge: &str, timeout: Duration) -> CheckOutc
         },
         Err(error) => CheckOutcome {
             live: false,
+            http_only: false,
             latency_ms: elapsed_ms(started),
             message: io_error(&error),
             ip: String::new(),
@@ -472,6 +512,7 @@ fn probe(proxy: &StoredProxy, judge: Judge, timeout: Duration) -> CheckOutcome {
     match result {
         Ok(ip) => CheckOutcome {
             live: true,
+            http_only: false,
             latency_ms: elapsed_ms(started),
             message: "ok".to_string(),
             ip,
@@ -481,6 +522,7 @@ fn probe(proxy: &StoredProxy, judge: Judge, timeout: Duration) -> CheckOutcome {
         },
         Err(error) => CheckOutcome {
             live: false,
+            http_only: false,
             latency_ms: elapsed_ms(started),
             message: io_error(&error),
             ip: String::new(),
@@ -495,6 +537,35 @@ fn lookup_geo(ip: &str) -> Option<GeoLocation> {
     let IpAddr::V4(address) = ip.trim().parse::<IpAddr>().ok()? else {
         return None;
     };
+    static CACHE: OnceLock<Mutex<HashMap<Ipv4Addr, (Instant, Option<GeoLocation>)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some((cached_at, location)) = cache.get(&address)
+        && cached_at.elapsed() < GEO_CACHE_TTL
+    {
+        return location.clone();
+    }
+
+    let location = lookup_geo_uncached(address);
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= MAX_GEO_CACHE_ENTRIES {
+            cache.retain(|_, (cached_at, _)| cached_at.elapsed() < GEO_CACHE_TTL);
+            if cache.len() >= MAX_GEO_CACHE_ENTRIES
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (cached_at, _))| *cached_at)
+                    .map(|(address, _)| *address)
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(address, (Instant::now(), location.clone()));
+    }
+    location
+}
+
+fn lookup_geo_uncached(address: Ipv4Addr) -> Option<GeoLocation> {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     let agent = AGENT.get_or_init(|| {
         ureq::Agent::config_builder()

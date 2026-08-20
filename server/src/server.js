@@ -5,19 +5,22 @@ import rateLimit from "@fastify/rate-limit";
 import { pathToFileURL } from "node:url";
 import { createAuthService } from "./auth.js";
 import { loadConfig } from "./config.js";
-import { createDatabase, migrate } from "./db.js";
+import { createDatabase } from "./db.js";
+
+export const TRUSTED_PROXY_ADDRESSES = Object.freeze(["127.0.0.1", "::1"]);
 
 export async function buildServer(config = loadConfig()) {
   const app = Fastify({
     bodyLimit: 16 * 1024,
-    trustProxy: true,
+    // The API port is bound to guest loopback. Only the local Caddy process may
+    // supply the single, sanitized X-Forwarded-For hop used by request.ip.
+    trustProxy: TRUSTED_PROXY_ADDRESSES,
     logger: {
       level: config.logLevel,
       redact: ["req.headers.authorization", "headers.authorization"],
     },
   });
   const database = createDatabase(config.database);
-  await migrate(database);
   const auth = await createAuthService(database, config.sessionTtlDays);
 
   await app.register(helmet, {

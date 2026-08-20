@@ -9,12 +9,14 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:production-login": "node scripts/Check-AylaProductionLogin.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "check:extension": "node scripts/Check-AylaCookieManager.mjs",
+    "test:extension": "npm test --prefix extensions/ayla-cookie-manager",
     "test:api": "node --test server/test/*.test.js",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "check": "npm run build && npm run check:extension && npm run test:api && npm run test:rust"
+    "check": "npm run build && npm run check:production-login && npm run check:extension && npm run test:extension && npm run test:api && npm run test:rust"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -65,7 +66,7 @@ import {
   X,
 } from "lucide-react";
 import { ModuleBrandIcon } from "./ModuleBrandIcon";
-import loginArtwork from "./assets/ayla-login-art.png";
+import loginArtwork from "./assets/ayla-login-art.webp";
 import {
   AuthApiError,
   login,
@@ -77,8 +78,12 @@ import {
 import "./App.css";
 
 const MAX_PROXY_IMPORT_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_SCAN_DIRECTORIES = 1_000;
+const DEFAULT_MAX_SCAN_FILES = 10_000;
+const DEFAULT_SCAN_BUDGET_MIB = 512;
 
 type Page = "overview" | "modules" | "tasks" | "proxies" | "settings";
+type ResourcePhase = "loading" | "ready" | "error";
 
 interface AppOverview {
   version: string;
@@ -103,9 +108,9 @@ interface AppSettings {
   delayMs: number;
   timeoutMs: number;
   retries: number;
-  maxScanDirectories: number;
-  maxScanFiles: number;
-  scanBudgetMib: number;
+  maxScanDirectories: number | null;
+  maxScanFiles: number | null;
+  scanBudgetMib: number | null;
   autoCheckUpdates: boolean;
 }
 
@@ -168,7 +173,8 @@ interface ProxyItem {
   host: string;
   port: number;
   hasAuth: boolean;
-  status: "pending" | "live";
+  status: "pending" | "live" | "httpOnly" | "failed";
+  capability: "unchecked" | "httpsVerified" | "httpOnly" | "unavailable";
   latencyMs: number;
   message: string;
   ip: string;
@@ -204,14 +210,18 @@ interface ProxyProgress {
   total: number;
   percent: number;
   live: number;
+  httpOnly: number;
+  failed: number;
   removed: number;
   id: string;
   item: ProxyItem | null;
-  status: "running" | "live" | "dead" | "stopped" | "done";
+  status: "running" | "live" | "httpOnly" | "failed" | "stopped" | "done";
   running: boolean;
 }
 interface ChatGptTaskSummary {
   active: number;
+  authenticatedUnknown?: number;
+  planUnavailable?: number;
   dead: number;
   rateLimited: number;
   errors: number;
@@ -243,6 +253,8 @@ interface TaskSnapshot {
   total: number;
   discovered: number;
   locallyFiltered: number;
+  discoveryComplete?: boolean;
+  discoveryError?: string | null;
   queued: number;
   running: number;
   succeeded: number;
@@ -274,6 +286,7 @@ interface TaskHistoryEntry {
   total: number;
   discovered?: number;
   locallyFiltered?: number;
+  discoveryError?: string | null;
   succeeded: number;
   failed: number;
   skipped: number;
@@ -308,7 +321,7 @@ const pageMeta: Record<Page, { title: string; icon: LucideIcon }> = {
 };
 
 const fallbackOverview: AppOverview = {
-  version: "0.2.0",
+  version: "Preview",
   modulesTotal: 15,
   defaultThreads: 24,
   proxiesTotal: 0,
@@ -412,6 +425,36 @@ function App() {
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => (
     overviewPreviewEnabled ? overviewPreviewSession : null
   ));
+  const [authenticationReady, setAuthenticationReady] = useState(() => (
+    overviewPreviewEnabled || !import.meta.env.DEV || !hasTauriRuntime()
+  ));
+  const [developmentSessionActive, setDevelopmentSessionActive] = useState(false);
+
+  useEffect(() => {
+    if (overviewPreviewEnabled || !import.meta.env.DEV || !hasTauriRuntime()) return;
+    let active = true;
+    void invoke<AuthSession | null>("development_login_bypass_session")
+      .then((session) => {
+        if (active && import.meta.env.DEV && session) {
+          setDevelopmentSessionActive(true);
+          setAuthSession(session);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setAuthenticationReady(true);
+      });
+    return () => { active = false; };
+  }, []);
+
+  if (!authenticationReady) {
+    return (
+      <div className="login-screen login-bootstrap" role="status" aria-live="polite">
+        <LoaderCircle className="is-spinning" size={20} />
+        <span>Starting Ayla…</span>
+      </div>
+    );
+  }
 
   if (!authSession) {
     return <LoginPreview onAuthenticated={setAuthSession} />;
@@ -420,7 +463,10 @@ function App() {
   const handleLogout = () => {
     const token = authSession.token;
     setAuthSession(null);
-    if (!overviewPreviewEnabled) void logout(token).catch(() => undefined);
+    setDevelopmentSessionActive(false);
+    if (!overviewPreviewEnabled && !developmentSessionActive) {
+      void logout(token).catch(() => undefined);
+    }
   };
 
   return <WorkspaceApp user={authSession.user} onLogout={handleLogout} />;
@@ -451,6 +497,11 @@ function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSess
   const [authState, setAuthState] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [authMessage, setAuthMessage] = useState("");
   const [registrationPending, setRegistrationPending] = useState(false);
+  const [invalidFields, setInvalidFields] = useState<Set<string>>(() => new Set());
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const emailInputRef = useRef<HTMLInputElement>(null);
+  const passwordInputRef = useRef<HTMLInputElement>(null);
+  const confirmPasswordInputRef = useRef<HTMLInputElement>(null);
   const matchedPasswordChecks = [
     password.length >= 12,
     /[a-z]/.test(password) && /[A-Z]/.test(password),
@@ -465,37 +516,71 @@ function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSess
     setAuthState("idle");
     setAuthMessage("");
     setRegistrationPending(false);
+    setInvalidFields(new Set());
   };
   const handleAuthSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (authState === "loading" || authState === "success") return;
 
-    setAuthState("loading");
     setAuthMessage("");
-    const minimumAnimation = new Promise((resolve) => window.setTimeout(resolve, 650));
 
     const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
     let validationError = "";
+    let firstInvalid: "name" | "email" | "password" | "confirmPassword" | null = null;
+    const nextInvalidFields = new Set<string>();
     if (!email.trim() || !password || (mode === "register" && (!name.trim() || !confirmPassword))) {
       validationError = "Complete all required fields.";
+      if (mode === "register" && !name.trim()) {
+        firstInvalid = "name";
+        nextInvalidFields.add("name");
+      }
+      if (!email.trim()) {
+        firstInvalid ??= "email";
+        nextInvalidFields.add("email");
+      }
+      if (!password) {
+        firstInvalid ??= "password";
+        nextInvalidFields.add("password");
+      }
+      if (mode === "register" && !confirmPassword) {
+        firstInvalid ??= "confirmPassword";
+        nextInvalidFields.add("confirmPassword");
+      }
     } else if (!emailValid) {
       validationError = "Enter a valid email address.";
+      firstInvalid = "email";
+      nextInvalidFields.add("email");
     } else if (mode === "register" && password.length < 12) {
       validationError = "Use a password with at least 12 characters.";
+      firstInvalid = "password";
+      nextInvalidFields.add("password");
     } else if (mode === "register" && passwordScore < 3) {
       validationError = "Choose a stronger password.";
+      firstInvalid = "password";
+      nextInvalidFields.add("password");
     } else if (mode === "register" && password !== confirmPassword) {
       validationError = "Passwords do not match.";
+      firstInvalid = "confirmPassword";
+      nextInvalidFields.add("confirmPassword");
     }
 
     if (validationError) {
-      await minimumAnimation;
+      setInvalidFields(nextInvalidFields);
       setAuthMessage(validationError);
       setAuthState("error");
-      await new Promise((resolve) => window.setTimeout(resolve, 1_600));
-      setAuthState("idle");
+      const invalidRefs = {
+        name: nameInputRef,
+        email: emailInputRef,
+        password: passwordInputRef,
+        confirmPassword: confirmPasswordInputRef,
+      };
+      window.requestAnimationFrame(() => firstInvalid && invalidRefs[firstInvalid].current?.focus());
       return;
     }
+
+    setInvalidFields(new Set());
+    setAuthState("loading");
+    const minimumAnimation = new Promise((resolve) => window.setTimeout(resolve, 650));
 
     try {
       if (mode === "register") {
@@ -576,19 +661,19 @@ function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSess
                   {mode === "register" && (
                     <label className="login-field">
                       <span>Name</span>
-                      <input type="text" name="name" autoComplete="name" placeholder="Your name" value={name} onChange={(event) => setName(event.target.value)} disabled={authState === "loading"} />
+                      <input ref={nameInputRef} type="text" name="name" autoComplete="name" placeholder="Your name" value={name} onChange={(event) => { setName(event.target.value); setInvalidFields((current) => { const next = new Set(current); next.delete("name"); return next; }); }} disabled={authState === "loading"} aria-invalid={invalidFields.has("name")} aria-describedby={invalidFields.has("name") ? "login-auth-message" : undefined} />
                     </label>
                   )}
 
                   <label className="login-field">
                     <span>Email address</span>
-                    <input type="email" name="email" autoComplete="email" placeholder="you@example.com" value={email} onChange={(event) => setEmail(event.target.value)} disabled={authState === "loading"} />
+                    <input ref={emailInputRef} type="email" name="email" autoComplete="email" placeholder="you@example.com" value={email} onChange={(event) => { setEmail(event.target.value); setInvalidFields((current) => { const next = new Set(current); next.delete("email"); return next; }); }} disabled={authState === "loading"} aria-invalid={invalidFields.has("email")} aria-describedby={invalidFields.has("email") ? "login-auth-message" : undefined} />
                   </label>
 
                   <label className="login-field">
                     <span>Password</span>
                     <div className="login-password-input">
-                      <input type={showPassword ? "text" : "password"} name="password" autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder="Enter your password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={authState === "loading"} />
+                      <input ref={passwordInputRef} type={showPassword ? "text" : "password"} name="password" autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder="Enter your password" value={password} onChange={(event) => { setPassword(event.target.value); setInvalidFields((current) => { const next = new Set(current); next.delete("password"); return next; }); }} disabled={authState === "loading"} aria-invalid={invalidFields.has("password")} aria-describedby={invalidFields.has("password") ? "login-auth-message" : undefined} />
                       <button type="button" onClick={() => setShowPassword((current) => !current)} aria-label={showPassword ? "Hide password" : "Show password"} disabled={authState === "loading"}>
                         {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
                       </button>
@@ -607,7 +692,7 @@ function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSess
                   {mode === "register" && (
                     <label className="login-field">
                       <span>Confirm password</span>
-                      <input type="password" name="confirmPassword" autoComplete="new-password" placeholder="Repeat your password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={authState === "loading"} />
+                      <input ref={confirmPasswordInputRef} type="password" name="confirmPassword" autoComplete="new-password" placeholder="Repeat your password" value={confirmPassword} onChange={(event) => { setConfirmPassword(event.target.value); setInvalidFields((current) => { const next = new Set(current); next.delete("confirmPassword"); return next; }); }} disabled={authState === "loading"} aria-invalid={invalidFields.has("confirmPassword")} aria-describedby={invalidFields.has("confirmPassword") ? "login-auth-message" : undefined} />
                     </label>
                   )}
 
@@ -619,7 +704,7 @@ function LoginPreview({ onAuthenticated }: { onAuthenticated: (session: AuthSess
                       {authState === "idle" && <>{mode === "signIn" ? "Sign in" : "Register"} <ArrowRight size={15} /></>}
                     </span>
                   </button>
-                  {authMessage && <span className="login-auth-message" role="alert">{authMessage}</span>}
+                  {authMessage && <span className="login-auth-message" id="login-auth-message" role="alert">{authMessage}</span>}
                 </form>
               </>
             )}
@@ -636,11 +721,25 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [aboutOpen, setAboutOpen] = useState(false);
   const [overview, setOverview] = useState<AppOverview | null>(() => (
     overviewPreviewEnabled
-      ? { ...fallbackOverview, version: "0.3.0", proxiesTotal: 48, proxiesLive: 44 }
-      : fallbackOverview
+      ? { ...fallbackOverview, proxiesTotal: 48, proxiesLive: 44 }
+      : null
   ));
-  const [modules, setModules] = useState<ModuleInfo[]>(fallbackModules);
+  const [appVersion, setAppVersion] = useState<string | null>(() => (
+    overviewPreviewEnabled ? fallbackOverview.version : null
+  ));
+  const [proxyCounts, setProxyCounts] = useState(() => ({
+    total: overviewPreviewEnabled ? 48 : 0,
+    live: overviewPreviewEnabled ? 44 : 0,
+  }));
+  const [modules, setModules] = useState<ModuleInfo[]>(() => overviewPreviewEnabled ? fallbackModules : []);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [resourcePhases, setResourcePhases] = useState<Record<"overview" | "modules" | "settings", ResourcePhase>>({
+    overview: overviewPreviewEnabled ? "ready" : "loading",
+    modules: overviewPreviewEnabled ? "ready" : "loading",
+    settings: overviewPreviewEnabled ? "ready" : "loading",
+  });
+  const [resourceErrors, setResourceErrors] = useState<Partial<Record<"overview" | "modules" | "settings", string>>>({});
+  const [settingsRecoveryNotice, setSettingsRecoveryNotice] = useState("");
   const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(() => (
     overviewPreviewEnabled
       ? { cpuPercent: 23, cpuCount: 8, memoryUsedBytes: 7_730_941_132, memoryTotalBytes: 17_179_869_184 }
@@ -650,6 +749,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const [taskHistory, setTaskHistory] = useState<TaskHistoryEntry[]>(() => (
     overviewPreviewEnabled ? overviewPreviewHistory : []
   ));
+  const [taskHistoryPhase, setTaskHistoryPhase] = useState<ResourcePhase>(overviewPreviewEnabled ? "ready" : "loading");
+  const [taskHistoryError, setTaskHistoryError] = useState("");
+  const taskHistoryRequestRef = useRef(0);
   const [configuredModuleId, setConfiguredModuleId] = useState<string | null>(null);
   const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
   const pendingUpdateRef = useRef<Update | null>(null);
@@ -663,8 +765,9 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       return {};
     }
   });
-  const [error, setError] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const aboutDialogRef = useRef<HTMLElement>(null);
+  const aboutReturnFocusRef = useRef<HTMLElement | null>(null);
   const page = navigation.entries[navigation.index];
   const meta = pageMeta[page];
 
@@ -682,6 +785,18 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const focusSearch = () => {
     setSidebarOpen(true);
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
+  };
+
+  const closeAbout = useCallback(() => {
+    setAboutOpen(false);
+    const returnFocus = aboutReturnFocusRef.current;
+    aboutReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => returnFocus?.focus());
+  }, []);
+
+  const openAbout = () => {
+    aboutReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setAboutOpen(true);
   };
 
   const checkForUpdates = useCallback(async (automatic = false) => {
@@ -841,30 +956,72 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
   }, []);
 
-  const refreshTaskHistory = async () => {
+  const refreshTaskHistory = useCallback(async () => {
+    const requestId = ++taskHistoryRequestRef.current;
+    if (overviewPreviewEnabled) {
+      setTaskHistoryPhase("ready");
+      return;
+    }
+    setTaskHistoryPhase("loading");
     try {
       const nextHistory = await invoke<TaskHistoryEntry[]>("task_history", { limit: 100 });
+      if (requestId !== taskHistoryRequestRef.current) return;
       setTaskHistory(nextHistory);
-    } catch {
-      // Browser previews do not expose the Tauri command bridge.
+      setTaskHistoryError("");
+      setTaskHistoryPhase("ready");
+    } catch (reason: unknown) {
+      if (!overviewPreviewEnabled && requestId === taskHistoryRequestRef.current) {
+        setTaskHistoryError(String(reason));
+        setTaskHistoryPhase("error");
+      }
     }
-  };
+  }, []);
 
-  useEffect(() => {
-    Promise.all([
+  const acceptTaskSnapshot = useCallback((snapshot: TaskSnapshot) => {
+    setTaskSnapshot((current) => {
+      if (current?.runId === snapshot.runId && current.sequence > snapshot.sequence) return current;
+      if (current && current.runId !== snapshot.runId && taskIsRunning(current)) return current;
+      return snapshot;
+    });
+  }, []);
+
+  const loadBootstrap = useCallback(async () => {
+    if (overviewPreviewEnabled) return;
+    setResourcePhases({ overview: "loading", modules: "loading", settings: "loading" });
+    setResourceErrors({});
+    const [overviewResult, modulesResult, settingsResult, versionResult] = await Promise.allSettled([
       invoke<AppOverview>("get_app_overview"),
       invoke<ModuleInfo[]>("list_modules"),
       invoke<AppSettings>("get_settings"),
-    ])
-      .then(([nextOverview, nextModules, nextSettings]) => {
-        setOverview(nextOverview);
-        setModules(nextModules);
-        setSettings(nextSettings);
-      })
-      .catch((reason: unknown) => {
-        if (!overviewPreviewEnabled) setError(String(reason));
-      });
+      getVersion(),
+    ]);
+
+    if (overviewResult.status === "fulfilled") {
+      setOverview(overviewResult.value);
+      setProxyCounts({ total: overviewResult.value.proxiesTotal, live: overviewResult.value.proxiesLive });
+    }
+    if (modulesResult.status === "fulfilled") setModules(modulesResult.value);
+    if (settingsResult.status === "fulfilled") setSettings(settingsResult.value);
+    if (versionResult.status === "fulfilled") setAppVersion(versionResult.value);
+    setResourcePhases({
+      overview: overviewResult.status === "fulfilled" ? "ready" : "error",
+      modules: modulesResult.status === "fulfilled" ? "ready" : "error",
+      settings: settingsResult.status === "fulfilled" ? "ready" : "error",
+    });
+    setResourceErrors({
+      ...(overviewResult.status === "rejected" ? { overview: String(overviewResult.reason) } : {}),
+      ...(modulesResult.status === "rejected" ? { modules: String(modulesResult.reason) } : {}),
+      ...(settingsResult.status === "rejected" ? { settings: String(settingsResult.reason) } : {}),
+    });
+    if (settingsResult.status === "fulfilled") {
+      const notice = await invoke<string | null>("get_settings_recovery_notice").catch(() => null);
+      setSettingsRecoveryNotice(notice ?? "");
+    }
   }, []);
+
+  useEffect(() => {
+    void loadBootstrap();
+  }, [loadBootstrap]);
 
   useEffect(() => {
     if (!settings?.autoCheckUpdates || autoCheckAttemptedRef.current) return;
@@ -888,13 +1045,47 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         event.preventDefault();
         focusSearch();
       }
-      if (event.key === "Escape") setAboutOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   useEffect(() => {
+    if (!aboutOpen) return;
+    const dialog = aboutDialogRef.current;
+    if (!dialog) return;
+    const focusable = () => [...dialog.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+      .filter((element) => !element.hasAttribute("disabled"));
+    window.requestAnimationFrame(() => (focusable()[0] ?? dialog).focus());
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeAbout();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const elements = focusable();
+      if (elements.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", trapFocus);
+    return () => window.removeEventListener("keydown", trapFocus);
+  }, [aboutOpen, closeAbout]);
+
+  useEffect(() => {
+    if (page !== "overview") return;
     let active = true;
     let timer = 0;
     const refresh = async () => {
@@ -911,18 +1102,13 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     let active = true;
     const cleanups: Array<() => void> = [];
     const receive = (snapshot: TaskSnapshot) => {
-      if (!active) return;
-      setTaskSnapshot((current) => {
-        if (current?.runId === snapshot.runId && current.sequence > snapshot.sequence) return current;
-        if (current && current.runId !== snapshot.runId && taskIsRunning(current)) return current;
-        return snapshot;
-      });
+      if (active) acceptTaskSnapshot(snapshot);
     };
 
     const initialize = async () => {
@@ -951,7 +1137,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
       active = false;
       cleanups.splice(0).forEach((cleanup) => cleanup());
     };
-  }, []);
+  }, [acceptTaskSnapshot, refreshTaskHistory]);
 
   const runnableModules = useMemo(
     () => modules.map((item) => ({ ...item, enabled: item.enabled && (modulePreferences[item.id] ?? true) })),
@@ -971,7 +1157,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         onForward={goForward}
         onNavigate={navigate}
         onSearch={focusSearch}
-        onAbout={() => setAboutOpen(true)}
+        onAbout={openAbout}
       />
       <div className={workbenchClass}>
         {sidebarOpen && (
@@ -989,65 +1175,82 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
 
         <div className="main-column">
           <main className={`content page-${page}`}>
-            {error && (
-              <div className="notice danger-notice" title={error}>
-                <CircleDot size={15} />
-                <div><strong>Desktop services are unavailable in this preview</strong><span>Open Ayla through Tauri to use local data.</span></div>
+            {(["overview", "modules", "settings"] as const).some((resource) => resource === page && resourcePhases[resource] === "loading") && (
+              <div className="notice" role="status">
+                <LoaderCircle className="is-spinning" size={15} />
+                <div><strong>Loading local data</strong><span>Ayla is reading the saved {page} state.</span></div>
               </div>
             )}
-            {page === "overview" && <Overview overview={overview} metrics={systemMetrics} history={taskHistory} modules={modules} user={user} />}
-            {page === "modules" && (
-              <Modules
+            {(["overview", "modules", "settings"] as const).some((resource) => resource === page && resourcePhases[resource] === "error") && (
+              <div className="notice danger-notice" title={resourceErrors[page as "overview" | "modules" | "settings"]}>
+                <CircleDot size={15} />
+                <div><strong>{pageMeta[page].title} could not be loaded</strong><span>The saved data was not replaced with an empty state.</span></div>
+                <button className="button outline small" type="button" onClick={() => void loadBootstrap()}>Retry</button>
+              </div>
+            )}
+            {page === "overview" && taskHistoryPhase === "error" && (
+              <div className="notice danger-notice" title={taskHistoryError}>
+                <CircleDot size={15} />
+                <div><strong>Recent activity could not be loaded</strong><span>Existing history remains on disk. Retry the read.</span></div>
+                <button className="button outline small" type="button" onClick={() => void refreshTaskHistory()}>Retry</button>
+              </div>
+            )}
+            {page === "settings" && settingsRecoveryNotice && (
+              <div className="notice" role="status">
+                <Info size={15} />
+                <div><strong>Settings recovery needs review</strong><span>{settingsRecoveryNotice}</span></div>
+              </div>
+            )}
+            <Overview active={page === "overview" && resourcePhases.overview === "ready"} overview={overview} metrics={systemMetrics} history={taskHistory} modules={modules} user={user} />
+            <Modules
+                active={page === "modules" && resourcePhases.modules === "ready"}
                 modules={modules}
                 preferences={modulePreferences}
                 onToggle={(id) => setModulePreferences((current) => ({ ...current, [id]: !(current[id] ?? true) }))}
                 onConfigure={(id) => { setConfiguredModuleId(id); navigate("settings"); }}
               />
-            )}
-            {page === "tasks" && (
-              <Tasks
+            <Tasks
+                active={page === "tasks" && resourcePhases.modules === "ready"}
                 modules={runnableModules}
                 defaultConcurrency={settings?.threads ?? 24}
                 moduleConcurrency={settings?.moduleThreads}
                 defaultDelayMs={settings?.delayMs ?? 120}
-                proxiesLive={overview?.proxiesLive ?? 0}
+                proxiesLive={proxyCounts.live}
                 onOpenProxies={() => navigate("proxies")}
-                onTaskSnapshot={setTaskSnapshot}
+                onTaskSnapshot={acceptTaskSnapshot}
                 onHistoryChanged={refreshTaskHistory}
               />
-            )}
-            {page === "proxies" && (
-              <Proxies
+            <Proxies
+                active={page === "proxies"}
                 defaultThreads={settings?.threads ?? 24}
                 defaultTimeoutMs={settings?.timeoutMs ?? 15_000}
                 onCountsChanged={(proxiesTotal, proxiesLive) => {
+                  setProxyCounts({ total: proxiesTotal, live: proxiesLive });
                   setOverview((current) => current ? { ...current, proxiesTotal, proxiesLive } : current);
                 }}
               />
-            )}
-            {page === "settings" && (
-              <Settings
+            <Settings
+                active={page === "settings" && resourcePhases.settings === "ready"}
                 settings={settings}
                 configuredModule={modules.find((item) => item.id === configuredModuleId) ?? null}
-                installedVersion={overview?.version ?? "0.2.0"}
+                installedVersion={appVersion ?? overview?.version ?? "Unavailable"}
                 updateState={updateState}
                 onCheckForUpdates={() => void checkForUpdates(false)}
                 onInstallUpdate={() => void installUpdate()}
-                onSaved={setSettings}
+                onSaved={(nextSettings) => { setSettings(nextSettings); setSettingsRecoveryNotice(""); }}
               />
-            )}
           </main>
         </div>
 
       </div>
 
       {aboutOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setAboutOpen(false)}>
-          <article className="about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={closeAbout}>
+          <article ref={aboutDialogRef} className="about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
             <div className="about-mark"><Flower2 size={22} /></div>
             <h2 id="about-title">Ayla</h2>
-            <p>Version {overview?.version ?? "0.2.0"}</p>
-            <button className="button secondary" type="button" onClick={() => setAboutOpen(false)}>Close</button>
+            <p>Version {appVersion ?? overview?.version ?? "Unavailable"}</p>
+            <button className="button secondary" type="button" onClick={closeAbout}>Close</button>
           </article>
         </div>
       )}
@@ -1119,20 +1322,20 @@ function Titlebar({
       </div>
       <div className="titlebar-menu" aria-label="Application menu" ref={menuRoot}>
         <div className="titlebar-menu-group">
-          <button className={openMenu === "file" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-haspopup="menu" aria-expanded={openMenu === "file"} onClick={() => setOpenMenu((current) => current === "file" ? null : "file")}>File</button>
-          {openMenu === "file" && <div className="titlebar-dropdown" role="menu"><button role="menuitem" type="button" onClick={() => choose(() => onNavigate("overview"))}>Open Overview</button><button role="menuitem" type="button" onClick={() => choose(() => onNavigate("tasks"))}>New Task</button><span className="menu-separator" /><button role="menuitem" type="button" onClick={() => choose(() => runWindowAction((window) => window.close()))}>Exit Ayla</button></div>}
+          <button className={openMenu === "file" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-expanded={openMenu === "file"} onClick={() => setOpenMenu((current) => current === "file" ? null : "file")}>File</button>
+          {openMenu === "file" && <div className="titlebar-dropdown" aria-label="File actions"><button type="button" onClick={() => choose(() => onNavigate("overview"))}>Open Overview</button><button type="button" onClick={() => choose(() => onNavigate("tasks"))}>New Task</button><span className="menu-separator" /><button type="button" onClick={() => choose(() => runWindowAction((window) => window.close()))}>Exit Ayla</button></div>}
         </div>
         <div className="titlebar-menu-group">
-          <button className={openMenu === "edit" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-haspopup="menu" aria-expanded={openMenu === "edit"} onClick={() => setOpenMenu((current) => current === "edit" ? null : "edit")}>Edit</button>
-          {openMenu === "edit" && <div className="titlebar-dropdown" role="menu"><button role="menuitem" type="button" onClick={() => choose(onSearch)}>Search <kbd>Ctrl K</kbd></button><button role="menuitem" type="button" onClick={() => choose(() => onNavigate("settings"))}>Settings</button></div>}
+          <button className={openMenu === "edit" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-expanded={openMenu === "edit"} onClick={() => setOpenMenu((current) => current === "edit" ? null : "edit")}>Edit</button>
+          {openMenu === "edit" && <div className="titlebar-dropdown" aria-label="Edit actions"><button type="button" onClick={() => choose(onSearch)}>Search <kbd>Ctrl K</kbd></button><button type="button" onClick={() => choose(() => onNavigate("settings"))}>Settings</button></div>}
         </div>
         <div className="titlebar-menu-group">
-          <button className={openMenu === "view" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-haspopup="menu" aria-expanded={openMenu === "view"} onClick={() => setOpenMenu((current) => current === "view" ? null : "view")}>View</button>
-          {openMenu === "view" && <div className="titlebar-dropdown" role="menu"><button role="menuitem" type="button" onClick={() => choose(onToggleSidebar)}>{sidebarOpen ? "Hide" : "Show"} Sidebar</button></div>}
+          <button className={openMenu === "view" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-expanded={openMenu === "view"} onClick={() => setOpenMenu((current) => current === "view" ? null : "view")}>View</button>
+          {openMenu === "view" && <div className="titlebar-dropdown" aria-label="View actions"><button type="button" onClick={() => choose(onToggleSidebar)}>{sidebarOpen ? "Hide" : "Show"} Sidebar</button></div>}
         </div>
         <div className="titlebar-menu-group">
-          <button className={openMenu === "help" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-haspopup="menu" aria-expanded={openMenu === "help"} onClick={() => setOpenMenu((current) => current === "help" ? null : "help")}>Help</button>
-          {openMenu === "help" && <div className="titlebar-dropdown" role="menu"><button role="menuitem" type="button" onClick={() => choose(onAbout)}><Info size={14} /> About Ayla</button></div>}
+          <button className={openMenu === "help" ? "titlebar-menu-button active" : "titlebar-menu-button"} type="button" aria-expanded={openMenu === "help"} onClick={() => setOpenMenu((current) => current === "help" ? null : "help")}>Help</button>
+          {openMenu === "help" && <div className="titlebar-dropdown" aria-label="Help actions"><button type="button" onClick={() => choose(onAbout)}><Info size={14} /> About Ayla</button></div>}
         </div>
       </div>
       <div className="titlebar-drag" data-tauri-drag-region onDoubleClick={() => runWindowAction((window) => window.toggleMaximize())}>
@@ -1181,6 +1384,7 @@ function Sidebar({
   const moduleResults = normalizedQuery ? modules.filter((item) => `${item.name} ${item.category}`.toLowerCase().includes(normalizedQuery)).slice(0, 5) : [];
   const progress = Math.max(0, Math.min(100, taskSnapshot?.percent ?? 0));
   const taskDone = taskSnapshot ? Math.max(0, taskSnapshot.total - taskSnapshot.queued - taskSnapshot.running) : 0;
+  const taskDiscovering = taskIsDiscovering(taskSnapshot);
   const initials = userInitials(user.name);
   const roleLabel = userRoleLabel(user);
 
@@ -1234,14 +1438,15 @@ function Sidebar({
       <div className="sidebar-wordmark">
         <strong>Ayla</strong>
       </div>
-      <div className="sidebar-search">
+      <div className="sidebar-search" onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSearchOpen(false);
+      }}>
         <Search size={14} />
         <input
           ref={searchInputRef}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           onFocus={() => setSearchOpen(true)}
-          onBlur={() => window.setTimeout(() => setSearchOpen(false), 120)}
           onKeyDown={(event) => {
             if (event.key === "Enter") openFirstResult();
             if (event.key === "Escape") {
@@ -1285,13 +1490,17 @@ function Sidebar({
 
       <div className="sidebar-spacer" />
       <div className="sidebar-runtime">
-        <div><Activity size={14} /><span>Task progress</span><strong>{Math.round(progress)}%</strong></div>
-        <div className="runtime-track" role="progressbar" aria-label="Task progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}><span style={{ width: `${progress}%` }} /></div>
-        <small>{taskSnapshot ? `${taskDone} of ${taskSnapshot.total} · ${taskStatusLabel(taskSnapshot.status)}` : "No active task"}</small>
+        <div><Activity size={14} /><span>Task progress</span><strong>{taskDiscovering ? "Scanning" : `${Math.round(progress)}%`}</strong></div>
+        {taskDiscovering ? (
+          <div className="runtime-track indeterminate" role="progressbar" aria-label="Discovering task files"><span /></div>
+        ) : (
+          <div className="runtime-track" role="progressbar" aria-label="Task progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}><span style={{ width: `${progress}%` }} /></div>
+        )}
+        <small>{taskSnapshot ? taskDiscovering ? `${taskSnapshot.discovered.toLocaleString("en-US")} scanned · Discovering` : `${taskDone} of ${taskSnapshot.total} · ${taskStatusLabel(taskSnapshot.status)}` : "No active task"}</small>
       </div>
       <div className="sidebar-profile-wrap" ref={profileRoot}>
         {profilePopover === "profile" && (
-          <div className="profile-popover" ref={profilePopoverRef} role="dialog" aria-label="Profile menu">
+          <div className="profile-popover" ref={profilePopoverRef} aria-label="Profile actions">
             <div className="profile-popover-header"><span className="avatar">{initials}</span><div><strong>{user.name}</strong><small>{user.email}</small></div><span className="profile-plan-badge">{roleLabel}</span></div>
             <button className="profile-menu-item" type="button" aria-expanded={planExpanded} onClick={() => setPlanExpanded((current) => !current)}><CircleGauge size={16} /><span>Plan information</span><ChevronDown className={planExpanded ? "expanded" : ""} size={15} /></button>
             {planExpanded && (
@@ -1313,7 +1522,7 @@ function Sidebar({
         )}
 
         {profilePopover === "help" && (
-          <div className="profile-popover profile-help-popover" ref={profilePopoverRef} role="dialog" aria-label="Help menu">
+          <div className="profile-popover profile-help-popover" ref={profilePopoverRef} aria-label="Help actions">
             <div className="profile-help-heading"><strong>Help & extras</strong><small>Ayla</small></div>
             <button className="profile-menu-item" type="button" onClick={() => setHelpDetail("gift")}><Gift size={16} /><span>Send gift</span></button>
             <button className="profile-menu-item" type="button" onClick={() => setHelpDetail("shortcuts")}><ListChecks size={16} /><span>Keyboard shortcuts</span></button>
@@ -1336,7 +1545,7 @@ function Sidebar({
   );
 }
 
-function Overview({ overview, metrics, history, modules, user }: { overview: AppOverview | null; metrics: SystemMetrics | null; history: TaskHistoryEntry[]; modules: ModuleInfo[]; user: AuthUser }) {
+function Overview({ active, overview, metrics, history, modules, user }: { active: boolean; overview: AppOverview | null; metrics: SystemMetrics | null; history: TaskHistoryEntry[]; modules: ModuleInfo[]; user: AuthUser }) {
   const memoryPercent = metrics?.memoryTotalBytes ? (metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100 : 0;
   const sessionsChecked = history.reduce((sum, item) => sum + item.total, 0);
   const sessionsSucceeded = history.reduce((sum, item) => sum + item.succeeded, 0);
@@ -1358,7 +1567,7 @@ function Overview({ overview, metrics, history, modules, user }: { overview: App
   }, [history, modules]);
 
   return (
-    <section className="overview-page">
+    <section className="overview-page" hidden={!active}>
       <header className="profile-hero">
         <div className="profile-avatar" aria-hidden="true">{initials}</div>
         <div className="profile-identity">
@@ -1465,7 +1674,7 @@ function ContributionActivity({ history }: { history: TaskHistoryEntry[] }) {
       <div className="section-heading">
         <div>
           <h2>Task activity</h2>
-          <span>Last 12 months</span>
+          <span>Latest 100 recorded tasks · 12-month window</span>
         </div>
         <span className="contribution-summary"><strong>{total}</strong> {total === 1 ? "task" : "tasks"}</span>
       </div>
@@ -1483,7 +1692,7 @@ function ContributionActivity({ history }: { history: TaskHistoryEntry[] }) {
             <span>Fri</span>
             <span />
           </div>
-          <div className="heatmap-grid" role="img" aria-label={`${total} ${total === 1 ? "task" : "tasks"} in the last 12 months`}>
+          <div className="heatmap-grid" role="img" aria-label={`${total} of the latest 100 recorded ${total === 1 ? "task" : "tasks"}, placed in a 12-month window`}>
             {weeks.flatMap((week) => week.map((date) => {
               const count = activity.get(localDayKey(date)) ?? 0;
               const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maximum) * 4));
@@ -1534,7 +1743,7 @@ const moduleTopics: Array<{ id: string; title: string; modules: string[] }> = [
   { id: "media", title: "Media & communities", modules: ["spotify", "twitch", "max", "kick", "instagram", "reddit"] },
 ];
 
-function Modules({ modules, preferences, onToggle, onConfigure }: { modules: ModuleInfo[]; preferences: Record<string, boolean>; onToggle: (id: string) => void; onConfigure: (id: string) => void }) {
+function Modules({ active, modules, preferences, onToggle, onConfigure }: { active: boolean; modules: ModuleInfo[]; preferences: Record<string, boolean>; onToggle: (id: string) => void; onConfigure: (id: string) => void }) {
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -1561,7 +1770,7 @@ function Modules({ modules, preferences, onToggle, onConfigure }: { modules: Mod
   }, [visibleModules]);
 
   return (
-    <section className="modules-page">
+    <section className="modules-page" hidden={!active}>
       <header className="module-page-header">
         <h1>Modules</h1>
       </header>
@@ -1630,6 +1839,10 @@ function taskIsRunning(snapshot: TaskSnapshot | null) {
   return Boolean(snapshot && runningTaskStatuses.has(snapshot.status.toLowerCase()));
 }
 
+function taskIsDiscovering(snapshot: TaskSnapshot | null) {
+  return Boolean(snapshot && snapshot.discoveryComplete === false && taskIsRunning(snapshot));
+}
+
 function taskTone(status: string) {
   const normalized = status.toLowerCase();
   if (["completed", "complete", "succeeded", "success"].includes(normalized)) return "success";
@@ -1661,7 +1874,7 @@ function formatTaskDate(value: string | number | null) {
   return Number.isNaN(date.getTime()) ? value : taskDateFormatter.format(date);
 }
 
-function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs, proxiesLive, onOpenProxies, onTaskSnapshot, onHistoryChanged }: { modules: ModuleInfo[]; defaultConcurrency: number; moduleConcurrency?: Record<string, number>; defaultDelayMs: number; proxiesLive: number; onOpenProxies: () => void; onTaskSnapshot: (snapshot: TaskSnapshot) => void; onHistoryChanged: () => void }) {
+function Tasks({ active, modules, defaultConcurrency, moduleConcurrency, defaultDelayMs, proxiesLive, onOpenProxies, onTaskSnapshot, onHistoryChanged }: { active: boolean; modules: ModuleInfo[]; defaultConcurrency: number; moduleConcurrency?: Record<string, number>; defaultDelayMs: number; proxiesLive: number; onOpenProxies: () => void; onTaskSnapshot: (snapshot: TaskSnapshot) => void; onHistoryChanged: () => void }) {
   const enabledModules = useMemo(() => modules.filter((module) => module.enabled), [modules]);
   const preferredModuleId = enabledModules.find((module) => module.id === "chatgpt")?.id ?? enabledModules[0]?.id ?? "";
   const [moduleId, setModuleId] = useState(preferredModuleId);
@@ -1671,13 +1884,18 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
   const [useProxy, setUseProxy] = useState(false);
   const [outputDirectory, setOutputDirectory] = useState("");
   const [selectingOutputDirectory, setSelectingOutputDirectory] = useState(false);
+  const [selectingSources, setSelectingSources] = useState(false);
+  const [draggingSources, setDraggingSources] = useState(false);
   const [activeTask, setActiveTask] = useState<TaskSnapshot | null>(null);
   const [history, setHistory] = useState<TaskHistoryEntry[]>([]);
+  const [historyPhase, setHistoryPhase] = useState<ResourcePhase>("loading");
+  const [historyError, setHistoryError] = useState("");
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [message, setMessage] = useState("");
   const [taskView, setTaskView] = useState<"history" | "create">("history");
   const [historyPage, setHistoryPage] = useState(0);
+  const historyRequestRef = useRef(0);
 
   const moduleById = useMemo(() => new Map(modules.map((module) => [module.id, module])), [modules]);
   const entryCount = useMemo(() => rawEntries.split(/\r?\n/).filter((entry) => entry.trim()).length, [rawEntries]);
@@ -1692,6 +1910,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
   const requestedConcurrency = Math.max(1, Math.min(32, Math.trunc(concurrency || 1)));
   const effectiveConcurrency = useProxy ? Math.min(requestedConcurrency, Math.max(1, proxiesLive)) : requestedConcurrency;
   const activeRunning = taskIsRunning(activeTask);
+  const activeDiscovering = taskIsDiscovering(activeTask);
   const progress = Math.max(0, Math.min(100, activeTask?.percent ?? 0));
   const moduleSummary = activeTask?.moduleSummary;
   const chatgptSummary = activeTask?.chatgpt;
@@ -1744,13 +1963,45 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
     }
   }
 
-  async function reloadHistory() {
+  async function chooseSources(kind: "files" | "folder") {
+    setSelectingSources(true);
+    setMessage("");
     try {
-      setHistory(await invoke<TaskHistoryEntry[]>("task_history", { limit: 30 }));
-      setHistoryPage(0);
-      onHistoryChanged();
+      const selected = await open({
+        directory: kind === "folder",
+        multiple: kind === "files",
+        title: kind === "files" ? "Choose authorized session files" : "Choose an authorized folder",
+      });
+      const paths = (Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [])
+        .map((path) => path.trim())
+        .filter(Boolean);
+      if (paths.length > 0) {
+        setRawEntries((current) => [...new Set([
+          ...current.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean),
+          ...paths,
+        ])].join("\n"));
+      }
     } catch {
-      // The global notice already covers browser previews without Tauri.
+      setMessage("Ayla could not open the source picker. You can still paste paths below.");
+    } finally {
+      setSelectingSources(false);
+    }
+  }
+
+  async function reloadHistory() {
+    const requestId = ++historyRequestRef.current;
+    setHistoryPhase("loading");
+    try {
+      const nextHistory = await invoke<TaskHistoryEntry[]>("task_history", { limit: 30 });
+      if (requestId !== historyRequestRef.current) return;
+      setHistory(nextHistory);
+      setHistoryPage(0);
+      setHistoryError("");
+      setHistoryPhase("ready");
+    } catch (reason: unknown) {
+      if (requestId !== historyRequestRef.current) return;
+      setHistoryError(String(reason));
+      setHistoryPhase("error");
     }
   }
 
@@ -1772,6 +2023,41 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
   }, [proxiesLive]);
 
   useEffect(() => {
+    if (!active || taskView !== "create" || !hasTauriRuntime()) {
+      setDraggingSources(false);
+      return;
+    }
+
+    let mounted = true;
+    let cleanup: (() => void) | null = null;
+    void getCurrentWindow().onDragDropEvent(({ payload }) => {
+      if (!mounted) return;
+      if (payload.type === "enter" || payload.type === "over") {
+        setDraggingSources(true);
+        return;
+      }
+      setDraggingSources(false);
+      if (payload.type !== "drop") return;
+      const paths = payload.paths.map((path) => path.trim()).filter(Boolean);
+      if (paths.length === 0) return;
+      setRawEntries((current) => [...new Set([
+        ...current.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean),
+        ...paths,
+      ])].join("\n"));
+      setMessage(`${paths.length.toLocaleString("en-US")} dropped ${paths.length === 1 ? "path" : "paths"} added.`);
+    }).then((unlisten) => {
+      if (mounted) cleanup = unlisten;
+      else unlisten();
+    }).catch(() => undefined);
+
+    return () => {
+      mounted = false;
+      setDraggingSources(false);
+      cleanup?.();
+    };
+  }, [active, taskView]);
+
+  useEffect(() => {
     let mounted = true;
     const cleanups: Array<() => void> = [];
     const receive = (snapshot: TaskSnapshot) => {
@@ -1786,7 +2072,9 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
           if (!mounted) return;
           receive(payload);
           setCancelling(false);
-          if (payload.historyPersisted === false) {
+          if (payload.discoveryError) {
+            setMessage(payload.discoveryError);
+          } else if (payload.historyPersisted === false) {
             setMessage("The task finished, but its summary could not be saved.");
           } else if (payload.resultsExportEnabled) {
             const exported = (payload.exportedActive ?? 0) + (payload.exportedFailed ?? 0);
@@ -1853,12 +2141,14 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
       setDelayMs(safeDelayMs);
       const duplicates = entryCount - entries.length;
       const preparationNotes = [
-        `${snapshot.total.toLocaleString("en-US")} structurally usable authentication ${snapshot.total === 1 ? "file" : "files"} found`,
-        snapshot.locallyFiltered > 0 ? `${snapshot.locallyFiltered.toLocaleString("en-US")} unrelated or unusable ${snapshot.locallyFiltered === 1 ? "file" : "files"} ignored locally` : "",
+        snapshot.discoveryComplete === false
+          ? "Streaming discovery started"
+          : `${snapshot.total.toLocaleString("en-US")} structurally usable authentication ${snapshot.total === 1 ? "file" : "files"} found`,
+        snapshot.discoveryComplete !== false && snapshot.locallyFiltered > 0 ? `${snapshot.locallyFiltered.toLocaleString("en-US")} unrelated or unusable ${snapshot.locallyFiltered === 1 ? "file" : "files"} ignored locally` : "",
         duplicates > 0 ? `${duplicates} duplicate source ${duplicates === 1 ? "path" : "paths"} removed` : "",
         outputDirectory ? `Results will be copied to ${outputFolderName}` : "",
       ].filter(Boolean);
-      setMessage(`${preparationNotes.join(" · ")}. Authenticated validation started.`);
+      setMessage(`${preparationNotes.join(" · ")}. ${snapshot.discoveryComplete === false ? "Files will be validated as they are found." : "Authenticated validation started."}`);
       setTaskView("history");
       setHistoryPage(0);
     } catch (error) {
@@ -1883,10 +2173,14 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
   }
 
   async function clearHistory() {
+    if (!window.confirm(`Clear all ${history.length} recorded ${history.length === 1 ? "task" : "tasks"}? This removes only summaries, not source or exported files.`)) return;
     try {
       await invoke("clear_task_history");
+      historyRequestRef.current += 1;
       setHistory([]);
       setHistoryPage(0);
+      setHistoryError("");
+      setHistoryPhase("ready");
       onHistoryChanged();
     } catch {
       setMessage("The task history could not be cleared.");
@@ -1894,7 +2188,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
   }
 
   return (
-    <section className="tasks-page">
+    <section className="tasks-page" hidden={!active}>
       {taskView === "history" ? (
         <div className="task-history-view">
           <header className="task-page-header">
@@ -1912,9 +2206,12 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
                 <div><strong>{moduleById.get(activeTask.moduleId)?.name ?? activeTask.moduleId}</strong><small>{planSummary || `Run ${activeTask.runId.slice(0, 8)}`}</small></div>
                 <span className={`task-status ${taskTone(activeTask.status)}`}>{taskStatusLabel(activeTask.status)}</span>
               </div>
-              <div className="task-active-progress"><div><span>{Math.max(0, activeTask.total - activeTask.queued - activeTask.running)} of {activeTask.total}</span><strong>{Math.round(progress)}%</strong></div><progress className="task-progress" value={progress} max="100" /></div>
+              <div className="task-active-progress">
+                <div><span>{activeDiscovering ? `${activeTask.discovered.toLocaleString("en-US")} files scanned` : `${Math.max(0, activeTask.total - activeTask.queued - activeTask.running)} of ${activeTask.total}`}</span><strong>{activeDiscovering ? "Discovering…" : `${Math.round(progress)}%`}</strong></div>
+                {activeDiscovering ? <progress className="task-progress discovering" aria-label="Discovering task files" /> : <progress className="task-progress" value={progress} max="100" />}
+              </div>
               <div className="task-active-stats">
-                <span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{outcomeSummary?.active ?? activeTask.succeeded} active</span>{moduleSummary && (moduleSummary.authenticatedUnknown ?? 0) > 0 && <span>{moduleSummary.authenticatedUnknown ?? 0} authenticated · plan unavailable</span>}{moduleSummary && (moduleSummary.noEntitlement ?? 0) > 0 && <span>{moduleSummary.noEntitlement ?? 0} no entitlement</span>}<span>{outcomeSummary?.dead ?? activeTask.failed} {hasDetailedOutcome ? "dead" : "failed"}</span>{moduleSummary && moduleSummary.rateLimited > 0 && <span>{moduleSummary.rateLimited} rate limited</span>}{moduleSummary && moduleSummary.errors > 0 && <span>{moduleSummary.errors} errors</span>}{moduleSummary && moduleSummary.invalid > 0 && <span>{moduleSummary.invalid} invalid</span>}{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
+                {activeDiscovering && <span>{activeTask.discovered} discovered</span>}<span>{activeTask.queued} queued</span><span>{activeTask.running} running</span><span>{outcomeSummary?.active ?? activeTask.succeeded} active</span>{moduleSummary && !chatgptSummary && (moduleSummary.authenticatedUnknown ?? 0) > 0 && <span>{moduleSummary.authenticatedUnknown ?? 0} authenticated · plan unknown</span>}{chatgptSummary && (chatgptSummary.authenticatedUnknown ?? 0) > 0 && <span>{chatgptSummary.authenticatedUnknown ?? 0} authenticated · plan unknown</span>}{chatgptSummary && (chatgptSummary.planUnavailable ?? 0) > 0 && <span>{chatgptSummary.planUnavailable ?? 0} authenticated · plan unavailable</span>}{moduleSummary && (moduleSummary.noEntitlement ?? 0) > 0 && <span>{moduleSummary.noEntitlement ?? 0} no entitlement</span>}<span>{outcomeSummary?.dead ?? activeTask.failed} {hasDetailedOutcome ? "dead" : "failed"}</span>{moduleSummary && moduleSummary.rateLimited > 0 && <span>{moduleSummary.rateLimited} rate limited</span>}{moduleSummary && moduleSummary.errors > 0 && <span>{moduleSummary.errors} errors</span>}{moduleSummary && moduleSummary.invalid > 0 && <span>{moduleSummary.invalid} invalid</span>}{activeTask.locallyFiltered > 0 && <span>{activeTask.locallyFiltered} ignored locally</span>}<span>{activeTask.skipped} skipped</span><span>{activeTask.retried} retries</span><span>{activeTask.useProxy ? `${activeTask.proxyCount} proxy pool` : "Direct"}</span>{activeTask.resultsExportEnabled && <><span>{activeTask.exportedActive ?? 0} active copied</span><span>{activeTask.exportedFailed ?? 0} failed copied</span>{(activeTask.exportErrors ?? 0) > 0 && <span className="task-export-error">{activeTask.exportErrors} copy errors</span>}</>}
               </div>
               <button className="button danger task-active-cancel" type="button" onClick={cancel} disabled={cancelling}><StopCircle size={14} />{cancelling ? "Cancelling…" : "Cancel"}</button>
             </article>
@@ -1924,14 +2221,18 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
 
           <section className="task-history-panel" aria-labelledby="task-history-title">
             <header className="task-history-header"><div><h2 id="task-history-title">History</h2><p>{history.length} recorded {history.length === 1 ? "task" : "tasks"}</p></div></header>
-            {history.length === 0 ? (
+            {historyPhase === "loading" ? (
+              <div className="empty-state task-history-empty" role="status"><LoaderCircle className="is-spinning" size={21} /><strong>Loading task history</strong><span>Reading saved summaries.</span></div>
+            ) : historyPhase === "error" ? (
+              <div className="empty-state task-history-empty"><CircleDot size={21} /><strong>Task history could not be loaded</strong><span title={historyError}>Existing summaries were not replaced with an empty state.</span><button className="button outline small" type="button" onClick={() => void reloadHistory()}>Retry</button></div>
+            ) : history.length === 0 ? (
               <div className="empty-state task-history-empty"><Clock3 size={21} /><strong>No tasks yet</strong><span>Create a task to begin.</span></div>
             ) : (
               <div className="task-history-list">
                 {visibleHistory.map((task) => (
                   <article className="task-history-row" key={task.runId}>
                     <span className="task-history-module"><ModuleBrandIcon id={task.moduleId} /></span>
-                    <div className="task-history-copy"><strong>{moduleById.get(task.moduleId)?.name ?? task.moduleId}</strong><small>{formatTaskDate(task.finishedAt ?? task.startedAt)} · {task.runId.slice(0, 8)} · {task.useProxy ? `${task.proxyCount ?? 0} proxies` : "Direct"} · {task.concurrency} workers</small></div>
+                    <div className="task-history-copy"><strong>{moduleById.get(task.moduleId)?.name ?? task.moduleId}</strong><small className={task.discoveryError ? "task-history-error" : undefined} title={task.discoveryError ?? undefined}>{task.discoveryError ? `Discovery failed: ${task.discoveryError}` : `${formatTaskDate(task.finishedAt ?? task.startedAt)} · ${task.runId.slice(0, 8)} · ${task.useProxy ? `${task.proxyCount ?? 0} proxies` : "Direct"} · ${task.concurrency} workers`}</small></div>
                     <div className="task-history-metrics"><span>{task.total} candidates</span><span>{task.succeeded} active</span><span>{task.failed} failed</span>{(task.locallyFiltered ?? 0) > 0 && <span>{task.locallyFiltered} ignored locally</span>}<span>{task.skipped} skipped</span>{task.resultsExportEnabled && <span>{(task.exportedActive ?? 0) + (task.exportedFailed ?? 0)} copied{(task.exportErrors ?? 0) > 0 ? ` · ${task.exportErrors} errors` : ""}</span>}</div>
                     <span className={`task-status ${taskTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
                   </article>
@@ -1955,12 +2256,16 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
               <div className="settings-group task-create-group">
                 <div className="settings-row task-module-row">
                   <div className="settings-copy"><strong>Module</strong><small>Only modules enabled in the catalog appear here.</small></div>
-                  <div className="task-module-picker" role="radiogroup" aria-label="Enabled modules">
-                    {enabledModules.map((module) => <button className={moduleId === module.id ? "task-module-choice active" : "task-module-choice"} type="button" role="radio" aria-checked={moduleId === module.id} key={module.id} onClick={() => setModuleId(module.id)} disabled={starting}><span><ModuleBrandIcon id={module.id} /></span>{module.name}</button>)}
+                  <div className="task-module-picker" role="group" aria-label="Enabled modules">
+                    {enabledModules.map((module) => <button className={moduleId === module.id ? "task-module-choice active" : "task-module-choice"} type="button" aria-pressed={moduleId === module.id} key={module.id} onClick={() => setModuleId(module.id)} disabled={starting}><span><ModuleBrandIcon id={module.id} /></span>{module.name}</button>)}
                   </div>
                 </div>
-                <div className="settings-row task-path-row">
-                  <div className="settings-copy"><label htmlFor="task-entries">Authorized files or folders</label><small>Paste one local path per line. Duplicates are removed automatically.</small></div>
+                <div className={`settings-row task-path-row${draggingSources ? " drag-active" : ""}`}>
+                  <div className="settings-copy"><label htmlFor="task-entries">Authorized files or folders</label><small>{draggingSources ? "Drop the files or folders to add their local paths." : "Paste one local path per line, drag sources here, or use the pickers. Duplicates are removed automatically."}</small></div>
+                  <div className="task-source-pickers" aria-label="Add authorized sources">
+                    <button className="button outline small" type="button" onClick={() => void chooseSources("files")} disabled={starting || selectingSources}><FileUp size={13} />Choose files</button>
+                    <button className="button outline small" type="button" onClick={() => void chooseSources("folder")} disabled={starting || selectingSources}><FolderOpen size={13} />Choose folder</button>
+                  </div>
                   <textarea className={`field-input task-entry-input${entryLimitExceeded ? " invalid" : ""}`} id="task-entries" value={rawEntries} onChange={(event) => setRawEntries(event.target.value)} placeholder={"C:\\Ayla\\examples"} disabled={starting} spellCheck={false} aria-invalid={entryLimitExceeded} />
                 </div>
                 <div className="settings-row task-source-row"><div className="settings-copy"><strong>Source preview</strong><small>{entryLimitExceeded ? "The 10,000-path limit has been exceeded." : duplicateEntryCount ? `${duplicateEntryCount} duplicate path(s) will be removed.` : "Cookie totals are calculated after the local scan starts."}</small></div><div className="task-source-summary"><span><strong>{uniqueEntryCount.toLocaleString("en-US")}</strong>Paths</span><span><strong>—</strong>Cookies</span></div></div>
@@ -1977,7 +2282,7 @@ function Tasks({ modules, defaultConcurrency, moduleConcurrency, defaultDelayMs,
             <section className="settings-section">
               <h2><span className="section-step">2</span>Run options</h2>
               <div className="settings-group task-create-group">
-                <div className="settings-row task-proxy-setting"><div className="settings-copy"><strong>Proxy routing</strong><small>{proxiesLive > 0 ? `${proxiesLive} live ${proxiesLive === 1 ? "proxy" : "proxies"} available` : "Add and check proxies before enabling this option."}</small>{proxiesLive === 0 && <button className="inline-action" type="button" onClick={onOpenProxies}>Manage proxies</button>}</div><button className={useProxy ? "switch-control active" : "switch-control"} type="button" role="switch" aria-checked={useProxy} onClick={() => setUseProxy((current) => !current)} disabled={starting || proxiesLive === 0}><span /></button></div>
+                <div className="settings-row task-proxy-setting"><div className="settings-copy"><strong>Proxy routing</strong><small>{proxiesLive > 0 ? `${proxiesLive} HTTPS-verified ${proxiesLive === 1 ? "proxy" : "proxies"} available` : "Add and check proxies before enabling this option."}</small>{proxiesLive === 0 && <button className="inline-action" type="button" onClick={onOpenProxies}>Manage proxies</button>}</div><button className={useProxy ? "switch-control active" : "switch-control"} type="button" role="switch" aria-checked={useProxy} aria-label="Route this task through HTTPS-verified proxies" onClick={() => setUseProxy((current) => !current)} disabled={starting || proxiesLive === 0}><span /></button></div>
                 <SettingNumberRow id="task-concurrency" label="Concurrency" description={useProxy && effectiveConcurrency < requestedConcurrency ? `${requestedConcurrency} requested · ${effectiveConcurrency} effective with the current proxy pool.` : "Parallel workers. Higher values use more CPU and network capacity."} min={1} max={32} value={concurrency} onChange={setConcurrency} disabled={starting} />
                 <SettingNumberRow id="task-delay" label={selectedModule && selectedModule.id !== "chatgpt" ? "Request spacing" : "Worker delay"} description={selectedModule && selectedModule.id !== "chatgpt" ? `Minimum global spacing between ${selectedModule.name} requests, including retries and proxy failover.` : "Pause between entries per worker, in milliseconds."} min={0} max={60_000} value={delayMs} onChange={setDelayMs} disabled={starting} />
               </div>
@@ -1996,7 +2301,7 @@ function countryFlag(countryCode: string) {
   return String.fromCodePoint(...[...code].map((character) => 127397 + character.charCodeAt(0)));
 }
 
-function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaultThreads: number; defaultTimeoutMs: number; onCountsChanged: (total: number, live: number) => void }) {
+function Proxies({ active, defaultThreads, defaultTimeoutMs, onCountsChanged }: { active: boolean; defaultThreads: number; defaultTimeoutMs: number; onCountsChanged: (total: number, live: number) => void }) {
   const [raw, setRaw] = useState("");
   const [protocol, setProtocol] = useState("http");
   const [items, setItems] = useState<ProxyItem[]>([]);
@@ -2007,14 +2312,20 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [selectedProxyId, setSelectedProxyId] = useState<string | null>(null);
   const [proxyView, setProxyView] = useState<"list" | "add">("list");
-  const [proxyFilter, setProxyFilter] = useState<"all" | "live" | "pending">("all");
+  const [proxyFilter, setProxyFilter] = useState<"all" | "live" | "pending" | "httpOnly" | "failed">("all");
   const [query, setQuery] = useState("");
   const [proxyPage, setProxyPage] = useState(0);
   const [proxyPageSize, setProxyPageSize] = useState(5);
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState("");
+  const [loadPhase, setLoadPhase] = useState<ResourcePhase>("loading");
+  const [loadError, setLoadError] = useState("");
   const proxyFileInputRef = useRef<HTMLInputElement>(null);
   const proxyListRef = useRef<HTMLDivElement>(null);
+  const pendingProxyUpdatesRef = useRef<Map<string, ProxyItem>>(new Map());
+  const latestProxyProgressRef = useRef<ProxyProgress | null>(null);
+  const proxyFlushTimerRef = useRef(0);
+  const acceptProxyEventsRef = useRef(false);
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   function applyItems(nextItems: ProxyItem[]) {
@@ -2026,29 +2337,66 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
     onCountsChanged(nextItems.length, nextItems.filter((item) => item.status === "live").length);
   }
 
+  function applyAuthoritativeItems(nextItems: ProxyItem[]) {
+    window.clearTimeout(proxyFlushTimerRef.current);
+    proxyFlushTimerRef.current = 0;
+    pendingProxyUpdatesRef.current.clear();
+    latestProxyProgressRef.current = null;
+    applyItems(nextItems);
+  }
+
+  async function reloadProxies() {
+    setLoadPhase("loading");
+    setLoadError("");
+    try {
+      applyAuthoritativeItems(await invoke<ProxyItem[]>("list_proxies"));
+      setLoadPhase("ready");
+    } catch (reason: unknown) {
+      setLoadError(String(reason));
+      setLoadPhase("error");
+    }
+  }
+
   useEffect(() => {
     let active = true;
     const cleanups: Array<() => void> = [];
 
-    invoke<ProxyItem[]>("list_proxies").then((nextItems) => active && applyItems(nextItems)).catch(() => undefined);
-    invoke<boolean>("is_proxy_check_running").then((value) => active && setRunning(value)).catch(() => undefined);
+    void reloadProxies();
+    invoke<boolean>("is_proxy_check_running").then((value) => {
+      if (!active) return;
+      acceptProxyEventsRef.current = value;
+      setRunning(value);
+    }).catch(() => undefined);
 
     void listen<ProxyProgress>("proxy:progress", ({ payload }) => {
-      if (!active) return;
-      setProgress(payload);
-      setRunning(payload.running);
-      if (payload.status === "dead" && payload.id) {
-        applyItems(itemsRef.current.filter((item) => item.id !== payload.id));
-      } else if (payload.item) {
-        const exists = itemsRef.current.some((item) => item.id === payload.item?.id);
-        applyItems(exists
-          ? itemsRef.current.map((item) => item.id === payload.item?.id ? payload.item as ProxyItem : item)
-          : [...itemsRef.current, payload.item]);
-      }
+      if (!active || !acceptProxyEventsRef.current) return;
+      latestProxyProgressRef.current = payload;
+      if (payload.item) pendingProxyUpdatesRef.current.set(payload.item.id, payload.item);
+      if (proxyFlushTimerRef.current) return;
+      proxyFlushTimerRef.current = window.setTimeout(() => {
+        proxyFlushTimerRef.current = 0;
+        if (!active) return;
+        const updates = pendingProxyUpdatesRef.current;
+        if (updates.size > 0) {
+          const knownIds = new Set(itemsRef.current.map((item) => item.id));
+          const next = itemsRef.current.map((item) => updates.get(item.id) ?? item);
+          updates.forEach((item, id) => { if (!knownIds.has(id)) next.push(item); });
+          updates.clear();
+          applyItems(next);
+        }
+        const latest = latestProxyProgressRef.current;
+        if (latest) {
+          setProgress(latest);
+          setRunning(latest.running);
+          if (!latest.running) acceptProxyEventsRef.current = false;
+        }
+      }, 75);
     }).then((unlisten) => active ? cleanups.push(unlisten) : unlisten()).catch(() => undefined);
 
     return () => {
       active = false;
+      window.clearTimeout(proxyFlushTimerRef.current);
+      proxyFlushTimerRef.current = 0;
       cleanups.forEach((cleanup) => cleanup());
     };
   }, []);
@@ -2080,7 +2428,7 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
       const sourceLines = raw.split(/\r?\n/);
       const result = await invoke<AddProxiesResult>("add_proxies", { raw, protocol });
       setReport(result);
-      applyItems(result.items);
+      applyAuthoritativeItems(result.items);
       setRaw([...new Set(result.rejected.map((item) => sourceLines[item.line - 1]?.trim()).filter(Boolean))].join("\n"));
       setProxyPage(0);
       setMessage(`${result.added} added · ${result.duplicates} duplicate · ${result.rejected.length} rejected.`);
@@ -2122,14 +2470,38 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
   async function check(ids: string[]) {
     if (items.length === 0) return;
     const total = ids.length || items.length;
+    acceptProxyEventsRef.current = true;
     setRunning(true);
     setMessage("");
-    setProgress({ done: 0, total, percent: 0, live: 0, removed: 0, id: "", item: null, status: "running", running: true });
+    setProgress({ done: 0, total, percent: 0, live: 0, httpOnly: 0, failed: 0, removed: 0, id: "", item: null, status: "running", running: true });
     try {
-      const result = await invoke<{ results: ProxyItem[]; stopped: boolean }>("check_proxies", { request: { ids, threads: defaultThreads, timeoutMs: defaultTimeoutMs } });
-      applyItems(result.results);
-      setMessage(result.stopped ? "Check stopped." : "Check completed.");
+      const result = await invoke<{ results: ProxyItem[]; stopped: boolean; done: number; total: number; live: number; httpOnly: number; failed: number }>("check_proxies", { request: { ids, threads: defaultThreads, timeoutMs: defaultTimeoutMs } });
+      acceptProxyEventsRef.current = false;
+      applyAuthoritativeItems(result.results);
+      setProgress({
+        done: result.done,
+        total: result.total,
+        percent: result.total > 0 ? Math.min(100, (result.done / result.total) * 100) : 0,
+        live: result.live,
+        httpOnly: result.httpOnly,
+        failed: result.failed,
+        removed: 0,
+        id: "",
+        item: null,
+        status: result.stopped ? "stopped" : "done",
+        running: false,
+      });
+      setMessage(result.stopped
+        ? "Check stopped. Saved proxies were retained."
+        : `Check completed: ${result.live} HTTPS-ready · ${result.httpOnly} HTTP-only · ${result.failed} failed. No proxies were removed.`);
     } catch (reason: unknown) {
+      acceptProxyEventsRef.current = false;
+      window.clearTimeout(proxyFlushTimerRef.current);
+      proxyFlushTimerRef.current = 0;
+      pendingProxyUpdatesRef.current.clear();
+      latestProxyProgressRef.current = null;
+      await reloadProxies();
+      setProgress(null);
       setMessage(String(reason));
     } finally {
       setRunning(false);
@@ -2146,16 +2518,19 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
   }
 
   async function remove(id: string) {
+    const target = items.find((item) => item.id === id);
+    if (!window.confirm(`Remove ${target?.display ?? "this proxy"} from the saved list? This cannot be undone.`)) return;
     try {
-      applyItems(await invoke<ProxyItem[]>("remove_proxies", { ids: [id] }));
+      applyAuthoritativeItems(await invoke<ProxyItem[]>("remove_proxies", { ids: [id] }));
     } catch (reason: unknown) {
       setMessage(String(reason));
     }
   }
 
   async function clear() {
+    if (!window.confirm(`Remove all ${items.length} saved ${items.length === 1 ? "proxy" : "proxies"}? This cannot be undone.`)) return;
     try {
-      applyItems(await invoke<ProxyItem[]>("clear_proxies"));
+      applyAuthoritativeItems(await invoke<ProxyItem[]>("clear_proxies"));
       setReport(null);
       setProgress(null);
       setSelectedIds([]);
@@ -2168,7 +2543,22 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
     }
   }
 
+  async function removeFailed() {
+    const ids = items.filter((item) => item.status === "failed").map((item) => item.id);
+    if (ids.length === 0) return;
+    if (!window.confirm(`Remove ${ids.length} failed ${ids.length === 1 ? "proxy" : "proxies"}? HTTP-only proxies will be kept for diagnostics.`)) return;
+    try {
+      applyAuthoritativeItems(await invoke<ProxyItem[]>("remove_proxies", { ids }));
+      setMessage(`${ids.length} failed ${ids.length === 1 ? "proxy" : "proxies"} removed.`);
+    } catch (reason: unknown) {
+      acceptProxyEventsRef.current = false;
+      setMessage(String(reason));
+    }
+  }
+
   const liveCount = items.filter((item) => item.status === "live").length;
+  const httpOnlyCount = items.filter((item) => item.status === "httpOnly").length;
+  const failedCount = items.filter((item) => item.status === "failed").length;
   const proxyInputLines = useMemo(() => raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean), [raw]);
   const proxyInputCandidates = useMemo(() => raw.split(/[\s,;]+/).map((entry) => entry.trim()).filter(Boolean), [raw]);
   const proxyUniqueCandidates = useMemo(() => new Set(proxyInputCandidates).size, [proxyInputCandidates]);
@@ -2216,13 +2606,13 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
   }
 
   return (
-    <section className="proxies-page">
+    <section className="proxies-page" hidden={!active}>
       {proxyView === "list" ? (
         <div className="proxy-browser-view">
           <section className="proxy-list-pane" aria-label="Saved proxies">
-            <div className="proxy-list-tabs" role="tablist" aria-label="Proxy status">
-              {(["all", "live", "pending"] as const).map((status) => (
-                <button className={proxyFilter === status ? "active" : ""} type="button" role="tab" aria-selected={proxyFilter === status} key={status} onClick={() => { setProxyFilter(status); setProxyPage(0); }}>{status === "all" ? "All" : status === "live" ? "Live" : "Unchecked"}</button>
+            <div className="proxy-list-tabs" aria-label="Filter proxies by status">
+              {(["all", "live", "httpOnly", "failed", "pending"] as const).map((status) => (
+                <button className={proxyFilter === status ? "active" : ""} type="button" aria-pressed={proxyFilter === status} key={status} onClick={() => { setProxyFilter(status); setProxyPage(0); }}>{status === "all" ? "All" : status === "live" ? "HTTPS ready" : status === "httpOnly" ? "HTTP only" : status === "failed" ? "Failed" : "Unchecked"}</button>
               ))}
             </div>
 
@@ -2233,9 +2623,10 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
             </div>
 
             <div className="proxy-list-summary">
-              <span>{filteredItems.length} shown · {liveCount} live</span>
+              <span>{filteredItems.length} shown · {liveCount} HTTPS ready · {httpOnlyCount} HTTP only · {failedCount} failed</span>
               <div className="proxy-list-summary-actions">
                 {running ? <button className="proxy-list-run" onClick={stop} type="button"><StopCircle size={11} />Stop</button> : <button className="proxy-list-run" onClick={() => check(selectedIds)} type="button" disabled={items.length === 0} title={selectedIds.length ? `Check ${selectedIds.length} selected proxies` : "Check every saved proxy"}><Play size={11} />Run checks</button>}
+                <button type="button" onClick={removeFailed} disabled={running || failedCount === 0} title="Permanently remove only proxies whose latest check failed">Remove failed</button>
                 <button type="button" onClick={() => setSelectedIds(selectedIds.length === items.length ? [] : items.map((item) => item.id))} disabled={running || items.length === 0}>{selectedIds.length === items.length && items.length > 0 ? "Deselect all" : "Select all"}</button>
               </div>
             </div>
@@ -2244,11 +2635,15 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
               <div className="proxy-check-progress proxy-check-progress-compact">
                 <div><span>{progress.done} of {progress.total}</span><strong>{Math.round(progress.percent)}%</strong></div>
                 <progress value={progress.percent} max="100" />
-                <small>{progress.live} live · {progress.removed} removed</small>
+                <small>{progress.live} HTTPS ready · {progress.httpOnly} HTTP only · {progress.failed} failed · none removed</small>
               </div>
             )}
 
-            {filteredItems.length === 0 ? (
+            {loadPhase === "loading" ? (
+              <div className="proxy-list-empty" role="status"><LoaderCircle className="is-spinning" size={22} /><strong>Loading saved proxies</strong><span>The list is being read from local storage.</span></div>
+            ) : loadPhase === "error" ? (
+              <div className="proxy-list-empty"><CircleDot size={22} /><strong>Saved proxies could not be loaded</strong><span title={loadError}>The existing file was not treated as an empty list.</span><button className="button outline small" type="button" onClick={() => void reloadProxies()}>Retry</button></div>
+            ) : filteredItems.length === 0 ? (
               <div className="proxy-list-empty"><Network size={22} /><strong>{items.length ? "No matching proxies" : "No proxies yet"}</strong><span>{items.length ? "Try another search or filter." : "Add a proxy list to begin."}</span></div>
             ) : (
               <div className="proxy-browser-list" ref={proxyListRef}>
@@ -2260,7 +2655,7 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
                       <button className="proxy-row-select" type="button" onClick={() => setSelectedProxyId(item.id)}>
                         <span className="proxy-country-flag" aria-label={item.country || "Unknown country"}>{countryFlag(item.countryCode)}</span>
                         <span className="proxy-row-copy"><strong>{item.ip || item.host}</strong><small>{location} · {item.hasAuth ? "Authenticated" : "No authentication"}</small></span>
-                        <span className="proxy-row-meta"><strong>{item.status === "live" ? `${item.latencyMs} ms` : "—"}</strong><small>{item.protocol.toUpperCase()}</small></span>
+                        <span className="proxy-row-meta"><strong>{item.checkedAt ? `${item.latencyMs} ms` : "—"}</strong><small>{item.status === "live" ? "HTTPS" : item.status === "httpOnly" ? "HTTP only" : item.status === "failed" ? "Failed" : item.protocol.toUpperCase()}</small></span>
                       </button>
                     </div>
                   );
@@ -2280,7 +2675,8 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
             <header className="proxy-detail-toolbar">
               <div><strong>Proxy details</strong><span>{items.length} stored · {defaultThreads} workers · {Math.round(defaultTimeoutMs / 1_000)}s timeout</span></div>
               <div>
-                <button className="button outline small" onClick={clear} type="button" disabled={items.length === 0 || running}><Trash2 size={13} />Clear</button>
+                <button className="button outline small" onClick={removeFailed} type="button" disabled={failedCount === 0 || running}><Trash2 size={13} />Remove failed</button>
+                <button className="button danger small" onClick={clear} type="button" disabled={items.length === 0 || running}><Trash2 size={13} />Clear all</button>
               </div>
             </header>
 
@@ -2288,7 +2684,7 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
               <div className="proxy-check-progress">
                 <div><span>{progress.done} of {progress.total}</span><strong>{Math.round(progress.percent)}%</strong></div>
                 <progress value={progress.percent} max="100" />
-                <small>{progress.live} live · {progress.removed} removed</small>
+                <small>{progress.live} HTTPS ready · {progress.httpOnly} HTTP only · {progress.failed} failed · none removed</small>
               </div>
             )}
 
@@ -2299,13 +2695,14 @@ function Proxies({ defaultThreads, defaultTimeoutMs, onCountsChanged }: { defaul
                 <div className="proxy-detail-hero">
                   <span className="proxy-detail-flag">{countryFlag(selectedProxy.countryCode)}</span>
                   <div><h1>{selectedProxy.ip || selectedProxy.host}</h1><p>{[selectedProxy.city, selectedProxy.country].filter(Boolean).join(", ") || "Location unavailable"}</p></div>
-                  <span className={`proxy-detail-status ${selectedProxy.status}`}>{selectedProxy.status === "live" ? "Live" : "Unchecked"}</span>
+                  <span className={`proxy-detail-status ${selectedProxy.status}`}>{selectedProxy.status === "live" ? "HTTPS ready" : selectedProxy.status === "httpOnly" ? "HTTP only" : selectedProxy.status === "failed" ? "Failed" : "Unchecked"}</span>
                 </div>
 
                 <div className="proxy-detail-grid">
                   <div><span>Address</span><strong>{selectedProxy.host}:{selectedProxy.port}</strong></div>
                   <div><span>Protocol</span><strong>{selectedProxy.protocol.toUpperCase()}</strong></div>
-                  <div><span>Latency</span><strong>{selectedProxy.status === "live" ? `${selectedProxy.latencyMs} ms` : "Not checked"}</strong></div>
+                  <div><span>HTTPS capability</span><strong>{selectedProxy.capability === "httpsVerified" ? "Verified" : selectedProxy.capability === "httpOnly" ? "Unavailable; HTTP only" : selectedProxy.capability === "unavailable" ? "Latest check failed" : "Not checked"}</strong></div>
+                  <div><span>Latency</span><strong>{selectedProxy.checkedAt ? `${selectedProxy.latencyMs} ms` : "Not checked"}</strong></div>
                   <div><span>Authentication</span><strong>{selectedProxy.hasAuth ? "Credentials saved" : "None"}</strong></div>
                   <div><span>Last checked</span><strong>{selectedProxy.checkedAt ? formatTaskDate(selectedProxy.checkedAt) : "Never"}</strong></div>
                   <div><span>Result</span><strong>{selectedProxy.message || "Waiting for a check"}</strong></div>
@@ -2386,6 +2783,7 @@ function formatUpdateProgress(downloadedBytes: number, totalBytes: number | null
 }
 
 function Settings({
+  active,
   settings,
   configuredModule,
   installedVersion,
@@ -2394,6 +2792,7 @@ function Settings({
   onInstallUpdate,
   onSaved,
 }: {
+  active: boolean;
   settings: AppSettings | null;
   configuredModule: ModuleInfo | null;
   installedVersion: string;
@@ -2407,9 +2806,9 @@ function Settings({
   const [delayMs, setDelayMs] = useState(settings?.delayMs ?? 120);
   const [timeoutMs, setTimeoutMs] = useState(settings?.timeoutMs ?? 10_000);
   const [retries, setRetries] = useState(settings?.retries ?? 1);
-  const [maxScanDirectories, setMaxScanDirectories] = useState(settings?.maxScanDirectories ?? 1_000);
-  const [maxScanFiles, setMaxScanFiles] = useState(settings?.maxScanFiles ?? 10_000);
-  const [scanBudgetMib, setScanBudgetMib] = useState(settings?.scanBudgetMib ?? 512);
+  const [maxScanDirectories, setMaxScanDirectories] = useState(settings?.maxScanDirectories ?? 0);
+  const [maxScanFiles, setMaxScanFiles] = useState(settings?.maxScanFiles === null ? 0 : settings?.maxScanFiles ?? DEFAULT_MAX_SCAN_FILES);
+  const [scanBudgetMib, setScanBudgetMib] = useState(settings?.scanBudgetMib === null ? 0 : settings?.scanBudgetMib ?? DEFAULT_SCAN_BUDGET_MIB);
   const [autoCheckUpdates, setAutoCheckUpdates] = useState(settings?.autoCheckUpdates ?? true);
   const [message, setMessage] = useState("");
 
@@ -2420,16 +2819,16 @@ function Settings({
     setDelayMs(settings.delayMs);
     setTimeoutMs(settings.timeoutMs);
     setRetries(settings.retries);
-    setMaxScanDirectories(settings.maxScanDirectories ?? 1_000);
-    setMaxScanFiles(settings.maxScanFiles ?? 10_000);
-    setScanBudgetMib(settings.scanBudgetMib ?? 512);
+    setMaxScanDirectories(settings.maxScanDirectories ?? 0);
+    setMaxScanFiles(settings.maxScanFiles === null ? 0 : settings.maxScanFiles ?? DEFAULT_MAX_SCAN_FILES);
+    setScanBudgetMib(settings.scanBudgetMib === null ? 0 : settings.scanBudgetMib ?? DEFAULT_SCAN_BUDGET_MIB);
     setAutoCheckUpdates(settings.autoCheckUpdates ?? true);
   }, [settings]);
 
   async function save() {
     if (!settings) return;
     try {
-      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories, maxScanFiles, scanBudgetMib, autoCheckUpdates } });
+      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories: maxScanDirectories === 0 ? null : maxScanDirectories, maxScanFiles: maxScanFiles === 0 ? null : maxScanFiles, scanBudgetMib: scanBudgetMib === 0 ? null : scanBudgetMib, autoCheckUpdates } });
       onSaved(saved);
       setMessage("Settings saved locally.");
     } catch (reason: unknown) {
@@ -2438,7 +2837,7 @@ function Settings({
   }
 
   return (
-    <section className={configuredModule ? "settings-page has-module-settings" : "settings-page"}>
+    <section className={configuredModule ? "settings-page has-module-settings" : "settings-page"} hidden={!active}>
       <header className="settings-page-header">
         <h1>Configuration</h1>
         <p>Task execution, network requests, and local discovery.</p>
@@ -2452,9 +2851,9 @@ function Settings({
               <SettingNumberRow
                 id={`module-workers-${configuredModule.id}`}
                 label="Module workers"
-                description="Concurrent workers used specifically for this module"
+                description="Concurrent validation workers for this module (maximum 32)"
                 min={1}
-                max={200}
+                max={32}
                 value={moduleThreads[configuredModule.id] ?? threads}
                 onChange={(value) => setModuleThreads((current) => ({ ...current, [configuredModule.id]: value }))}
               />
@@ -2465,7 +2864,7 @@ function Settings({
         <section className="settings-section" aria-labelledby="execution-settings-title">
           <h2 id="execution-settings-title">Execution</h2>
           <div className="settings-group">
-            <SettingNumberRow id="threads" label="Default workers" description="Concurrent workers used by default" min={1} max={200} value={threads} onChange={setThreads} />
+            <SettingNumberRow id="threads" label="Default workers" description="Proxy checks may use up to 200; validation tasks are capped at 32" min={1} max={200} value={threads} onChange={setThreads} />
             <SettingNumberRow id="delay-ms" label="Delay between items" description="Milliseconds between items per worker" min={0} max={60_000} value={delayMs} onChange={setDelayMs} />
           </div>
         </section>
@@ -2481,9 +2880,9 @@ function Settings({
         <section className="settings-section" aria-labelledby="discovery-settings-title">
           <h2 id="discovery-settings-title">Discovery</h2>
           <div className="settings-group">
-            <SettingNumberRow id="max-scan-directories" label="Directory limit" description="Maximum directories visited while expanding folders" min={1} max={10_000} value={maxScanDirectories} onChange={setMaxScanDirectories} />
-            <SettingNumberRow id="max-scan-files" label="File limit" description="Maximum unique files discovered for each task" min={1} max={100_000} value={maxScanFiles} onChange={setMaxScanFiles} />
-            <SettingNumberRow id="scan-budget-mib" label="Scan budget" description="MiB available to each local validation phase" min={1} max={4_096} value={scanBudgetMib} onChange={setScanBudgetMib} />
+            <SettingNumberRow id="max-scan-directories" label="Directory limit" description="Maximum directories visited while expanding folders" min={1} max={10_000} value={maxScanDirectories} onChange={setMaxScanDirectories} unlimitedDefault={DEFAULT_MAX_SCAN_DIRECTORIES} unlimitedDescription="No directory-count cap. Traversal streams entries without retaining the full directory tree." />
+            <SettingNumberRow id="max-scan-files" label="File limit" description="Maximum unique file paths discovered for each task" min={1} max={100_000} value={maxScanFiles} onChange={setMaxScanFiles} unlimitedDefault={DEFAULT_MAX_SCAN_FILES} unlimitedDescription="No discovered-file-count cap. Files stream through a bounded worker queue without retaining the full list." />
+            <SettingNumberRow id="scan-budget-mib" label="Scan budget" description="Aggregate MiB available to each local validation phase" min={1} max={4_096} value={scanBudgetMib} onChange={setScanBudgetMib} unlimitedDefault={DEFAULT_SCAN_BUDGET_MIB} unlimitedDescription="No aggregate byte cap. Files flow through a bounded worker queue." />
           </div>
         </section>
 
@@ -2587,14 +2986,47 @@ function Settings({
   );
 }
 
-function SettingNumberRow({ id, label, description, min, max, value, onChange, disabled = false }: { id: string; label: string; description: string; min: number; max: number; value: number; onChange: (value: number) => void; disabled?: boolean }) {
+function SettingNumberRow({ id, label, description, min, max, value, onChange, disabled = false, unlimitedDefault, unlimitedDescription }: { id: string; label: string; description: string; min: number; max: number; value: number; onChange: (value: number) => void; disabled?: boolean; unlimitedDefault?: number; unlimitedDescription?: string }) {
+  const supportsUnlimited = unlimitedDefault !== undefined;
+  const isUnlimited = supportsUnlimited && value === 0;
+  const descriptionId = `${id}-description`;
+
   return (
-    <div className="settings-row">
+    <div className={supportsUnlimited ? "settings-row settings-unlimited-row" : "settings-row"}>
       <div className="settings-copy">
         <label htmlFor={id}>{label}</label>
-        <small>{description}</small>
+        <small id={descriptionId}>{isUnlimited ? unlimitedDescription ?? `${description} · Unlimited is enabled` : description}</small>
       </div>
-      <input className="field-input number-input" id={id} type="number" min={min} max={max} value={value} onChange={(event) => onChange(Number(event.target.value))} disabled={disabled} />
+      <div className={isUnlimited ? "settings-number-control is-unlimited" : "settings-number-control"}>
+        <input
+          className="field-input number-input"
+          id={id}
+          type="number"
+          min={min}
+          max={max}
+          value={isUnlimited ? "" : value}
+          placeholder={isUnlimited ? "Unlimited" : undefined}
+          onChange={(event) => {
+            const nextValue = event.currentTarget.valueAsNumber;
+            if (Number.isFinite(nextValue)) onChange(nextValue);
+          }}
+          disabled={disabled || isUnlimited}
+          aria-describedby={descriptionId}
+        />
+        {supportsUnlimited && (
+          <button
+            className={isUnlimited ? "button outline small settings-unlimited-toggle active" : "button outline small settings-unlimited-toggle"}
+            type="button"
+            aria-label={`${label}: Unlimited`}
+            aria-pressed={isUnlimited}
+            aria-controls={id}
+            onClick={() => onChange(isUnlimited ? unlimitedDefault : 0)}
+            disabled={disabled}
+          >
+            Unlimited
+          </button>
+        )}
+      </div>
     </div>
   );
 }

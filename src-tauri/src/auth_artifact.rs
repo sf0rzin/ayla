@@ -13,6 +13,7 @@ const MAX_COOKIES: usize = 10_000;
 const MAX_TOKEN_CHUNKS: usize = 20;
 const MAX_JSON_DEPTH: usize = 128;
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_COOKIE_HEADER_BYTES: usize = 64 * 1024;
 // Bounded by MAX_COOKIES with a generous per-cookie structural-token allowance so a
 // legitimate multi-thousand-cookie export is not rejected before serde parses it. The
 // 2 MiB artifact cap already bounds the absolute amount of work regardless of this value.
@@ -31,10 +32,37 @@ pub(crate) enum InspectionResult {
     TooLarge,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactReadError {
+    Inspection(InspectionResult),
+    BudgetExceeded,
+}
+
+impl ArtifactReadError {
+    #[cfg(test)]
+    fn inspection_result(self) -> InspectionResult {
+        match self {
+            Self::Inspection(result) => result,
+            Self::BudgetExceeded => InspectionResult::TooLarge,
+        }
+    }
+}
+
 pub(crate) struct PreparedChatGptAuth {
-    cookie_header: String,
-    device_id: Option<String>,
+    cookies: Vec<CookieMeta>,
     artifact_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatGptEndpoint {
+    Session,
+    Accounts,
+    Me,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatGptCookieError {
+    HeaderTooLarge,
 }
 
 pub(crate) enum ChatGptArtifactPreparation {
@@ -46,12 +74,37 @@ pub(crate) enum ChatGptArtifactPreparation {
 }
 
 impl PreparedChatGptAuth {
-    pub(crate) fn cookie_header(&self) -> &str {
-        &self.cookie_header
+    /// Renders only the session cookies which a browser would attach to the exact
+    /// ChatGPT endpoint. Domain, host-only, path, Secure, and expiry metadata remain
+    /// authoritative; cookies from another OpenAI host or path never enter the header.
+    pub(crate) fn cookie_header_for(
+        &self,
+        endpoint: ChatGptEndpoint,
+        now: i64,
+    ) -> Result<Option<String>, ChatGptCookieError> {
+        cookie_header_for_request(
+            &self.cookies,
+            endpoint.host(),
+            endpoint.path(),
+            endpoint.is_https(),
+            now,
+            |name| endpoint.allows_cookie(name),
+        )
     }
 
-    pub(crate) fn device_id(&self) -> Option<&str> {
-        self.device_id.as_deref()
+    /// `oai-did` is read as request metadata, not forwarded as a cookie. The same
+    /// browser scope checks still apply before it can become the device-id header.
+    pub(crate) fn device_id_for(&self, endpoint: ChatGptEndpoint, now: i64) -> Option<&str> {
+        matching_cookies(
+            &self.cookies,
+            endpoint.host(),
+            endpoint.path(),
+            endpoint.is_https(),
+            now,
+        )
+        .into_iter()
+        .find(|cookie| cookie.name == "oai-did")
+        .map(|cookie| cookie.value.as_str())
     }
 
     pub(crate) fn into_artifact_bytes(self) -> Vec<u8> {
@@ -59,8 +112,37 @@ impl PreparedChatGptAuth {
     }
 }
 
+impl ChatGptEndpoint {
+    const fn host(self) -> &'static str {
+        "chatgpt.com"
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Session => "/api/auth/session",
+            Self::Accounts => "/backend-api/accounts/check/v4-2023-04-27",
+            Self::Me => "/backend-api/me",
+        }
+    }
+
+    const fn is_https(self) -> bool {
+        true
+    }
+
+    fn allows_cookie(self, name: &str) -> bool {
+        // All three endpoints can authenticate from the NextAuth session cookie when a
+        // bearer token is unavailable. No unrelated browser cookie is ever forwarded.
+        matches!(self, Self::Session | Self::Accounts | Self::Me) && is_session_cookie_name(name)
+    }
+}
+
+#[derive(Clone)]
 struct CookieMeta {
     domain: String,
+    path: String,
+    secure: bool,
+    host_only: bool,
+    scope_valid: bool,
     name: String,
     expires_at: Option<i64>,
     expiry_valid: bool,
@@ -84,34 +166,24 @@ pub(crate) fn prepare_chatgpt_path_with_budget(
     prepare_chatgpt_path_at_with_budget(path, now_seconds(), Some(remaining_bytes))
 }
 
-pub(crate) fn load_chatgpt_path_with_budget(
+/// Reads an artifact once for the task pipeline. `None` disables only the aggregate byte
+/// budget; locality, regular-file, reparse-point, and per-artifact size checks still apply.
+pub(crate) fn read_artifact_path(
     path: &Path,
-    remaining_bytes: &AtomicU64,
-) -> ChatGptArtifactPreparation {
-    load_chatgpt_path_at_with_budget(path, now_seconds(), Some(remaining_bytes))
+    remaining_bytes: Option<&AtomicU64>,
+) -> Result<Vec<u8>, ArtifactReadError> {
+    read_limited_detailed(path, remaining_bytes)
 }
 
-pub(crate) fn inspect_chatgpt_path_with_budget(
-    path: &Path,
-    remaining_bytes: &AtomicU64,
-) -> InspectionResult {
-    match prepare_chatgpt_path_at_with_budget(path, now_seconds(), Some(remaining_bytes)) {
-        Ok(_) => InspectionResult::Ready,
-        Err(result) => result,
-    }
-}
-
-/// Reads one regular local artifact under the same path, size, reparse-point, and
-/// aggregate-budget checks used by the ChatGPT parser. Other module parsers consume the
-/// returned owned bytes, so every module shares the same filesystem security boundary.
-pub(crate) fn read_artifact_path_with_budget(
-    path: &Path,
-    remaining_bytes: &AtomicU64,
-) -> Result<Vec<u8>, InspectionResult> {
-    read_limited(path, Some(remaining_bytes))
+pub(crate) fn load_chatgpt_bytes(data: Vec<u8>) -> ChatGptArtifactPreparation {
+    load_chatgpt_bytes_at(data, now_seconds())
 }
 
 pub(crate) fn output_directory_is_local(path: &Path) -> bool {
+    artifact_path_is_local(path)
+}
+
+pub(crate) fn artifact_path_is_local(path: &Path) -> bool {
     path.is_absolute() && !has_disallowed_path_prefix(path)
 }
 
@@ -156,6 +228,7 @@ fn inspect_chatgpt_path_at_with_budget(
     }
 }
 
+#[cfg(test)]
 fn prepare_chatgpt_path_at_with_budget(
     path: &Path,
     now: i64,
@@ -167,6 +240,7 @@ fn prepare_chatgpt_path_at_with_budget(
     }
 }
 
+#[cfg(test)]
 fn load_chatgpt_path_at_with_budget(
     path: &Path,
     now: i64,
@@ -181,6 +255,10 @@ fn load_chatgpt_path_at_with_budget(
             };
         }
     };
+    load_chatgpt_bytes_at(data, now)
+}
+
+fn load_chatgpt_bytes_at(data: Vec<u8>, now: i64) -> ChatGptArtifactPreparation {
     let text = match std::str::from_utf8(&data) {
         Ok(text) => text.trim().trim_start_matches('\u{feff}').trim(),
         Err(_) => {
@@ -223,61 +301,81 @@ fn load_chatgpt_path_at_with_budget(
     ChatGptArtifactPreparation::Ready(auth)
 }
 
+#[cfg(test)]
 fn read_limited(
     path: &Path,
     remaining_bytes: Option<&AtomicU64>,
 ) -> Result<Vec<u8>, InspectionResult> {
+    read_limited_detailed(path, remaining_bytes).map_err(ArtifactReadError::inspection_result)
+}
+
+fn read_limited_detailed(
+    path: &Path,
+    remaining_bytes: Option<&AtomicU64>,
+) -> Result<Vec<u8>, ArtifactReadError> {
     if !path.is_absolute() || has_disallowed_path_prefix(path) {
-        return Err(InspectionResult::Unreadable);
+        return Err(ArtifactReadError::Inspection(InspectionResult::Unreadable));
     }
 
-    let file = File::open(path).map_err(|_| InspectionResult::Unreadable)?;
-    let metadata = file.metadata().map_err(|_| InspectionResult::Unreadable)?;
+    let file = File::open(path)
+        .map_err(|_| ArtifactReadError::Inspection(InspectionResult::Unreadable))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ArtifactReadError::Inspection(InspectionResult::Unreadable))?;
     if !metadata.is_file() {
-        return Err(InspectionResult::Unreadable);
+        return Err(ArtifactReadError::Inspection(InspectionResult::Unreadable));
     }
     #[cfg(windows)]
     if !windows_handle_target_is_local(&file) {
-        return Err(InspectionResult::Unreadable);
+        return Err(ArtifactReadError::Inspection(InspectionResult::Unreadable));
     }
     if metadata.len() > MAX_ARTIFACT_BYTES {
-        return Err(InspectionResult::TooLarge);
+        return Err(ArtifactReadError::Inspection(InspectionResult::TooLarge));
     }
 
     // Reserve the declared size up front so an exhausted shared budget stops the read
     // before any bytes are consumed; the reservation is reconciled with the bytes
-    // actually read and refunded in full on every failure path.
+    // actually consumed, including partial reads and per-file-limit failures.
     let reserved = metadata.len();
     if !charge_budget(remaining_bytes, reserved) {
-        return Err(InspectionResult::TooLarge);
+        return Err(ArtifactReadError::BudgetExceeded);
     }
 
     let mut reader = file.take(MAX_ARTIFACT_BYTES + 1);
     let mut data = Vec::with_capacity(reserved.min(MAX_ARTIFACT_BYTES) as usize);
     let outcome = match reader.read_to_end(&mut data) {
-        Ok(_) if data.len() as u64 > MAX_ARTIFACT_BYTES => Err(InspectionResult::TooLarge),
+        Ok(_) if data.len() as u64 > MAX_ARTIFACT_BYTES => {
+            Err(ArtifactReadError::Inspection(InspectionResult::TooLarge))
+        }
         Ok(_) => Ok(()),
-        Err(_) => Err(InspectionResult::Unreadable),
+        Err(_) => Err(ArtifactReadError::Inspection(InspectionResult::Unreadable)),
     };
 
+    // Charge the bytes actually consumed even when the read or per-file check fails. This
+    // prevents a file which grows after metadata from being retried indefinitely without
+    // consuming the finite aggregate scan budget.
+    let actual = data.len() as u64;
+    if !reconcile_read_budget(remaining_bytes, reserved, actual) {
+        return Err(ArtifactReadError::BudgetExceeded);
+    }
+
     match outcome {
-        Ok(()) => {
-            // Reconcile the reservation with the bytes actually read: refund the surplus
-            // if the file shrank, or charge the difference if it grew, rejecting when the
-            // extra bytes would exceed the remaining budget.
-            let actual = data.len() as u64;
-            if actual < reserved {
-                refund_budget(remaining_bytes, reserved - actual);
-            } else if actual > reserved && !charge_budget(remaining_bytes, actual - reserved) {
-                refund_budget(remaining_bytes, reserved);
-                return Err(InspectionResult::TooLarge);
-            }
-            Ok(data)
+        Ok(()) => Ok(data),
+        Err(error) => Err(error),
+    }
+}
+
+fn reconcile_read_budget(remaining_bytes: Option<&AtomicU64>, reserved: u64, actual: u64) -> bool {
+    if actual < reserved {
+        refund_budget(remaining_bytes, reserved - actual);
+        true
+    } else if actual == reserved || charge_budget(remaining_bytes, actual - reserved) {
+        true
+    } else {
+        if let Some(remaining) = remaining_bytes {
+            remaining.store(0, Ordering::Release);
         }
-        Err(error) => {
-            refund_budget(remaining_bytes, reserved);
-            Err(error)
-        }
+        false
     }
 }
 
@@ -490,6 +588,10 @@ fn parse_document(text: &str) -> Result<Vec<CookieMeta>, ()> {
     if let Some(token) = token_only_value(text) {
         return Ok(vec![CookieMeta {
             domain: "chatgpt.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            host_only: true,
+            scope_valid: true,
             name: SESSION_COOKIE.to_string(),
             expires_at: None,
             expiry_valid: true,
@@ -559,8 +661,19 @@ fn parse_netscape(text: &str) -> Result<Vec<CookieMeta>, ()> {
             Ok(expires_at) => (expires_at, true),
             Err(()) => (None, false),
         };
+        let include_subdomains = parse_cookie_bool(parts[1]);
+        let secure = parse_cookie_bool(parts[3]);
+        let path = if parts[2].trim().is_empty() {
+            "/"
+        } else {
+            parts[2].trim()
+        };
         cookies.push(CookieMeta {
             domain: normalize_domain(parts[0]),
+            path: path.to_string(),
+            secure: secure.unwrap_or(false),
+            host_only: !include_subdomains.unwrap_or(false),
+            scope_valid: include_subdomains.is_some() && secure.is_some() && safe_cookie_path(path),
             name: name.to_string(),
             expires_at,
             expiry_valid,
@@ -612,6 +725,12 @@ struct JsonCookie {
     value: Option<JsonScalar>,
     #[serde(alias = "Domain", alias = "Host raw", alias = "host")]
     domain: String,
+    #[serde(alias = "Path", alias = "Path raw")]
+    path: String,
+    #[serde(alias = "Secure")]
+    secure: Option<bool>,
+    #[serde(alias = "hostOnly", alias = "HostOnly")]
+    host_only: Option<bool>,
     #[serde(alias = "expirationDate", alias = "expiry", alias = "Expires raw")]
     expires: Option<JsonScalar>,
 }
@@ -789,6 +908,10 @@ fn parse_json(text: &str) -> Result<Vec<CookieMeta>, ()> {
             let token = token_only_value(&token).ok_or(())?;
             cookies.push(CookieMeta {
                 domain: "chatgpt.com".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                host_only: true,
+                scope_valid: true,
                 name: SESSION_COOKIE.to_string(),
                 expires_at: None,
                 expiry_valid: true,
@@ -819,6 +942,10 @@ fn parse_json(text: &str) -> Result<Vec<CookieMeta>, ()> {
                 };
                 cookies.push(CookieMeta {
                     domain: "chatgpt.com".to_string(),
+                    path: "/".to_string(),
+                    secure: true,
+                    host_only: true,
+                    scope_valid: true,
                     name: SESSION_COOKIE.to_string(),
                     expires_at,
                     expiry_valid,
@@ -842,8 +969,20 @@ fn append_json_cookies(target: &mut Vec<CookieMeta>, items: Vec<JsonCookie>) -> 
         }
         let (expires_at, expiry_valid) = optional_expiry(item.expires.as_ref());
         let (value, value_valid) = optional_string_value(item.value.as_ref());
+        let raw_domain = item.domain.trim();
+        let path = if item.path.trim().is_empty() {
+            "/"
+        } else {
+            item.path.trim()
+        };
         target.push(CookieMeta {
-            domain: normalize_domain(&item.domain),
+            domain: normalize_domain(raw_domain),
+            path: path.to_string(),
+            secure: item.secure.unwrap_or_else(|| name.starts_with("__Secure-")),
+            host_only: item
+                .host_only
+                .unwrap_or_else(|| !raw_domain.starts_with('.')),
+            scope_valid: safe_cookie_path(path),
             name: name.to_string(),
             expires_at,
             expiry_valid,
@@ -859,11 +998,43 @@ fn append_json_cookies(target: &mut Vec<CookieMeta>, items: Vec<JsonCookie>) -> 
 
 fn classify_chatgpt(cookies: &[CookieMeta], now: i64) -> InspectionResult {
     let mut direct = Vec::new();
-    let mut chunks = [None; MAX_TOKEN_CHUNKS];
-    let mut highest_chunk = None;
+    let mut chunk_groups =
+        BTreeMap::<(String, String, bool, bool, &'static str), ChunkGroup>::new();
+    let mut identities = BTreeMap::<(String, String, String), &CookieMeta>::new();
 
     for cookie in cookies {
-        if !chatgpt_domain(&cookie.domain) {
+        let auth_name = cookie.name == SESSION_COOKIE
+            || cookie.name == LEGACY_SESSION_COOKIE
+            || cookie.name.starts_with("__Secure-next-auth.session-token.")
+            || cookie.name.starts_with("next-auth.session-token.");
+        if !auth_name || !chatgpt_domain(&cookie.domain) || !cookie.scope_valid {
+            continue;
+        }
+        if let Some(existing) = identities.insert(
+            (
+                cookie.domain.clone(),
+                cookie.path.clone(),
+                cookie.name.clone(),
+            ),
+            cookie,
+        ) {
+            let identical = existing.secure == cookie.secure
+                && existing.host_only == cookie.host_only
+                && existing.expires_at == cookie.expires_at
+                && existing.expiry_valid == cookie.expiry_valid
+                && existing.value == cookie.value
+                && existing.value_valid == cookie.value_valid;
+            if identical {
+                continue;
+            }
+            return InspectionResult::Invalid;
+        }
+        if !cookie_matches_scope(
+            cookie,
+            ChatGptEndpoint::Session.host(),
+            ChatGptEndpoint::Session.path(),
+            ChatGptEndpoint::Session.is_https(),
+        ) {
             continue;
         }
         // A cookie whose name or value cannot be safely placed in a Cookie header is not
@@ -879,11 +1050,21 @@ fn classify_chatgpt(cookies: &[CookieMeta], now: i64) -> InspectionResult {
             direct.push(state);
             continue;
         }
-        match session_chunk_index(&cookie.name) {
-            Ok(Some(index)) if index < MAX_TOKEN_CHUNKS && chunks[index].is_none() => {
-                chunks[index] = Some(state);
-                highest_chunk =
-                    Some(highest_chunk.map_or(index, |highest: usize| highest.max(index)));
+        match session_chunk(&cookie.name) {
+            Ok(Some((family, index))) if index < MAX_TOKEN_CHUNKS => {
+                let group = chunk_groups
+                    .entry((
+                        cookie.domain.clone(),
+                        cookie.path.clone(),
+                        cookie.secure,
+                        cookie.host_only,
+                        family,
+                    ))
+                    .or_default();
+                if group.chunks[index].replace(state).is_some() {
+                    group.ambiguous = true;
+                }
+                group.highest = Some(group.highest.map_or(index, |highest| highest.max(index)));
             }
             Ok(Some(_)) | Err(()) => return InspectionResult::Invalid,
             Ok(None) => {}
@@ -893,19 +1074,23 @@ fn classify_chatgpt(cookies: &[CookieMeta], now: i64) -> InspectionResult {
     if direct.contains(&CredentialState::Ready) {
         return InspectionResult::Ready;
     }
-    if let Some(highest) = highest_chunk {
-        let selected = &chunks[..=highest];
-        if selected.iter().any(Option::is_none) || selected.contains(&Some(CredentialState::Empty))
-        {
-            return InspectionResult::MissingAuth;
-        }
-        if selected.contains(&Some(CredentialState::Invalid)) {
-            return InspectionResult::Invalid;
-        }
-        if selected.contains(&Some(CredentialState::Expired)) {
-            return InspectionResult::Expired;
-        }
+    let chunk_states = chunk_groups
+        .values()
+        .map(ChunkGroup::state)
+        .collect::<Vec<_>>();
+    if chunk_states.contains(&CredentialState::Ready) {
         return InspectionResult::Ready;
+    }
+    if !chunk_states.is_empty() {
+        return if chunk_states.contains(&CredentialState::Empty) {
+            InspectionResult::MissingAuth
+        } else if chunk_states.contains(&CredentialState::Invalid) {
+            InspectionResult::Invalid
+        } else if chunk_states.contains(&CredentialState::Expired) {
+            InspectionResult::Expired
+        } else {
+            InspectionResult::MissingAuth
+        };
     }
     if direct.contains(&CredentialState::Invalid) {
         InspectionResult::Invalid
@@ -915,58 +1100,146 @@ fn classify_chatgpt(cookies: &[CookieMeta], now: i64) -> InspectionResult {
         InspectionResult::MissingAuth
     }
 }
-fn prepared_auth(cookies: &[CookieMeta], now: i64) -> Option<PreparedChatGptAuth> {
-    let mut values = BTreeMap::<String, String>::new();
-    let mut secure_token = None;
-    let mut legacy_token = None;
-    let mut chunks = [None::<&str>; MAX_TOKEN_CHUNKS];
 
-    for cookie in cookies {
-        if !chatgpt_domain(&cookie.domain)
-            || credential_state(cookie, now) != CredentialState::Ready
-            || !safe_cookie_name(&cookie.name)
-            || !safe_cookie_value(&cookie.value)
+#[derive(Default)]
+struct ChunkGroup {
+    chunks: [Option<CredentialState>; MAX_TOKEN_CHUNKS],
+    highest: Option<usize>,
+    ambiguous: bool,
+}
+
+impl ChunkGroup {
+    fn state(&self) -> CredentialState {
+        if self.ambiguous {
+            return CredentialState::Invalid;
+        }
+        let Some(highest) = self.highest else {
+            return CredentialState::Empty;
+        };
+        let selected = &self.chunks[..=highest];
+        if selected.iter().any(Option::is_none) || selected.contains(&Some(CredentialState::Empty))
         {
+            CredentialState::Empty
+        } else if selected.contains(&Some(CredentialState::Invalid)) {
+            CredentialState::Invalid
+        } else if selected.contains(&Some(CredentialState::Expired)) {
+            CredentialState::Expired
+        } else {
+            CredentialState::Ready
+        }
+    }
+}
+
+fn prepared_auth(cookies: &[CookieMeta], now: i64) -> Option<PreparedChatGptAuth> {
+    if classify_chatgpt(cookies, now) != InspectionResult::Ready {
+        return None;
+    }
+    let mut prepared = Vec::<CookieMeta>::new();
+    for cookie in cookies.iter().filter(|cookie| {
+        chatgpt_domain(&cookie.domain)
+            && cookie.scope_valid
+            && safe_cookie_name(&cookie.name)
+            && safe_cookie_value(&cookie.value)
+            && (is_session_cookie_name(&cookie.name) || cookie.name == "oai-did")
+    }) {
+        if prepared.iter().any(|existing| {
+            existing.domain == cookie.domain
+                && existing.path == cookie.path
+                && existing.name == cookie.name
+        }) {
             continue;
         }
-        values.insert(cookie.name.clone(), cookie.value.clone());
-        if cookie.name == SESSION_COOKIE {
-            secure_token = Some(cookie.value.as_str());
-        } else if cookie.name == LEGACY_SESSION_COOKIE {
-            legacy_token = Some(cookie.value.as_str());
-        } else if let Ok(Some(index)) = session_chunk_index(&cookie.name)
-            && index < MAX_TOKEN_CHUNKS
-        {
-            chunks[index] = Some(cookie.value.as_str());
+        prepared.push(cookie.clone());
+    }
+    Some(PreparedChatGptAuth {
+        cookies: prepared,
+        artifact_bytes: Vec::new(),
+    })
+}
+
+fn cookie_header_for_request<F>(
+    cookies: &[CookieMeta],
+    host: &str,
+    path: &str,
+    is_https: bool,
+    now: i64,
+    allowed: F,
+) -> Result<Option<String>, ChatGptCookieError>
+where
+    F: Fn(&str) -> bool,
+{
+    let matching = matching_cookies(cookies, host, path, is_https, now)
+        .into_iter()
+        .filter(|cookie| allowed(&cookie.name))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+
+    let mut required_bytes = 0usize;
+    for (index, cookie) in matching.iter().enumerate() {
+        required_bytes = required_bytes
+            .checked_add(cookie.name.len())
+            .and_then(|size| size.checked_add(1))
+            .and_then(|size| size.checked_add(cookie.value.len()))
+            .and_then(|size| size.checked_add(if index == 0 { 0 } else { 2 }))
+            .ok_or(ChatGptCookieError::HeaderTooLarge)?;
+        if required_bytes > MAX_COOKIE_HEADER_BYTES {
+            return Err(ChatGptCookieError::HeaderTooLarge);
         }
     }
 
-    let session_token = secure_token
-        .or(legacy_token)
-        .map(str::to_string)
-        .or_else(|| {
-            let mut joined = String::new();
-            for chunk in chunks {
-                match chunk {
-                    Some(value) => joined.push_str(value),
-                    None => break,
-                }
-            }
-            (!joined.is_empty()).then_some(joined)
-        })?;
-    values.insert(SESSION_COOKIE.to_string(), session_token);
+    let mut header = String::with_capacity(required_bytes);
+    for (index, cookie) in matching.into_iter().enumerate() {
+        if index > 0 {
+            header.push_str("; ");
+        }
+        header.push_str(&cookie.name);
+        header.push('=');
+        header.push_str(&cookie.value);
+    }
+    Ok(Some(header))
+}
 
-    let device_id = values.get("oai-did").cloned();
-    let cookie_header = values
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    (!cookie_header.is_empty()).then_some(PreparedChatGptAuth {
-        cookie_header,
-        device_id,
-        artifact_bytes: Vec::new(),
-    })
+fn matching_cookies<'a>(
+    cookies: &'a [CookieMeta],
+    host: &str,
+    path: &str,
+    is_https: bool,
+    now: i64,
+) -> Vec<&'a CookieMeta> {
+    let mut matching = cookies
+        .iter()
+        .filter(|cookie| {
+            cookie_matches_scope(cookie, host, path, is_https)
+                && credential_state(cookie, now) == CredentialState::Ready
+                && safe_cookie_name(&cookie.name)
+                && safe_cookie_value(&cookie.value)
+        })
+        .collect::<Vec<_>>();
+    // Stable sorting preserves source order for equal paths, matching browser jars.
+    matching.sort_by(|left, right| right.path.len().cmp(&left.path.len()));
+    matching
+}
+
+fn cookie_matches_scope(cookie: &CookieMeta, host: &str, path: &str, is_https: bool) -> bool {
+    let domain_matches = if cookie.host_only {
+        host == cookie.domain
+    } else {
+        host == cookie.domain || host.ends_with(&format!(".{}", cookie.domain))
+    };
+    cookie.scope_valid
+        && chatgpt_domain(&cookie.domain)
+        && (!cookie.secure || is_https)
+        && domain_matches
+        && cookie_path_matches(&cookie.path, path)
+}
+
+fn cookie_path_matches(cookie_path: &str, request_path: &str) -> bool {
+    cookie_path == request_path
+        || (request_path.starts_with(cookie_path)
+            && (cookie_path.ends_with('/')
+                || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')))
 }
 
 fn safe_cookie_name(value: &str) -> bool {
@@ -976,6 +1249,22 @@ fn safe_cookie_name(value: &str) -> bool {
             .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b';' | b'='))
 }
 
+fn safe_cookie_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4 * 1024
+        && value.starts_with('/')
+        && !value.chars().any(char::is_control)
+        && !value.contains(';')
+}
+
+fn parse_cookie_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn safe_cookie_value(value: &str) -> bool {
     !value
         .bytes()
@@ -983,7 +1272,7 @@ fn safe_cookie_value(value: &str) -> bool {
 }
 
 fn credential_state(cookie: &CookieMeta, now: i64) -> CredentialState {
-    if !cookie.expiry_valid || !cookie.value_valid {
+    if !cookie.scope_valid || !cookie.expiry_valid || !cookie.value_valid {
         CredentialState::Invalid
     } else if cookie.value.is_empty() {
         CredentialState::Empty
@@ -994,14 +1283,26 @@ fn credential_state(cookie: &CookieMeta, now: i64) -> CredentialState {
     }
 }
 
-fn session_chunk_index(name: &str) -> Result<Option<usize>, ()> {
-    let suffix = name
-        .strip_prefix("__Secure-next-auth.session-token.")
-        .or_else(|| name.strip_prefix("next-auth.session-token."));
-    let Some(suffix) = suffix else {
-        return Ok(None);
-    };
-    suffix.parse::<usize>().map(Some).map_err(|_| ())
+fn session_chunk(name: &str) -> Result<Option<(&'static str, usize)>, ()> {
+    let (family, suffix) =
+        if let Some(suffix) = name.strip_prefix(concat!("__Secure-next-auth.session-token", ".")) {
+            (SESSION_COOKIE, suffix)
+        } else if let Some(suffix) = name.strip_prefix(concat!("next-auth.session-token", ".")) {
+            (LEGACY_SESSION_COOKIE, suffix)
+        } else {
+            return Ok(None);
+        };
+    suffix
+        .parse::<usize>()
+        .map(|index| Some((family, index)))
+        .map_err(|_| ())
+}
+
+fn is_session_cookie_name(name: &str) -> bool {
+    name == SESSION_COOKIE
+        || name == LEGACY_SESSION_COOKIE
+        || session_chunk(name)
+            .is_ok_and(|chunk| chunk.is_some_and(|(_, index)| index < MAX_TOKEN_CHUNKS))
 }
 
 fn normalize_domain(domain: &str) -> String {
@@ -1050,7 +1351,20 @@ fn now_seconds() -> i64 {
 mod tests {
     use super::*;
     use crate::chatgpt_client::{ChatGptPlan, ChatGptProbePool, ChatGptProbeStatus, ChatGptProber};
+    use crate::module_probe::ProbeControl;
     use std::fs;
+
+    struct NeverCancelled;
+
+    impl ProbeControl for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn wait_cancelled(&self, _duration: std::time::Duration) -> bool {
+            false
+        }
+    }
 
     const NOW: i64 = 2_000_000_000;
     const FUTURE: i64 = 2_100_000_000;
@@ -1336,9 +1650,106 @@ mod tests {
 
         let auth = prepare_chatgpt_path_at_with_budget(&path, NOW, None)
             .unwrap_or_else(|_| panic!("prepared auth from prefixed object token"));
+        let expected = format!("{SESSION_COOKIE}={SYNTHETIC_TOKEN}");
         assert_eq!(
-            auth.cookie_header(),
-            format!("{SESSION_COOKIE}={SYNTHETIC_TOKEN}")
+            auth.cookie_header_for(ChatGptEndpoint::Session, NOW)
+                .expect("bounded cookie header")
+                .as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn request_headers_preserve_duplicate_names_paths_host_only_and_secure_scope() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("scoped-cookies.json");
+        fs::write(
+            &path,
+            format!(
+                r#"[
+                  {{"domain":".chatgpt.com","path":"/","hostOnly":false,"secure":true,"name":"{SESSION_COOKIE}","value":"root-token","expirationDate":{FUTURE}}},
+                  {{"domain":".chatgpt.com","path":"/backend-api","hostOnly":false,"secure":true,"name":"{SESSION_COOKIE}","value":"backend-token","expirationDate":{FUTURE}}},
+                  {{"domain":"api.openai.com","path":"/","hostOnly":true,"secure":true,"name":"{SESSION_COOKIE}","value":"wrong-host-token","expirationDate":{FUTURE}}},
+                  {{"domain":"auth.chatgpt.com","path":"/","hostOnly":true,"secure":true,"name":"{SESSION_COOKIE}","value":"wrong-subdomain-token","expirationDate":{FUTURE}}},
+                  {{"domain":"chatgpt.com","path":"/","hostOnly":true,"secure":true,"name":"oai-did","value":"scoped-device","expirationDate":{FUTURE}}}
+                ]"#
+            ),
+        )
+        .expect("write scoped cookie fixture");
+
+        let auth = prepare_chatgpt_path_at_with_budget(&path, NOW, None)
+            .unwrap_or_else(|_| panic!("prepare scoped auth"));
+        let session = auth
+            .cookie_header_for(ChatGptEndpoint::Session, NOW)
+            .expect("session header")
+            .expect("session cookie");
+        assert_eq!(session, format!("{SESSION_COOKIE}=root-token"));
+
+        let accounts = auth
+            .cookie_header_for(ChatGptEndpoint::Accounts, NOW)
+            .expect("accounts header")
+            .expect("accounts cookie");
+        assert_eq!(
+            accounts,
+            format!("{SESSION_COOKIE}=backend-token; {SESSION_COOKIE}=root-token")
+        );
+        assert_eq!(
+            auth.device_id_for(ChatGptEndpoint::Accounts, NOW),
+            Some("scoped-device")
+        );
+
+        let insecure = cookie_header_for_request(
+            &auth.cookies,
+            "chatgpt.com",
+            "/api/auth/session",
+            false,
+            NOW,
+            is_session_cookie_name,
+        )
+        .expect("bounded insecure header");
+        assert_eq!(insecure, None);
+    }
+
+    #[test]
+    fn host_only_cookie_never_expands_to_a_subdomain() {
+        let mut cookie = CookieMeta {
+            domain: "chatgpt.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            host_only: true,
+            scope_valid: true,
+            name: SESSION_COOKIE.to_string(),
+            expires_at: Some(FUTURE),
+            expiry_valid: true,
+            value: "host-only-token".to_string(),
+            value_valid: true,
+        };
+        assert_eq!(
+            cookie_header_for_request(
+                std::slice::from_ref(&cookie),
+                "sub.chatgpt.com",
+                "/api/auth/session",
+                true,
+                NOW,
+                is_session_cookie_name,
+            )
+            .expect("host-only header"),
+            None
+        );
+
+        cookie.host_only = false;
+        assert_eq!(
+            cookie_header_for_request(
+                std::slice::from_ref(&cookie),
+                "sub.chatgpt.com",
+                "/api/auth/session",
+                true,
+                NOW,
+                is_session_cookie_name,
+            )
+            .expect("domain-cookie header")
+            .as_deref(),
+            Some("__Secure-next-auth.session-token=host-only-token")
         );
     }
 
@@ -1416,6 +1827,21 @@ mod tests {
     }
 
     #[test]
+    fn failed_or_growing_reads_cannot_refund_bytes_already_consumed() {
+        // The declared size was already reserved before the read. If the file grows beyond
+        // the remaining allowance, every available byte stays consumed instead of refunding
+        // the reservation and allowing an unbounded retry loop.
+        let exhausted = AtomicU64::new(10);
+        assert!(!reconcile_read_budget(Some(&exhausted), 100, 111));
+        assert_eq!(exhausted.load(Ordering::Acquire), 0);
+
+        // A partial read refunds only the portion which was reserved but never consumed.
+        let partial = AtomicU64::new(25);
+        assert!(reconcile_read_budget(Some(&partial), 100, 60));
+        assert_eq!(partial.load(Ordering::Acquire), 65);
+    }
+
+    #[test]
     #[ignore = "requires AYLA_AUTH_EXAMPLES and explicit local authorization"]
     fn validates_authorized_external_examples_without_identifiers() {
         let Some(root) = std::env::var_os("AYLA_AUTH_EXAMPLES") else {
@@ -1459,7 +1885,7 @@ mod tests {
                 match prepare_chatgpt_path_with_budget(&entry.path(), &remaining) {
                     Ok(auth) => {
                         counts[0] += 1;
-                        let result = probe.check(&auth);
+                        let result = probe.check(&auth, &NeverCancelled);
                         match result.status {
                             ChatGptProbeStatus::Active(plan) => {
                                 remote_counts[0] += 1;
@@ -1473,6 +1899,7 @@ mod tests {
                                 };
                                 plan_counts[index] += 1;
                             }
+                            ChatGptProbeStatus::Authenticated(_) => remote_counts[0] += 1,
                             ChatGptProbeStatus::Dead => remote_counts[1] += 1,
                             ChatGptProbeStatus::RateLimited => remote_counts[2] += 1,
                             ChatGptProbeStatus::Error => remote_counts[3] += 1,

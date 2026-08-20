@@ -1,21 +1,29 @@
 import {
   cookieId,
+  deleteAllCookies,
   downloadText,
   exportJson,
   exportNetscape,
+  getAllCookies,
+  getCookiesForTab,
   getProtectedCookies,
   getSettings,
   importCookies,
   normalizeDomain,
-  parseImport,
-  protectCookie,
-  removeCookie,
-  removeCookies,
+  parseImportReport,
+  protectCookies,
+  removeUnprotectedCookies,
+  resolveImportCookies,
   replaceCookie,
-  saveSettings,
+  saveSettingsPatch,
   setCookie,
-  unprotectCookie
+  settingsStorageKey,
+  unprotectCookies
 } from "./lib/cookies.js";
+import { closeModal, confirmWithDialog, openModal } from "./lib/dialogs.js";
+
+const MAX_IMPORT_FILE_BYTES = 32 * 1024 * 1024;
+let importAnalysisGeneration = 0;
 
 const state = {
   cookies: [],
@@ -23,11 +31,14 @@ const state = {
   settings: null,
   domain: null,
   onlyProtected: false,
+  settingsOpen: false,
   domainSearch: "",
   cookieSearch: "",
   selected: new Set(),
   editing: null,
-  transferMode: "export"
+  transferMode: "export",
+  importReport: null,
+  importFilename: ""
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -37,7 +48,8 @@ const elements = {
   empty: $("#empty-state"), selectAll: $("#select-all"), selection: $("#selection-label"),
   title: $("#view-title"), eyebrow: $("#view-eyebrow"), cookiesView: $("#cookies-view"), settingsView: $("#settings-view"),
   cookieDialog: $("#cookie-dialog"), cookieForm: $("#cookie-form"), cookieError: $("#cookie-form-error"),
-  transferDialog: $("#transfer-dialog"), transferForm: $("#transfer-form"), transferError: $("#transfer-error"), toast: $("#toast")
+  transferDialog: $("#transfer-dialog"), transferForm: $("#transfer-form"), transferError: $("#transfer-error"),
+  confirmDialog: $("#confirm-dialog"), toast: $("#toast")
 };
 
 const protectedIds = () => new Set(state.protectedRecords.map((item) => item.id));
@@ -73,14 +85,23 @@ function domainGroups() {
 }
 
 function renderDomains() {
+  const focusedDomain = document.activeElement?.dataset?.domain;
   const query = state.domainSearch.trim().toLowerCase();
   const groups = domainGroups().filter(([domain]) => domain.includes(query));
   elements.domainTotal.textContent = String(domainGroups().length);
   elements.protectedTotal.textContent = String(state.protectedRecords.length);
   const allActive = !state.domain && !state.onlyProtected;
-  elements.domainList.innerHTML = `<button data-domain="" class="${allActive ? "active" : ""}"><span class="domain-icon">A</span><span>Todos os cookies</span><small>${state.cookies.length}</small></button>` + groups.map(([domain, count]) =>
-    `<button data-domain="${escapeHtml(domain)}" class="${state.domain === domain ? "active" : ""}"><span class="domain-icon">${escapeHtml(domain[0] || "?")}</span><span title="${escapeHtml(domain)}">${escapeHtml(domain)}</span><small>${count}</small></button>`
+  elements.domainList.innerHTML = `<button type="button" data-domain="" class="${allActive ? "active" : ""}" ${allActive ? 'aria-current="page"' : ""}><span class="domain-icon" aria-hidden="true">A</span><span>Todos os cookies</span><small>${state.cookies.length}</small></button>` + groups.map(([domain, count]) =>
+    `<button type="button" data-domain="${escapeHtml(domain)}" class="${state.domain === domain ? "active" : ""}" ${state.domain === domain ? 'aria-current="page"' : ""}><span class="domain-icon" aria-hidden="true">${escapeHtml(domain[0] || "?")}</span><span title="${escapeHtml(domain)}">${escapeHtml(domain)}</span><small>${count}</small></button>`
   ).join("");
+  if (focusedDomain !== undefined) {
+    queueMicrotask(() => [...elements.domainList.querySelectorAll("[data-domain]")]
+      .find((button) => button.dataset.domain === focusedDomain)?.focus());
+  }
+}
+
+function runAction(action) {
+  void action().catch((error) => toast(error.message, "danger"));
 }
 
 function expirationLabel(cookie) {
@@ -90,25 +111,40 @@ function expirationLabel(cookie) {
 }
 
 function renderRows() {
+  const focusedCookieId = document.activeElement?.dataset?.selectCookie ?? document.activeElement?.dataset?.editCookie;
+  const focusedControl = document.activeElement?.dataset?.selectCookie !== undefined ? "select" : "edit";
   const cookies = visibleCookies();
   const protectedSet = protectedIds();
   elements.rows.innerHTML = cookies.map((cookie) => {
     const id = cookieId(cookie);
     const selected = state.selected.has(id);
     const flags = [cookie.secure && "Secure", cookie.httpOnly && "HttpOnly", cookie.partitionKey && "CHIPS"].filter(Boolean);
+    const accessibleName = `Selecionar ${cookie.name || "cookie sem nome"} de ${cookie.domain}`;
     return `<tr data-cookie-id="${escapeHtml(id)}" class="${selected ? "selected" : ""}">
-      <td><input type="checkbox" data-select-cookie="${escapeHtml(id)}" ${selected ? "checked" : ""}></td>
+      <td><input type="checkbox" data-select-cookie="${escapeHtml(id)}" aria-label="${escapeHtml(accessibleName)}" ${selected ? "checked" : ""}></td>
       <td class="cookie-name" title="${escapeHtml(cookie.name)}">${protectedSet.has(id) ? '<span class="tag protected-tag">◆</span>' : ""}${escapeHtml(cookie.name || "(vazio)")}</td>
       <td title="${escapeHtml(cookie.domain)}">${escapeHtml(cookie.domain)}</td><td>${escapeHtml(cookie.path)}</td>
       <td title="${escapeHtml(expirationLabel(cookie))}">${escapeHtml(expirationLabel(cookie))}</td>
       <td>${flags.map((flag) => `<span class="tag">${flag}</span>`).join("") || '<span class="tag">—</span>'}</td>
-      <td><button class="row-menu" data-edit-cookie="${escapeHtml(id)}" title="Editar">•••</button></td></tr>`;
+      <td><button type="button" class="row-menu" data-edit-cookie="${escapeHtml(id)}" aria-label="Editar ${escapeHtml(cookie.name || "cookie sem nome")} de ${escapeHtml(cookie.domain)}">•••</button></td></tr>`;
   }).join("");
   elements.empty.classList.toggle("hidden", cookies.length > 0);
   const selectedVisible = cookies.filter((cookie) => state.selected.has(cookieId(cookie))).length;
+  const selectedTotal = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie))).length;
+  const selectedProtected = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie)) && protectedSet.has(cookieId(cookie))).length;
   elements.selectAll.checked = cookies.length > 0 && selectedVisible === cookies.length;
   elements.selectAll.indeterminate = selectedVisible > 0 && selectedVisible < cookies.length;
-  elements.selection.textContent = selectedVisible ? `${selectedVisible} selecionado(s)` : "Nenhum selecionado";
+  elements.selection.textContent = selectedTotal
+    ? `${selectedTotal} selecionado(s)${selectedTotal !== selectedVisible ? `; ${selectedVisible} visível(is)` : ""}`
+    : "Nenhum selecionado";
+  $("#protect-selected").disabled = selectedTotal === 0 || selectedProtected === selectedTotal;
+  $("#unprotect-selected").disabled = selectedProtected === 0;
+  $("#delete-selected").disabled = selectedTotal === 0;
+  if (focusedCookieId !== undefined) {
+    const attribute = focusedControl === "select" ? "selectCookie" : "editCookie";
+    queueMicrotask(() => [...elements.rows.querySelectorAll(`[data-${focusedControl}-cookie]`)]
+      .find((control) => control.dataset[attribute] === focusedCookieId)?.focus());
+  }
 }
 
 function renderSummary() {
@@ -131,21 +167,32 @@ function renderHeading() {
 }
 
 function render() {
-  renderDomains(); renderHeading(); renderSummary(); renderRows();
-  $("#show-protected").classList.toggle("active", state.onlyProtected);
+  renderDomains();
+  if (state.settingsOpen) {
+    elements.eyebrow.textContent = "PREFERÊNCIAS";
+    elements.title.textContent = "Configurações";
+  } else {
+    renderHeading();
+  }
+  renderSummary(); renderRows();
+  $("#show-protected").classList.toggle("active", state.onlyProtected && !state.settingsOpen);
+  $("#show-protected").setAttribute("aria-pressed", String(state.onlyProtected && !state.settingsOpen));
+  $("#show-settings").setAttribute("aria-pressed", String(state.settingsOpen));
 }
 
 async function refresh({ preserveSelection = false } = {}) {
   try {
     [state.cookies, state.protectedRecords, state.settings] = await Promise.all([
-      chrome.cookies.getAll({}), getProtectedCookies(), getSettings()
+      getAllCookies(), getProtectedCookies(), getSettings()
     ]);
     if (!preserveSelection) state.selected.clear();
     state.selected = new Set([...state.selected].filter((id) => state.cookies.some((cookie) => cookieId(cookie) === id)));
-    $("#setting-protection").checked = state.settings.protectAgainstExternalDeletion;
-    $("#setting-autoclear").checked = state.settings.autoClearOnStartup;
-    $("#setting-confirm").checked = state.settings.confirmDestructiveActions;
+    const visibleIds = new Set(visibleCookies().map(cookieId));
+    state.selected = new Set([...state.selected].filter((id) => visibleIds.has(id)));
+    renderSettings();
+    $("#delete-all").disabled = state.cookies.length === 0;
     render();
+    if (elements.transferDialog.open && state.transferMode === "export") renderExportOptions();
   } catch (error) { toast(error.message, "danger"); }
 }
 
@@ -167,7 +214,7 @@ function openCookieDialog(cookie = null) {
     const date = new Date(cookie.expirationDate * 1000);
     f.expiration.value = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   }
-  elements.cookieDialog.showModal();
+  openModal(elements.cookieDialog, { initialFocus: elements.cookieForm.elements.name });
 }
 
 async function saveCookieForm() {
@@ -189,16 +236,74 @@ async function saveCookieForm() {
 async function deleteSelection() {
   const selected = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie)));
   if (!selected.length) return;
-  if (state.settings.confirmDestructiveActions && !confirm(`Apagar ${selected.length} cookie(s)? Cookies protegidos serão preservados.`)) return;
-  const result = await removeCookies(selected, protectedIds());
+  state.protectedRecords = await getProtectedCookies();
+  const protectedSet = protectedIds();
+  const protectedCount = selected.filter((cookie) => protectedSet.has(cookieId(cookie))).length;
+  const removableCount = selected.length - protectedCount;
+  if (!removableCount) {
+    toast("Todos os cookies selecionados estão protegidos.");
+    return;
+  }
+  state.settings = await getSettings();
+  renderSettings();
+  if (state.settings.confirmDestructiveActions) {
+    const confirmed = await confirmWithDialog(elements.confirmDialog, {
+      title: "Apagar cookies selecionados?",
+      description: `${removableCount} cookie(s) serão apagados desta seleção. ${protectedCount} protegido(s) serão preservados. Esta ação não pode ser desfeita.`,
+      confirmLabel: `Apagar ${removableCount}`
+    });
+    if (!confirmed) return;
+  }
+  const result = await removeUnprotectedCookies(selected);
   toast(`${result.removed} removido(s); ${result.skipped} protegido(s).`, result.failed ? "danger" : "success");
   await refresh();
 }
 
+function renderSettings() {
+  if (!state.settings) return;
+  $("#setting-protection").checked = state.settings.protectAgainstExternalDeletion;
+  $("#setting-autoclear").checked = state.settings.autoClearOnStartup;
+  $("#setting-confirm").checked = state.settings.confirmDestructiveActions;
+}
+
+async function deleteEveryCookie() {
+  const [cookies, protectedRecords] = await Promise.all([
+    getAllCookies(),
+    getProtectedCookies()
+  ]);
+  if (!cookies.length) {
+    toast("Não há cookies acessíveis neste perfil do Edge.");
+    return;
+  }
+  const confirmed = await confirmWithDialog(elements.confirmDialog, {
+    title: "Apagar todos os cookies do Edge?",
+    description: `${cookies.length} cookie(s) acessível(is) serão apagados, incluindo ${protectedRecords.length} protegido(s). A proteção externa será desativada e seus snapshots serão removidos para impedir restauração. Esta ação não pode ser desfeita.`,
+    confirmLabel: `Apagar todos os ${cookies.length}`
+  });
+  if (!confirmed) return;
+
+  const result = await deleteAllCookies();
+  state.selected.clear();
+  const tone = result.failed || result.remaining ? "danger" : "success";
+  toast(`${result.removed} removido(s); ${result.failed} falha(s); ${result.remaining} restante(s).`, tone);
+  await refresh();
+}
+
 async function protectSelection() {
-  const selected = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie)));
-  await Promise.all(selected.map((cookie) => protectedIds().has(cookieId(cookie)) ? unprotectCookie(cookie) : protectCookie(cookie)));
-  toast("Proteção atualizada.", "success");
+  const protectedSet = protectedIds();
+  const selected = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie)) && !protectedSet.has(cookieId(cookie)));
+  if (!selected.length) return;
+  await protectCookies(selected);
+  toast(`${selected.length} cookie(s) protegido(s).`, "success");
+  await refresh({ preserveSelection: true });
+}
+
+async function unprotectSelection() {
+  const protectedSet = protectedIds();
+  const selected = state.cookies.filter((cookie) => state.selected.has(cookieId(cookie)) && protectedSet.has(cookieId(cookie)));
+  if (!selected.length) return;
+  await unprotectCookies(selected);
+  toast(`${selected.length} cookie(s) desprotegido(s).`, "success");
   await refresh({ preserveSelection: true });
 }
 
@@ -208,36 +313,154 @@ function openTransfer(mode) {
   $("#export-panel").classList.toggle("hidden", !exporting); $("#import-panel").classList.toggle("hidden", exporting);
   $("#transfer-eyebrow").textContent = exporting ? "BACKUP" : "RESTAURAÇÃO";
   $("#transfer-title").textContent = exporting ? "Exportar cookies" : "Importar cookies";
-  $("#transfer-submit").textContent = exporting ? "Exportar" : "Importar";
+  $("#transfer-submit").textContent = exporting ? "Exportar" : "Importar todos";
+  $("#transfer-submit").disabled = !exporting;
   $("#export-description").textContent = `${visibleCookies().length} cookie(s) da visualização atual serão exportados.`;
-  elements.transferDialog.showModal();
+  if (exporting) renderExportOptions(); else resetImportEditor();
+  openModal(elements.transferDialog, { initialFocus: exporting ? "#export-format" : "#import-file" });
+}
+
+function renderExportOptions() {
+  const cookies = visibleCookies();
+  const chipsCount = cookies.filter((cookie) => cookie.partitionKey).length;
+  const format = $("#export-format");
+  const netscape = format.querySelector('option[value="netscape"]');
+  netscape.disabled = chipsCount > 0;
+  if (netscape.disabled && format.value === "netscape") format.value = "json";
+  $("#export-warning").textContent = chipsCount
+    ? `${chipsCount} cookie(s) CHIPS exigem JSON; o formato Netscape foi desativado para evitar perda de partição.`
+    : "JSON preserva store e metadados do Chromium; Netscape é indicado apenas para cookies não particionados.";
+}
+
+function resetImportEditor() {
+  importAnalysisGeneration += 1;
+  state.importReport = null;
+  state.importFilename = "";
+  $("#import-file").value = "";
+  $("#import-text").value = "";
+  $("#import-file-name").textContent = "Nenhum arquivo selecionado";
+  $("#import-summary").textContent = "Escolha um TXT para analisar todos os registros.";
+  $("#import-summary").dataset.tone = "";
+  $("#transfer-submit").disabled = true;
+}
+
+async function analyzeImportText() {
+  const generation = ++importAnalysisGeneration;
+  const text = $("#import-text").value;
+  const bytes = new Blob([text]).size;
+  if (!text.trim()) {
+    state.importReport = null;
+    $("#import-summary").textContent = "O arquivo não contém cookies.";
+    $("#import-summary").dataset.tone = "warning";
+    $("#transfer-submit").disabled = true;
+    return null;
+  }
+  if (bytes > MAX_IMPORT_FILE_BYTES) {
+    throw new Error("O arquivo excede 32 MiB. Divida-o em partes menores antes de importar.");
+  }
+
+  $("#import-summary").textContent = "Analisando cookies e verificando substituições…";
+  $("#import-summary").dataset.tone = "";
+  $("#transfer-submit").disabled = true;
+  const report = parseImportReport(text);
+  const [resolvedCookies, currentCookies] = await Promise.all([
+    resolveImportCookies(report.cookies),
+    getAllCookies()
+  ]);
+  if (generation !== importAnalysisGeneration) return null;
+  const deduplicated = new Map();
+  let resolvedDuplicates = report.duplicates;
+  for (const cookie of resolvedCookies) {
+    const id = cookieId(cookie);
+    if (deduplicated.has(id)) {
+      resolvedDuplicates += 1;
+      deduplicated.delete(id);
+    }
+    deduplicated.set(id, cookie);
+  }
+  const cookies = [...deduplicated.values()];
+  const currentIds = new Set(currentCookies.map(cookieId));
+  const overwrites = cookies.filter((cookie) => currentIds.has(cookieId(cookie))).length;
+  state.importReport = { ...report, cookies, duplicates: resolvedDuplicates, overwrites };
+  const details = [
+    `${cookies.length} válido(s)`,
+    overwrites ? `${overwrites} substituição(ões)` : "nenhuma substituição",
+    resolvedDuplicates ? `${resolvedDuplicates} duplicata(s)` : "sem duplicatas",
+    report.invalid.length ? `${report.invalid.length} linha(s) inválida(s)` : "sem linhas inválidas"
+  ];
+  $("#import-summary").textContent = details.join(" · ");
+  $("#import-summary").dataset.tone = report.invalid.length ? "warning" : "success";
+  $("#transfer-submit").disabled = cookies.length === 0;
+  return state.importReport;
 }
 
 elements.domainList.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-domain]"); if (!button) return;
-  state.domain = button.dataset.domain || null; state.onlyProtected = false; state.selected.clear(); render();
+  state.domain = button.dataset.domain || null; state.onlyProtected = false; state.settingsOpen = false; state.selected.clear(); elements.settingsView.classList.add("hidden"); elements.cookiesView.classList.remove("hidden"); render();
 });
-$("#show-protected").addEventListener("click", () => { state.domain = null; state.onlyProtected = true; state.selected.clear(); elements.settingsView.classList.add("hidden"); elements.cookiesView.classList.remove("hidden"); render(); });
-$("#show-settings").addEventListener("click", () => { elements.cookiesView.classList.add("hidden"); elements.settingsView.classList.remove("hidden"); elements.eyebrow.textContent = "PREFERÊNCIAS"; elements.title.textContent = "Configurações"; });
+$("#show-protected").addEventListener("click", () => { state.domain = null; state.onlyProtected = true; state.settingsOpen = false; state.selected.clear(); elements.settingsView.classList.add("hidden"); elements.cookiesView.classList.remove("hidden"); render(); });
+$("#show-settings").addEventListener("click", () => {
+  state.onlyProtected = false;
+  state.settingsOpen = true;
+  elements.cookiesView.classList.add("hidden");
+  elements.settingsView.classList.remove("hidden");
+  render();
+});
 elements.domainSearch.addEventListener("input", () => { state.domainSearch = elements.domainSearch.value; renderDomains(); });
-elements.cookieSearch.addEventListener("input", () => { state.cookieSearch = elements.cookieSearch.value; renderSummary(); renderRows(); });
+elements.cookieSearch.addEventListener("input", () => {
+  state.cookieSearch = elements.cookieSearch.value;
+  // A hidden selection must never survive a filter change and be deleted invisibly.
+  state.selected.clear();
+  renderSummary();
+  renderRows();
+});
 document.addEventListener("keydown", (event) => { if (event.key === "/" && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) { event.preventDefault(); elements.domainSearch.focus(); } });
 elements.selectAll.addEventListener("change", () => { for (const cookie of visibleCookies()) elements.selectAll.checked ? state.selected.add(cookieId(cookie)) : state.selected.delete(cookieId(cookie)); renderRows(); });
 elements.rows.addEventListener("click", (event) => {
   const edit = event.target.closest("[data-edit-cookie]"); if (edit) { openCookieDialog(findCookie(edit.dataset.editCookie)); return; }
   const checkbox = event.target.closest("[data-select-cookie]");
   const row = event.target.closest("tr[data-cookie-id]"); if (!row) return;
-  if (checkbox) checkbox.checked ? state.selected.add(row.dataset.cookieId) : state.selected.delete(row.dataset.cookieId);
-  else openCookieDialog(findCookie(row.dataset.cookieId)); renderRows();
+  if (!checkbox) return;
+  checkbox.checked ? state.selected.add(row.dataset.cookieId) : state.selected.delete(row.dataset.cookieId);
+  renderRows();
 });
 $("#new-cookie").addEventListener("click", () => openCookieDialog());
 $("#refresh").addEventListener("click", () => refresh());
-$("#delete-selected").addEventListener("click", deleteSelection);
-$("#protect-selected").addEventListener("click", protectSelection);
+$("#delete-selected").addEventListener("click", () => runAction(deleteSelection));
+$("#delete-all").addEventListener("click", () => runAction(deleteEveryCookie));
+$("#protect-selected").addEventListener("click", () => runAction(protectSelection));
+$("#unprotect-selected").addEventListener("click", () => runAction(unprotectSelection));
 elements.cookieForm.elements.session.addEventListener("change", () => { elements.cookieForm.elements.expiration.disabled = elements.cookieForm.elements.session.checked; });
-elements.cookieForm.addEventListener("submit", async (event) => { event.preventDefault(); try { await saveCookieForm(); elements.cookieDialog.close(); toast("Cookie salvo.", "success"); await refresh(); } catch (error) { elements.cookieError.textContent = error.message; } });
+elements.cookieForm.addEventListener("submit", async (event) => { event.preventDefault(); try { await saveCookieForm(); closeModal(elements.cookieDialog, "saved"); toast("Cookie salvo.", "success"); await refresh(); } catch (error) { elements.cookieError.textContent = error.message; } });
 $("#export-open").addEventListener("click", () => openTransfer("export")); $("#import-open").addEventListener("click", () => openTransfer("import"));
-$("#import-file").addEventListener("change", async (event) => { const [file] = event.target.files; if (file) $("#import-text").value = await file.text(); });
+$("#export-format").addEventListener("change", renderExportOptions);
+$("#import-file").addEventListener("change", async (event) => {
+  const [file] = event.target.files;
+  if (!file) return;
+  elements.transferError.textContent = "";
+  try {
+    if (file.size > MAX_IMPORT_FILE_BYTES) throw new Error("O arquivo excede 32 MiB. Divida-o em partes menores antes de importar.");
+    state.importFilename = file.name;
+    $("#import-file-name").textContent = file.name;
+    $("#import-text").value = await file.text();
+    await analyzeImportText();
+  } catch (error) {
+    state.importReport = null;
+    $("#transfer-submit").disabled = true;
+    elements.transferError.textContent = error.message;
+  }
+});
+$("#import-text").addEventListener("input", () => {
+  clearTimeout(analyzeImportText.timer);
+  analyzeImportText.timer = setTimeout(async () => {
+    elements.transferError.textContent = "";
+    try { await analyzeImportText(); } catch (error) {
+      state.importReport = null;
+      $("#transfer-submit").disabled = true;
+      elements.transferError.textContent = error.message;
+    }
+  }, 180);
+});
 elements.transferForm.addEventListener("submit", async (event) => {
   event.preventDefault(); elements.transferError.textContent = "";
   try {
@@ -246,17 +469,109 @@ elements.transferForm.addEventListener("submit", async (event) => {
       downloadText(format === "json" ? "ayla-cookies.json" : "cookies.txt", format === "json" ? exportJson(cookies) : exportNetscape(cookies), format === "json" ? "application/json" : "text/plain");
       toast(`${cookies.length} cookie(s) exportado(s).`, "success");
     } else {
-      const cookies = parseImport($("#import-text").value); const result = await importCookies(cookies);
-      toast(`${result.imported} importado(s), ${result.failed} falha(s).`, result.failed ? "danger" : "success"); await refresh();
+      const report = await analyzeImportText();
+      if (!report?.cookies.length) throw new Error("Nenhum cookie válido foi encontrado.");
+      if (report.overwrites || report.invalid.length) {
+        const confirmed = await confirmWithDialog(elements.confirmDialog, {
+          title: "Importar todos os cookies válidos?",
+          description: `${report.cookies.length} cookie(s) serão gravados; ${report.overwrites} existente(s) serão substituídos; ${report.invalid.length} linha(s) inválida(s) serão ignoradas.`,
+          confirmLabel: `Importar ${report.cookies.length}`
+        });
+        if (!confirmed) return;
+      }
+      let result;
+      try {
+        result = await importCookies(report.cookies);
+      } catch (error) {
+        await refresh();
+        throw error;
+      }
+      const tone = result.failed || report.invalid.length ? "danger" : "success";
+      toast(`${result.imported} importado(s); ${result.failed} falha(s); ${report.invalid.length} linha(s) ignorada(s).`, tone);
+      await refresh();
+      resetImportEditor();
     }
-    elements.transferDialog.close();
+    closeModal(elements.transferDialog, "completed");
   } catch (error) { elements.transferError.textContent = error.message; }
 });
 for (const [selector, key] of [["#setting-protection", "protectAgainstExternalDeletion"], ["#setting-autoclear", "autoClearOnStartup"], ["#setting-confirm", "confirmDestructiveActions"]]) {
-  $(selector).addEventListener("change", async (event) => { state.settings[key] = event.target.checked; state.settings = await saveSettings(state.settings); toast("Configuração salva.", "success"); });
+  $(selector).addEventListener("change", (event) => runAction(async () => {
+    state.settings = await saveSettingsPatch({ [key]: event.target.checked });
+    renderSettings();
+    toast("Configuração salva.", "success");
+  }));
 }
 document.querySelectorAll("[data-close-dialog]").forEach((button) => {
-  button.addEventListener("click", () => document.querySelector(`#${button.dataset.closeDialog}`).close());
+  button.addEventListener("click", () => closeModal(document.querySelector(`#${button.dataset.closeDialog}`)));
 });
 chrome.cookies.onChanged.addListener(() => { clearTimeout(refresh.timer); refresh.timer = setTimeout(() => refresh({ preserveSelection: true }), 160); });
-void refresh();
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes[settingsStorageKey()]) return;
+  clearTimeout(renderSettings.timer);
+  renderSettings.timer = setTimeout(() => {
+    runAction(async () => {
+      state.settings = await getSettings();
+      renderSettings();
+    });
+  }, 40);
+});
+
+async function handleManagerAction(action) {
+  if (action?.type === "import") {
+    if (elements.transferDialog.open && state.transferMode === "import") {
+      (state.importReport ? $("#transfer-submit") : $("#import-file")).focus();
+      return;
+    }
+    openTransfer("import");
+    return;
+  }
+  if (action?.type !== "delete-site" || !Number.isInteger(action.tabId)) return;
+
+  const tabId = action.tabId;
+  try {
+    const { tab, cookies } = await getCookiesForTab(tabId);
+    state.protectedRecords = await getProtectedCookies();
+    const protectedSet = protectedIds();
+    const removableCount = cookies.filter((cookie) => !protectedSet.has(cookieId(cookie))).length;
+    if (!removableCount) {
+      toast("Nenhum cookie não protegido para apagar.");
+      return;
+    }
+    const site = new URL(tab.url).hostname;
+    state.settings = await getSettings();
+    renderSettings();
+    if (state.settings.confirmDestructiveActions) {
+      const confirmed = await confirmWithDialog(elements.confirmDialog, {
+        title: `Apagar cookies de ${site}?`,
+        description: `${removableCount} cookie(s) não protegido(s) deste site serão apagados. Esta ação não pode ser desfeita.`,
+        confirmLabel: `Apagar ${removableCount}`
+      });
+      if (!confirmed) return;
+    }
+    const result = await removeUnprotectedCookies(cookies);
+    toast(`${result.removed} removido(s); ${result.skipped} protegido(s).`, result.failed ? "danger" : "success");
+    await refresh();
+  } catch (error) {
+    toast(error.message, "danger");
+  }
+}
+
+async function handlePendingAction() {
+  const currentUrl = new URL(location.href);
+  const type = currentUrl.searchParams.get("action");
+  const tabId = Number(currentUrl.searchParams.get("tabId"));
+  if (!type) return;
+  history.replaceState(null, "", chrome.runtime.getURL("manager.html"));
+  await handleManagerAction({ type, tabId });
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "manager-action") return undefined;
+  runAction(() => handleManagerAction(message.action));
+  return undefined;
+});
+
+void (async () => {
+  await refresh();
+  await handlePendingAction();
+})();

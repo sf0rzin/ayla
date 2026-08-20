@@ -25,6 +25,42 @@ function clientMetadata(request) {
   };
 }
 
+export async function persistSession(database, session) {
+  await database.transaction(async (client) => {
+    // Serialize session pruning and insertion for this account. Without this
+    // row lock, concurrent successful logins can all observe the same session
+    // count and exceed SESSION_LIMIT after committing.
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [session.userId]);
+    await client.query(
+      `UPDATE sessions
+       SET revoked_at = COALESCE(revoked_at, now())
+       WHERE user_id = $1
+         AND revoked_at IS NULL
+         AND id NOT IN (
+           SELECT id FROM sessions
+           WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
+           ORDER BY created_at DESC
+           LIMIT $2
+         )`,
+      [session.userId, SESSION_LIMIT - 1],
+    );
+    await client.query(
+      `INSERT INTO sessions
+         (id, user_id, token_hash, expires_at, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        session.id,
+        session.userId,
+        session.tokenDigest,
+        session.expiresAt,
+        session.ipAddress,
+        session.userAgent,
+      ],
+    );
+    await client.query("UPDATE users SET last_login_at = now() WHERE id = $1", [session.userId]);
+  });
+}
+
 export async function createAuthService(database, sessionTtlDays) {
   const dummyHash = await hashPassword(DUMMY_PASSWORD);
 
@@ -78,34 +114,13 @@ export async function createAuthService(database, sessionTtlDays) {
       const metadata = clientMetadata(request);
       const expiresAt = new Date(Date.now() + sessionTtlDays * 86_400_000);
 
-      await database.transaction(async (client) => {
-        await client.query(
-          `UPDATE sessions
-           SET revoked_at = COALESCE(revoked_at, now())
-           WHERE user_id = $1
-             AND revoked_at IS NULL
-             AND id NOT IN (
-               SELECT id FROM sessions
-               WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
-               ORDER BY created_at DESC
-               LIMIT $2
-             )`,
-          [user.id, SESSION_LIMIT - 1],
-        );
-        await client.query(
-          `INSERT INTO sessions
-             (id, user_id, token_hash, expires_at, ip_address, user_agent)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            sessionId,
-            user.id,
-            tokenHash(rawToken),
-            expiresAt,
-            metadata.ipAddress,
-            metadata.userAgent,
-          ],
-        );
-        await client.query("UPDATE users SET last_login_at = now() WHERE id = $1", [user.id]);
+      await persistSession(database, {
+        id: sessionId,
+        userId: user.id,
+        tokenDigest: tokenHash(rawToken),
+        expiresAt,
+        ipAddress: metadata.ipAddress,
+        userAgent: metadata.userAgent,
       });
 
       return {

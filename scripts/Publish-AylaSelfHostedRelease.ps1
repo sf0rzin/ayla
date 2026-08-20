@@ -209,9 +209,9 @@ if ($DryRun) {
 $ssh = (Get-Command ssh -CommandType Application -ErrorAction Stop).Source
 $scp = (Get-Command scp -CommandType Application -ErrorAction Stop).Source
 $target = "$SshUser@$SshHost"
-$stage = "/tmp/ayla-release-$normalizedVersion-$([guid]::NewGuid().ToString('N'))"
-$releaseDirectory = "/srv/ayla-public/updates/releases/$normalizedVersion"
-$stableDirectory = '/srv/ayla-public/updates/stable'
+$publishNonce = [guid]::NewGuid().ToString('N')
+$stage = "/tmp/ayla-release-$normalizedVersion-$publishNonce"
+$remotePublisherPath = Join-Path $projectRoot 'scripts\Publish-AylaSelfHostedRelease.remote.sh'
 
 try {
     Invoke-CheckedCommand -Executable $ssh -Operation 'Create remote staging directory' -Arguments @(
@@ -220,20 +220,11 @@ try {
     )
     Invoke-CheckedCommand -Executable $scp -Operation 'Upload signed release artifacts' -Arguments @(
         '-o', 'BatchMode=yes', '-i', $IdentityFile, '-P', [string]$SshPort,
-        $installerPath, $signaturePath, $metadataPath, "${target}:$stage/"
+        $installerPath, $signaturePath, $metadataPath, $remotePublisherPath, "${target}:$stage/"
     )
 
-    $remotePublish = "set -eu; " +
-        "test -f '$stage/$expectedInstallerName'; " +
-        "test -f '$stage/$expectedSignatureName'; " +
-        "test -f '$stage/latest.json'; " +
-        "sudo test ! -e '$releaseDirectory'; " +
-        "sudo install -d -m 0750 -o root -g caddy '$releaseDirectory' '$stableDirectory'; " +
-        "sudo install -m 0640 -o root -g caddy '$stage/$expectedInstallerName' '$releaseDirectory/$expectedInstallerName'; " +
-        "sudo install -m 0640 -o root -g caddy '$stage/$expectedSignatureName' '$releaseDirectory/$expectedSignatureName'; " +
-        "sudo install -m 0640 -o root -g caddy '$stage/latest.json' '$stableDirectory/.latest.json.tmp'; " +
-        "sudo mv -f '$stableDirectory/.latest.json.tmp' '$stableDirectory/latest.json'; " +
-        "rm -rf -- '$stage'"
+    $remotePublish = "sudo /bin/sh '$stage/Publish-AylaSelfHostedRelease.remote.sh' " +
+        "'$stage' '$normalizedVersion' '$installerHash' '$installerSize' '$publishNonce'"
     Invoke-CheckedCommand -Executable $ssh -Operation 'Atomically publish release' -Arguments @(
         '-o', 'BatchMode=yes', '-i', $IdentityFile, '-p', [string]$SshPort,
         $target, $remotePublish

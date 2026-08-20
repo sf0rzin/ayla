@@ -19,6 +19,7 @@
   --success: #63c58b;
   --danger: #e26d66;
   --warning: #d7b765;
+  --focus: #9dcaff;
   --radius-sm: 8px;
   --radius: 12px;
   --radius-lg: 16px;
@@ -31,16 +32,19 @@ html, body { margin: 0; min-width: 0; min-height: 100%; }
 body, button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 button, input, select, textarea { outline: 0; }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.22); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 button:disabled { opacity: 0.38; cursor: default !important; }
 .brand-row { display: flex; align-items: center; gap: 10px; }
 .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--raised); box-shadow: var(--highlight); font-size: 13px; font-weight: 600; }
 .brand-row > div:nth-child(2) { min-width: 0; display: grid; gap: 1px; }
 .brand-row strong { font-size: 13px; font-weight: 600; }
-.brand-row span { color: var(--dim); font-size: 9px; }
+.brand-row span { color: var(--dim); font-size: 10px; }
 .status-dot { width: 7px; height: 7px; margin-left: auto; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px rgba(99, 197, 139, 0.1); }
-.eyebrow { color: var(--dim); font-size: 9px; font-weight: 600; letter-spacing: .08em; }
+.eyebrow { color: var(--dim); font-size: 10px; font-weight: 600; letter-spacing: .08em; }
 .primary { border-color: #e3e3e3 !important; color: #151515 !important; background: #e3e3e3 !important; font-weight: 600; }
 .primary:hover { background: #fff !important; }
 .danger { color: var(--danger) !important; }
+.danger-solid { border-color: rgba(226, 109, 102, .42) !important; color: #ffd9d6 !important; background: rgba(226, 109, 102, .13) !important; }
+.danger-solid:hover { border-color: rgba(226, 109, 102, .7) !important; color: #fff !important; background: rgba(226, 109, 102, .23) !important; }
 .hidden { display: none !important; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }

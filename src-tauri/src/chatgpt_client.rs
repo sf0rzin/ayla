@@ -1,13 +1,17 @@
-use crate::{auth_artifact::PreparedChatGptAuth, proxy_store::StoredProxy};
+use crate::{
+    auth_artifact::{ChatGptEndpoint, PreparedChatGptAuth},
+    module_probe::ProbeControl,
+    proxy_store::StoredProxy,
+};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    io::Read,
     sync::atomic::{AtomicUsize, Ordering},
-    thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use ureq::{Agent, Proxy, ProxyProtocol};
+use tokio::runtime::Runtime;
+use wreq::{Client, Proxy, redirect};
 
 const SESSION_URL: &str = "https://chatgpt.com/api/auth/session";
 const ACCOUNTS_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
@@ -16,6 +20,7 @@ const HOME_URL: &str = "https://chatgpt.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROXY_ATTEMPTS: usize = 4;
+const CANCELLATION_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatGptPlan {
@@ -27,9 +32,19 @@ pub(crate) enum ChatGptPlan {
     Enterprise,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatGptPlanLookup {
+    Known(ChatGptPlan),
+    /// A valid response described an entitlement or tier Ayla does not recognize.
+    Unknown,
+    /// The plan endpoints could not provide a usable response within the probe budget.
+    Unavailable,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatGptProbeStatus {
     Active(ChatGptPlan),
+    Authenticated(ChatGptPlanLookup),
     Dead,
     RateLimited,
     Error,
@@ -42,14 +57,16 @@ pub(crate) struct ChatGptProbeResult {
 }
 
 pub(crate) trait ChatGptProber: Send + Sync + 'static {
-    fn check(&self, auth: &PreparedChatGptAuth) -> ChatGptProbeResult;
+    fn check(&self, auth: &PreparedChatGptAuth, control: &dyn ProbeControl) -> ChatGptProbeResult;
 }
 
 pub(crate) struct ChatGptProbePool {
-    agents: Vec<Agent>,
+    runtime: Runtime,
+    clients: Vec<Client>,
     proxy_count: usize,
     retries: u8,
-    next_agent: AtomicUsize,
+    timeout: Duration,
+    next_client: AtomicUsize,
 }
 
 impl ChatGptProbePool {
@@ -59,31 +76,43 @@ impl ChatGptProbePool {
         proxies: &[StoredProxy],
     ) -> Result<Self, String> {
         let timeout = Duration::from_millis(timeout_ms.clamp(3_000, 120_000));
-        let agents = if proxies.is_empty() {
-            vec![build_agent(timeout, None)?]
+        let clients = if proxies.is_empty() {
+            vec![build_client(timeout, None)?]
         } else {
-            let mut agents = Vec::with_capacity(proxies.len());
+            let mut clients = Vec::with_capacity(proxies.len());
             let mut last_error = None;
             for stored in proxies {
-                match proxy_from_stored(stored).and_then(|proxy| build_agent(timeout, Some(proxy)))
-                {
-                    Ok(agent) => agents.push(agent),
+                match build_proxy(stored).and_then(|proxy| build_client(timeout, Some(proxy))) {
+                    Ok(client) => clients.push(client),
                     Err(error) => last_error = Some(error),
                 }
             }
-            if agents.is_empty() {
+            if clients.is_empty() {
                 return Err(
                     last_error.unwrap_or_else(|| "no usable proxy is available".to_string())
                 );
             }
-            agents
+            clients
         };
-        let proxy_count = if proxies.is_empty() { 0 } else { agents.len() };
+        let proxy_count = if proxies.is_empty() { 0 } else { clients.len() };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("ayla-chatgpt-http")
+            .worker_threads(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(2)
+                    .clamp(2, 4),
+            )
+            .build()
+            .map_err(|_| "unable to initialize the ChatGPT network runtime".to_string())?;
         Ok(Self {
-            agents,
+            runtime,
+            clients,
             proxy_count,
             retries: retries.min(5),
-            next_agent: AtomicUsize::new(0),
+            timeout,
+            next_client: AtomicUsize::new(0),
         })
     }
 
@@ -93,32 +122,48 @@ impl ChatGptProbePool {
 }
 
 impl ChatGptProber for ChatGptProbePool {
-    fn check(&self, auth: &PreparedChatGptAuth) -> ChatGptProbeResult {
-        let start = self.next_agent.fetch_add(1, Ordering::Relaxed) % self.agents.len();
+    fn check(&self, auth: &PreparedChatGptAuth, control: &dyn ProbeControl) -> ChatGptProbeResult {
+        if control.is_cancelled() {
+            return error_result(0);
+        }
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .unwrap_or_else(Instant::now);
+        let start = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
         let mut previous_retries = 0usize;
 
-        for (attempt, index) in proxy_attempt_indices(start, self.agents.len())
+        for (attempt, index) in proxy_attempt_indices(start, self.clients.len())
             .into_iter()
             .enumerate()
         {
-            match self.check_with_agent(&self.agents[index], auth) {
+            if control.is_cancelled() || Instant::now() >= deadline {
+                return error_result(previous_retries);
+            }
+            match self.runtime.block_on(self.check_with_client(
+                &self.clients[index],
+                auth,
+                control,
+                deadline,
+            )) {
                 Ok(mut result) => {
+                    if control.is_cancelled() {
+                        return error_result(previous_retries.saturating_add(result.retries));
+                    }
                     result.retries = result.retries.saturating_add(previous_retries);
                     return result;
                 }
                 Err(failure) => {
                     previous_retries = previous_retries.saturating_add(failure.retries);
-                    if attempt + 1 < self.agents.len().min(MAX_PROXY_ATTEMPTS) {
+                    if failure.kind.can_failover()
+                        && attempt + 1 < self.clients.len().min(MAX_PROXY_ATTEMPTS)
+                        && !control.is_cancelled()
+                        && Instant::now() < deadline
+                    {
                         previous_retries = previous_retries.saturating_add(1);
                         continue;
                     }
                     return ChatGptProbeResult {
-                        status: match failure.kind {
-                            FailureKind::RateLimited => ChatGptProbeStatus::RateLimited,
-                            FailureKind::Transient => ChatGptProbeStatus::Error,
-                            FailureKind::Dead => ChatGptProbeStatus::Dead,
-                            FailureKind::Permanent => ChatGptProbeStatus::Error,
-                        },
+                        status: failure.kind.status(),
                         retries: previous_retries,
                     };
                 }
@@ -133,12 +178,25 @@ impl ChatGptProber for ChatGptProbePool {
 }
 
 impl ChatGptProbePool {
-    fn check_with_agent(
+    async fn check_with_client(
         &self,
-        agent: &Agent,
+        client: &Client,
         auth: &PreparedChatGptAuth,
+        control: &dyn ProbeControl,
+        deadline: Instant,
     ) -> Result<ChatGptProbeResult, HttpFailure> {
-        let session = match get_with_retry(agent, SESSION_URL, auth, None, self.retries) {
+        let session = match get_with_retry(
+            client,
+            ChatGptEndpoint::Session,
+            SESSION_URL,
+            auth,
+            None,
+            self.retries,
+            control,
+            deadline,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(failure) if failure.kind.can_failover() => return Err(failure),
             Err(failure) => {
@@ -146,9 +204,10 @@ impl ChatGptProbePool {
                     status: match failure.kind {
                         FailureKind::Dead => ChatGptProbeStatus::Dead,
                         FailureKind::RateLimited => ChatGptProbeStatus::RateLimited,
-                        FailureKind::Transient | FailureKind::Permanent => {
-                            ChatGptProbeStatus::Error
-                        }
+                        FailureKind::Transient
+                        | FailureKind::Permanent
+                        | FailureKind::Cancelled
+                        | FailureKind::Deadline => ChatGptProbeStatus::Error,
                     },
                     retries: failure.retries,
                 });
@@ -179,10 +238,29 @@ impl ChatGptProbePool {
             });
         }
 
-        let (plan, plan_retries) = fetch_plan(agent, auth, &session.access_token, self.retries);
+        if control.is_cancelled() {
+            return Err(HttpFailure {
+                kind: FailureKind::Cancelled,
+                retries,
+            });
+        }
+        let (plan, plan_retries) = fetch_plan(
+            client,
+            auth,
+            &session.access_token,
+            self.retries,
+            control,
+            deadline,
+        )
+        .await?;
         retries = retries.saturating_add(plan_retries);
         Ok(ChatGptProbeResult {
-            status: ChatGptProbeStatus::Active(plan),
+            status: match plan {
+                ChatGptPlanLookup::Known(plan) => ChatGptProbeStatus::Active(plan),
+                unknown @ (ChatGptPlanLookup::Unknown | ChatGptPlanLookup::Unavailable) => {
+                    ChatGptProbeStatus::Authenticated(unknown)
+                }
+            },
             retries,
         })
     }
@@ -194,36 +272,55 @@ fn proxy_attempt_indices(start: usize, pool_size: usize) -> Vec<usize> {
         .collect()
 }
 
-fn build_agent(timeout: Duration, proxy: Option<Proxy>) -> Result<Agent, String> {
-    let config = Agent::config_builder()
-        .proxy(proxy)
-        .https_only(true)
-        .http_status_as_error(false)
-        .max_redirects(8)
-        .timeout_global(Some(timeout))
-        .build();
-    Ok(config.into())
+fn error_result(retries: usize) -> ChatGptProbeResult {
+    ChatGptProbeResult {
+        status: ChatGptProbeStatus::Error,
+        retries,
+    }
 }
 
-fn proxy_from_stored(stored: &StoredProxy) -> Result<Proxy, String> {
-    let protocol = match stored.protocol.as_str() {
-        "http" => ProxyProtocol::Http,
-        "socks4" => ProxyProtocol::Socks4A,
-        "socks5" => ProxyProtocol::Socks5h,
-        _ => return Err("unsupported proxy protocol".to_string()),
-    };
-    let mut builder = Proxy::builder(protocol)
-        .host(&stored.host)
-        .port(stored.port);
-    if let Some(username) = stored.username.as_deref() {
-        builder = builder.username(username);
-    }
-    if let Some(password) = stored.password.as_deref() {
-        builder = builder.password(password);
+fn build_client(timeout: Duration, proxy: Option<Proxy>) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .cookie_store(false)
+        .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(20)))
+        .read_timeout(timeout)
+        // A pre-rendered Cookie header is valid only for the requested endpoint path.
+        // Refuse redirects so the transport cannot reuse it for a different target.
+        .redirect(redirect::Policy::none())
+        .https_only(true)
+        .no_proxy();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
     }
     builder
         .build()
-        .map_err(|_| "the configured proxy is invalid".to_string())
+        .map_err(|_| "unable to initialize the ChatGPT browser transport".to_string())
+}
+
+fn build_proxy(stored: &StoredProxy) -> Result<Proxy, String> {
+    if stored.protocol == "socks4" && stored.username.is_some() {
+        return Err(
+            "authenticated SOCKS4 is not supported by the ChatGPT browser transport".to_string(),
+        );
+    }
+    let scheme = match stored.protocol.as_str() {
+        "http" => "http",
+        "socks4" => "socks4a",
+        "socks5" => "socks5h",
+        _ => return Err("unsupported proxy protocol".to_string()),
+    };
+    let host = if stored.host.contains(':') && !stored.host.starts_with('[') {
+        format!("[{}]", stored.host)
+    } else {
+        stored.host.clone()
+    };
+    let mut proxy = Proxy::all(format!("{scheme}://{host}:{}", stored.port))
+        .map_err(|_| "the configured proxy is invalid".to_string())?;
+    if let Some(username) = stored.username.as_deref() {
+        proxy = proxy.basic_auth(username, stored.password.as_deref().unwrap_or(""));
+    }
+    Ok(proxy)
 }
 
 #[derive(Default, Deserialize)]
@@ -246,17 +343,29 @@ struct HttpResponse {
     retries: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind {
     Dead,
     RateLimited,
     Transient,
     Permanent,
+    Cancelled,
+    Deadline,
 }
 
 impl FailureKind {
     fn can_failover(self) -> bool {
         matches!(self, Self::RateLimited | Self::Transient)
+    }
+
+    fn status(self) -> ChatGptProbeStatus {
+        match self {
+            Self::Dead => ChatGptProbeStatus::Dead,
+            Self::RateLimited => ChatGptProbeStatus::RateLimited,
+            Self::Transient | Self::Permanent | Self::Cancelled | Self::Deadline => {
+                ChatGptProbeStatus::Error
+            }
+        }
     }
 }
 
@@ -265,26 +374,45 @@ struct HttpFailure {
     retries: usize,
 }
 
-fn get_with_retry(
-    agent: &Agent,
+async fn get_with_retry(
+    client: &Client,
+    endpoint: ChatGptEndpoint,
     url: &str,
     auth: &PreparedChatGptAuth,
     bearer: Option<&str>,
     retries: u8,
+    control: &dyn ProbeControl,
+    deadline: Instant,
 ) -> Result<HttpResponse, HttpFailure> {
     let attempts = usize::from(retries) + 1;
     for attempt in 0..attempts {
-        if attempt > 0 {
-            thread::sleep(Duration::from_secs((1_u64 << (attempt - 1).min(3)).min(12)));
+        if control.is_cancelled() {
+            return Err(HttpFailure {
+                kind: FailureKind::Cancelled,
+                retries: attempt,
+            });
         }
-        match get_once(agent, url, auth, bearer) {
+        if Instant::now() >= deadline {
+            return Err(HttpFailure {
+                kind: FailureKind::Deadline,
+                retries: attempt,
+            });
+        }
+        if attempt > 0 {
+            let backoff = Duration::from_secs((1_u64 << (attempt - 1).min(3)).min(12));
+            cancellable_until(control, deadline, tokio::time::sleep(backoff))
+                .await
+                .map_err(|kind| HttpFailure {
+                    kind,
+                    retries: attempt,
+                })?;
+        }
+        match get_once(client, endpoint, url, auth, bearer, control, deadline).await {
             Ok(mut response) => {
                 response.retries = attempt;
                 return Ok(response);
             }
-            Err(kind)
-                if attempt + 1 < attempts
-                    && matches!(kind, FailureKind::RateLimited | FailureKind::Transient) => {}
+            Err(kind) if attempt + 1 < attempts && kind.can_failover() => {}
             Err(kind) => {
                 return Err(HttpFailure {
                     kind,
@@ -299,43 +427,50 @@ fn get_with_retry(
     })
 }
 
-fn get_once(
-    agent: &Agent,
+async fn get_once(
+    client: &Client,
+    endpoint: ChatGptEndpoint,
     url: &str,
     auth: &PreparedChatGptAuth,
     bearer: Option<&str>,
+    control: &dyn ProbeControl,
+    deadline: Instant,
 ) -> Result<HttpResponse, FailureKind> {
-    let mut request = agent
+    let now = now_unix().ok_or(FailureKind::Permanent)?;
+    let mut request = client
         .get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "application/json, text/plain, */*")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Referer", HOME_URL)
         .header("Origin", "https://chatgpt.com")
-        .header("oai-language", "en-US")
-        .header("Cookie", auth.cookie_header());
-    if let Some(device_id) = auth.device_id() {
+        .header("oai-language", "en-US");
+    if let Some(cookie_header) = auth
+        .cookie_header_for(endpoint, now)
+        .map_err(|_| FailureKind::Permanent)?
+    {
+        request = request.header("Cookie", cookie_header);
+    } else if bearer.is_none_or(str::is_empty) {
+        return Err(FailureKind::Permanent);
+    }
+    if let Some(device_id) = auth.device_id_for(endpoint, now) {
         request = request.header("oai-device-id", device_id);
     }
     if let Some(token) = bearer.filter(|token| !token.is_empty()) {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
-    let mut response = request.call().map_err(|_| FailureKind::Transient)?;
-    let status = response.status().as_u16();
-    // Cap the read with take() so an oversized body is truncated and rejected as a
-    // non-retryable Permanent failure, instead of surfacing as a Transient read error that
-    // would be retried and failed over across every proxy, re-downloading it each time.
-    let mut body = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take((MAX_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut body)
+    let response = cancellable_until(control, deadline, request.send())
+        .await?
         .map_err(|_| FailureKind::Transient)?;
-    if body.len() > MAX_RESPONSE_BYTES {
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
         return Err(FailureKind::Permanent);
     }
+    let body = cancellable_until(control, deadline, read_bounded_body(response)).await??;
     if is_cloudflare_body(status, &body) || status == 429 {
         return Err(FailureKind::RateLimited);
     }
@@ -347,78 +482,111 @@ fn get_once(
     }
 }
 
-fn fetch_plan(
-    agent: &Agent,
+async fn fetch_plan(
+    client: &Client,
     auth: &PreparedChatGptAuth,
     access_token: &str,
     retries: u8,
-) -> (ChatGptPlan, usize) {
+    control: &dyn ProbeControl,
+    deadline: Instant,
+) -> Result<(ChatGptPlanLookup, usize), HttpFailure> {
     let mut retried = 0usize;
-    if !access_token.is_empty() {
-        match get_with_retry(agent, ACCOUNTS_URL, auth, Some(access_token), retries) {
-            Ok(response) => {
-                retried = retried.saturating_add(response.retries);
-                if let Ok(root) = serde_json::from_slice::<Value>(&response.body) {
-                    return (extract_plan(&root), retried);
-                }
-            }
-            Err(error) => retried = retried.saturating_add(error.retries),
-        }
-    }
-    match get_with_retry(agent, ACCOUNTS_URL, auth, None, retries) {
-        Ok(response) => {
-            retried = retried.saturating_add(response.retries);
-            if let Ok(root) = serde_json::from_slice::<Value>(&response.body) {
-                return (extract_plan(&root), retried);
-            }
-        }
-        Err(error) => retried = retried.saturating_add(error.retries),
-    }
+    let mut saw_unknown = false;
+    let attempts = [
+        (
+            ChatGptEndpoint::Accounts,
+            ACCOUNTS_URL,
+            (!access_token.is_empty()).then_some(access_token),
+        ),
+        (ChatGptEndpoint::Accounts, ACCOUNTS_URL, None),
+        (
+            ChatGptEndpoint::Me,
+            ME_URL,
+            (!access_token.is_empty()).then_some(access_token),
+        ),
+        (ChatGptEndpoint::Me, ME_URL, None),
+    ];
 
-    for bearer in [Some(access_token), None] {
-        if bearer.is_some_and(str::is_empty) {
-            continue;
-        }
-        match get_with_retry(agent, ME_URL, auth, bearer, retries) {
+    for (endpoint, url, bearer) in attempts {
+        match get_with_retry(
+            client, endpoint, url, auth, bearer, retries, control, deadline,
+        )
+        .await
+        {
             Ok(response) => {
                 retried = retried.saturating_add(response.retries);
-                // The /me body may carry entitlement/account fields; derive the plan from
-                // it rather than assuming Free for an otherwise live account.
-                if let Ok(root) = serde_json::from_slice::<Value>(&response.body) {
-                    return (extract_plan(&root), retried);
+                match classify_plan_body(&response.body) {
+                    known @ ChatGptPlanLookup::Known(_) => return Ok((known, retried)),
+                    ChatGptPlanLookup::Unknown => saw_unknown = true,
+                    ChatGptPlanLookup::Unavailable => {}
                 }
-                return (ChatGptPlan::Free, retried);
             }
-            Err(error) => retried = retried.saturating_add(error.retries),
+            Err(error) if error.kind == FailureKind::Cancelled => return Err(error),
+            Err(error) => {
+                retried = retried.saturating_add(error.retries);
+                if error.kind == FailureKind::Deadline {
+                    break;
+                }
+            }
         }
     }
-    (ChatGptPlan::Free, retried)
+    Ok((
+        if saw_unknown {
+            ChatGptPlanLookup::Unknown
+        } else {
+            ChatGptPlanLookup::Unavailable
+        },
+        retried,
+    ))
 }
 
-fn extract_plan(root: &Value) -> ChatGptPlan {
+fn classify_plan_body(body: &[u8]) -> ChatGptPlanLookup {
+    serde_json::from_slice::<Value>(body)
+        .map(|root| extract_plan(&root))
+        .unwrap_or(ChatGptPlanLookup::Unavailable)
+}
+
+#[cfg(test)]
+fn classify_plan_response(status: u16, body: &[u8]) -> ChatGptPlanLookup {
+    if status == 200 {
+        classify_plan_body(body)
+    } else {
+        ChatGptPlanLookup::Unavailable
+    }
+}
+
+fn extract_plan(root: &Value) -> ChatGptPlanLookup {
     let Some(root_object) = root.as_object() else {
-        return ChatGptPlan::Free;
+        return ChatGptPlanLookup::Unknown;
     };
-    let mut best = ChatGptPlan::Free;
     if let Some(accounts) = root_object.get("accounts").and_then(Value::as_object) {
-        if let Some(default) = accounts.get("default") {
-            best = plan_from_account(default);
-        }
+        let mut best = None;
+        let mut saw_unknown = false;
         for account in accounts.values() {
-            let candidate = plan_from_account(account);
-            if plan_rank(candidate) > plan_rank(best) {
-                best = candidate;
+            match plan_from_account(account) {
+                ChatGptPlanLookup::Known(candidate)
+                    if best.is_none_or(|current| plan_rank(candidate) > plan_rank(current)) =>
+                {
+                    best = Some(candidate);
+                }
+                ChatGptPlanLookup::Known(_) => {}
+                ChatGptPlanLookup::Unknown | ChatGptPlanLookup::Unavailable => saw_unknown = true,
             }
         }
-        return best;
+        return match best {
+            Some(plan) if plan != ChatGptPlan::Free || !saw_unknown => {
+                ChatGptPlanLookup::Known(plan)
+            }
+            _ => ChatGptPlanLookup::Unknown,
+        };
     }
     if root_object.contains_key("entitlement") || root_object.contains_key("account") {
         return plan_from_account(root);
     }
-    ChatGptPlan::Free
+    ChatGptPlanLookup::Unknown
 }
 
-fn plan_from_account(value: &Value) -> ChatGptPlan {
+fn plan_from_account(value: &Value) -> ChatGptPlanLookup {
     let entitlement = value.get("entitlement").and_then(Value::as_object);
     let account = value.get("account").and_then(Value::as_object);
     let subscription = entitlement
@@ -429,25 +597,30 @@ fn plan_from_account(value: &Value) -> ChatGptPlan {
     let plan_type = account.and_then(|node| first_string(node, &["plan_type", "planType"]));
 
     if active == Some(false) {
-        // A seat-based Team/Enterprise member commonly reports has_active_subscription=false
-        // while the tier lives in subscription_plan, so consult both fields before Free.
         for candidate in [
-            plan_type.map(normalize_plan),
-            subscription.map(normalize_plan),
+            plan_type.and_then(normalize_plan),
+            subscription.and_then(normalize_plan),
         ]
         .into_iter()
         .flatten()
         {
             if matches!(candidate, ChatGptPlan::Team | ChatGptPlan::Enterprise) {
-                return candidate;
+                return ChatGptPlanLookup::Known(candidate);
             }
         }
-        return ChatGptPlan::Free;
+        // An explicit negative entitlement confirms that a personal account currently
+        // has no paid subscription. This is the only implicit route to a Free verdict.
+        return ChatGptPlanLookup::Known(ChatGptPlan::Free);
     }
     if let Some(subscription) = subscription {
-        return normalize_plan(subscription);
+        return normalize_plan(subscription)
+            .map(ChatGptPlanLookup::Known)
+            .unwrap_or(ChatGptPlanLookup::Unknown);
     }
-    plan_type.map(normalize_plan).unwrap_or(ChatGptPlan::Free)
+    plan_type
+        .and_then(normalize_plan)
+        .map(ChatGptPlanLookup::Known)
+        .unwrap_or(ChatGptPlanLookup::Unknown)
 }
 
 fn first_string<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
@@ -457,30 +630,31 @@ fn first_string<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_plan(raw: &str) -> ChatGptPlan {
+fn normalize_plan(raw: &str) -> Option<ChatGptPlan> {
     let normalized: String = raw
         .trim()
         .to_ascii_lowercase()
         .chars()
         .filter(|character| !matches!(character, ' ' | '_' | '-'))
         .collect();
-    // Paid tiers are matched before the generic "free" fallback so a plan string that
-    // merely contains "free" (e.g. a paid "free_trial") is not demoted to Free.
+    // Paid tiers are matched before explicit Free so a paid free-trial is not demoted.
     if normalized.contains("team") {
-        ChatGptPlan::Team
+        Some(ChatGptPlan::Team)
     } else if normalized.contains("enterprise") {
-        ChatGptPlan::Enterprise
+        Some(ChatGptPlan::Enterprise)
     } else if normalized == "go"
         || normalized.contains("chatgptgo")
         || normalized.ends_with("goplan")
     {
-        ChatGptPlan::Go
+        Some(ChatGptPlan::Go)
     } else if normalized.contains("pro") && !normalized.contains("plus") {
-        ChatGptPlan::Pro
+        Some(ChatGptPlan::Pro)
     } else if normalized.contains("plus") || normalized == "paid" {
-        ChatGptPlan::Plus
+        Some(ChatGptPlan::Plus)
+    } else if matches!(normalized.as_str(), "free" | "freeplan" | "chatgptfreeplan") {
+        Some(ChatGptPlan::Free)
     } else {
-        ChatGptPlan::Free
+        None
     }
 }
 
@@ -493,6 +667,66 @@ fn plan_rank(plan: ChatGptPlan) -> u8 {
         ChatGptPlan::Go => 5,
         ChatGptPlan::Free => 0,
     }
+}
+
+async fn cancellable_until<F, T>(
+    control: &dyn ProbeControl,
+    deadline: Instant,
+    future: F,
+) -> Result<T, FailureKind>
+where
+    F: std::future::Future<Output = T>,
+{
+    if control.is_cancelled() {
+        return Err(FailureKind::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(FailureKind::Deadline);
+    }
+    tokio::pin!(future);
+    let deadline = tokio::time::Instant::from_std(deadline);
+    tokio::select! {
+        biased;
+        _ = cancellation_watcher(control) => Err(FailureKind::Cancelled),
+        _ = tokio::time::sleep_until(deadline) => Err(FailureKind::Deadline),
+        output = &mut future => {
+            if control.is_cancelled() {
+                Err(FailureKind::Cancelled)
+            } else {
+                Ok(output)
+            }
+        },
+    }
+}
+
+async fn cancellation_watcher(control: &dyn ProbeControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(CANCELLATION_POLL).await;
+    }
+}
+
+async fn read_bounded_body(response: wreq::Response) -> Result<Vec<u8>, FailureKind> {
+    let stream = response.bytes_stream();
+    futures_util::pin_mut!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| FailureKind::Transient)?;
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .filter(|length| *length <= MAX_RESPONSE_BYTES)
+            .ok_or(FailureKind::Permanent)?;
+        body.reserve(next_len.saturating_sub(body.len()));
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn now_unix() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
 }
 
 fn is_cloudflare_body(status: u16, body: &[u8]) -> bool {
@@ -528,6 +762,16 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+        },
+        task::{Context, Poll},
+        thread,
+    };
 
     #[test]
     fn plan_extraction_matches_the_go_contract() {
@@ -542,7 +786,10 @@ mod tests {
                 }
             }
         });
-        assert!(extract_plan(&plus) == ChatGptPlan::Plus);
+        assert_eq!(
+            extract_plan(&plus),
+            ChatGptPlanLookup::Known(ChatGptPlan::Plus)
+        );
 
         let expired = json!({
             "accounts": {
@@ -555,9 +802,12 @@ mod tests {
                 }
             }
         });
-        assert!(extract_plan(&expired) == ChatGptPlan::Free);
-        assert!(normalize_plan("chatgptprolite") == ChatGptPlan::Pro);
-        assert!(normalize_plan("chatgptgoplan") == ChatGptPlan::Go);
+        assert_eq!(
+            extract_plan(&expired),
+            ChatGptPlanLookup::Known(ChatGptPlan::Free)
+        );
+        assert_eq!(normalize_plan("chatgptprolite"), Some(ChatGptPlan::Pro));
+        assert_eq!(normalize_plan("chatgptgoplan"), Some(ChatGptPlan::Go));
     }
 
     #[test]
@@ -581,11 +831,14 @@ mod tests {
 
     #[test]
     fn paid_trial_plan_is_not_demoted_to_free() {
-        assert!(normalize_plan("chatgpt plus plan free trial") == ChatGptPlan::Plus);
-        assert!(normalize_plan("pro_free_trial") == ChatGptPlan::Pro);
-        assert!(normalize_plan("team free trial") == ChatGptPlan::Team);
-        assert!(normalize_plan("free") == ChatGptPlan::Free);
-        assert!(normalize_plan("") == ChatGptPlan::Free);
+        assert_eq!(
+            normalize_plan("chatgpt plus plan free trial"),
+            Some(ChatGptPlan::Plus)
+        );
+        assert_eq!(normalize_plan("pro_free_trial"), Some(ChatGptPlan::Pro));
+        assert_eq!(normalize_plan("team free trial"), Some(ChatGptPlan::Team));
+        assert_eq!(normalize_plan("free"), Some(ChatGptPlan::Free));
+        assert_eq!(normalize_plan(""), None);
     }
 
     #[test]
@@ -601,7 +854,10 @@ mod tests {
                 }
             }
         });
-        assert!(extract_plan(&team_seat) == ChatGptPlan::Team);
+        assert_eq!(
+            extract_plan(&team_seat),
+            ChatGptPlanLookup::Known(ChatGptPlan::Team)
+        );
 
         // A lapsed personal subscription (no business tier) still demotes to Free.
         let lapsed = json!({
@@ -615,7 +871,52 @@ mod tests {
                 }
             }
         });
-        assert!(extract_plan(&lapsed) == ChatGptPlan::Free);
+        assert_eq!(
+            extract_plan(&lapsed),
+            ChatGptPlanLookup::Known(ChatGptPlan::Free)
+        );
+    }
+
+    #[test]
+    fn unavailable_and_unknown_plan_responses_never_become_free() {
+        assert_eq!(
+            classify_plan_response(429, br#"{"error":"rate limited"}"#),
+            ChatGptPlanLookup::Unavailable
+        );
+        assert_eq!(
+            classify_plan_response(500, br#"{"error":"temporary"}"#),
+            ChatGptPlanLookup::Unavailable
+        );
+        assert_eq!(
+            classify_plan_response(200, b"not-json"),
+            ChatGptPlanLookup::Unavailable
+        );
+
+        let future_tier = json!({
+            "accounts": {
+                "default": {
+                    "account": {"plan_type": "ultra-2027"},
+                    "entitlement": {
+                        "has_active_subscription": true,
+                        "subscription_plan": "chatgpt-ultra-2027"
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_plan(&future_tier), ChatGptPlanLookup::Unknown);
+
+        let explicit_free = json!({
+            "accounts": {
+                "default": {
+                    "account": {"plan_type": "free"},
+                    "entitlement": {"has_active_subscription": false}
+                }
+            }
+        });
+        assert_eq!(
+            extract_plan(&explicit_free),
+            ChatGptPlanLookup::Known(ChatGptPlan::Free)
+        );
     }
 
     #[test]
@@ -627,5 +928,92 @@ mod tests {
         assert!(FailureKind::RateLimited.can_failover());
         assert!(!FailureKind::Dead.can_failover());
         assert!(!FailureKind::Permanent.can_failover());
+    }
+
+    struct TestControl {
+        cancelled: AtomicBool,
+    }
+
+    impl ProbeControl for TestControl {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(AtomicOrdering::Acquire)
+        }
+
+        fn wait_cancelled(&self, duration: Duration) -> bool {
+            let started = Instant::now();
+            while !self.is_cancelled() && started.elapsed() < duration {
+                thread::yield_now();
+            }
+            self.is_cancelled()
+        }
+    }
+
+    struct PendingRequest {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for PendingRequest {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRequest {
+        fn drop(&mut self) {
+            self.dropped.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    #[test]
+    fn cancellation_aborts_in_flight_work_without_a_late_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let control = Arc::new(TestControl {
+            cancelled: AtomicBool::new(false),
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelling = Arc::clone(&control);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            cancelling.cancelled.store(true, AtomicOrdering::Release);
+        });
+
+        let started = Instant::now();
+        let result = runtime.block_on(cancellable_until(
+            control.as_ref(),
+            Instant::now() + Duration::from_secs(5),
+            PendingRequest {
+                dropped: Arc::clone(&dropped),
+            },
+        ));
+        worker.join().expect("cancellation thread");
+        assert_eq!(result, Err(FailureKind::Cancelled));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(dropped.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn per_artifact_deadline_aborts_in_flight_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let control = TestControl {
+            cancelled: AtomicBool::new(false),
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = runtime.block_on(cancellable_until(
+            &control,
+            Instant::now() + Duration::from_millis(25),
+            PendingRequest {
+                dropped: Arc::clone(&dropped),
+            },
+        ));
+        assert_eq!(result, Err(FailureKind::Deadline));
+        assert!(dropped.load(AtomicOrdering::Acquire));
     }
 }
