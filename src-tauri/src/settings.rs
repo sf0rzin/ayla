@@ -35,6 +35,7 @@ pub struct AppSettings {
     pub max_scan_files: Option<u32>,
     pub scan_budget_mib: Option<u32>,
     pub auto_check_updates: bool,
+    pub auto_install_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -49,6 +50,7 @@ impl Default for AppSettings {
             max_scan_files: Some(DEFAULT_MAX_SCAN_FILES),
             scan_budget_mib: Some(DEFAULT_SCAN_BUDGET_MIB),
             auto_check_updates: true,
+            auto_install_updates: true,
         }
     }
 }
@@ -324,6 +326,7 @@ mod tests {
             max_scan_files: Some(u32::MAX),
             scan_budget_mib: Some(u32::MAX),
             auto_check_updates: false,
+            auto_install_updates: false,
         }
         .normalized();
 

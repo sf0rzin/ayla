@@ -112,6 +112,7 @@ interface AppSettings {
   maxScanFiles: number | null;
   scanBudgetMib: number | null;
   autoCheckUpdates: boolean;
+  autoInstallUpdates: boolean;
 }
 
 type UpdatePhase = "idle" | "checking" | "current" | "available" | "downloading" | "ready" | "installing" | "restarting" | "blocked" | "error" | "unsupported";
@@ -144,6 +145,57 @@ const initialUpdateState: AppUpdateState = {
   downloadComplete: false,
   message: "Updates are signed and delivered through public GitHub Releases.",
 };
+
+// Memoria de tentativas de instalacao automatica, FORA do processo.
+// Um useRef morre junto com o app, e o instalador em modo passive mata e reabre
+// o app — entao um release mal etiquetado (latest.json anuncia 2.0.1 mas o
+// instalador entrega 2.0.0) viraria um laco infinito de baixar-instalar-morrer,
+// sem janela pratica para alguem desligar a preferencia. Com o registro em
+// disco, a segunda tentativa frustrada para o caminho automatico e devolve o
+// controle ao botao manual.
+const UPDATE_ATTEMPTS_KEY = "ayla.update-attempts";
+const MAX_AUTO_INSTALL_ATTEMPTS = 2;
+
+interface UpdateAttemptRecord {
+  version: string;
+  attempts: number;
+}
+
+function readUpdateAttempts(): UpdateAttemptRecord | null {
+  try {
+    const raw = localStorage.getItem(UPDATE_ATTEMPTS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<UpdateAttemptRecord>;
+    if (typeof parsed?.version !== "string" || typeof parsed?.attempts !== "number") return null;
+    return { version: parsed.version, attempts: parsed.attempts };
+  } catch {
+    return null;
+  }
+}
+
+function autoInstallAllowedFor(version: string): boolean {
+  const record = readUpdateAttempts();
+  if (!record || record.version !== version) return true;
+  return record.attempts < MAX_AUTO_INSTALL_ATTEMPTS;
+}
+
+function recordAutoInstallAttempt(version: string): void {
+  try {
+    const record = readUpdateAttempts();
+    const attempts = record && record.version === version ? record.attempts + 1 : 1;
+    localStorage.setItem(UPDATE_ATTEMPTS_KEY, JSON.stringify({ version, attempts }));
+  } catch {
+    // Sem localStorage o caminho automatico perde a rede de seguranca; nao vale
+    // derrubar a aplicacao por isso.
+  }
+}
+
+function clearUpdateAttempts(installedVersion: string): void {
+  const record = readUpdateAttempts();
+  if (record && record.version === installedVersion) {
+    try { localStorage.removeItem(UPDATE_ATTEMPTS_KEY); } catch { /* idem */ }
+  }
+}
 
 const updatePhaseLabels: Record<UpdatePhase, string> = {
   idle: "Ready",
@@ -758,6 +810,17 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   const updateDownloadedRef = useRef(false);
   const updateBusyRef = useRef(false);
   const autoCheckAttemptedRef = useRef(false);
+  // Versao ja armada nesta sessao, para o efeito nao reentrar.
+  const autoInstallArmedRef = useRef("");
+  // A decisao e congelada no momento da checagem, nao lida do valor corrente da
+  // preferencia. Dois motivos: o botao "Check manually" promete "without
+  // installing it", entao so a checagem automatica instala; e ligar o toggle
+  // depois nao pode instalar retroativamente um update ja pendente.
+  const lastCheckRef = useRef({ automatic: false, autoInstall: false });
+  // Espelho das settings para ser lido de dentro de callbacks com deps vazias.
+  const settingsRef = useRef<AppSettings | null>(null);
+  // Contagem regressiva visivel antes do reinicio, com opcao de adiar.
+  const [pendingRestart, setPendingRestart] = useState<{ version: string; secondsLeft: number } | null>(null);
   const [modulePreferences, setModulePreferences] = useState<Record<string, boolean>>(() => {
     try {
       return JSON.parse(localStorage.getItem("ayla.module-preferences") ?? "{}") as Record<string, boolean>;
@@ -813,6 +876,10 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
 
     updateBusyRef.current = true;
+    lastCheckRef.current = {
+      automatic,
+      autoInstall: Boolean(settingsRef.current?.autoInstallUpdates),
+    };
     setUpdateState((current) => ({
       ...current,
       phase: "checking",
@@ -923,11 +990,17 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
 
       const readiness = await invoke<UpdateInstallReadiness>("prepare_update_install");
       if (!readiness.canInstall) {
+        // Bloqueio NAO e falha: o download ja esta em disco e installUpdate()
+        // pula essa etapa numa proxima tentativa. Reagenda a contagem em vez de
+        // desistir da sessao inteira, que era o defeito anterior.
         setUpdateState((current) => ({
           ...current,
           phase: "blocked",
-          message: `Update downloaded. ${readiness.blockedReason ?? "Finish active work before installing."}`,
+          message: `Update downloaded. ${readiness.blockedReason ?? "Finish active work before installing."} Ayla will try again shortly.`,
         }));
+        if (lastCheckRef.current.autoInstall && pendingUpdateRef.current) {
+          setPendingRestart({ version: pendingUpdateRef.current.version, secondsLeft: 300 });
+        }
         return;
       }
       gateArmed = true;
@@ -1028,6 +1101,45 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     autoCheckAttemptedRef.current = true;
     void checkForUpdates(true);
   }, [checkForUpdates, settings?.autoCheckUpdates]);
+
+  useEffect(() => {
+    settingsRef.current = settings ?? null;
+  }, [settings]);
+
+  // Quando a versao instalada finalmente alcanca a que foi tentada, o registro
+  // e limpo. Isso tambem e o detector do release mal etiquetado: se a versao
+  // nunca alcanca, o contador nao zera e o caminho automatico para sozinho.
+  useEffect(() => {
+    if (appVersion) clearUpdateAttempts(appVersion);
+  }, [appVersion]);
+
+  // Atualizacao sem pedir aprovacao, mas NUNCA reiniciando de surpresa: o efeito
+  // apenas arma uma contagem regressiva visivel no shell. Baixar so comeca
+  // quando ela termina, entao adiar tambem poupa banda. A instalacao em si passa
+  // pelo mesmo installUpdate() do botao, logo assinatura e portao continuam
+  // valendo.
+  useEffect(() => {
+    if (!lastCheckRef.current.automatic || !lastCheckRef.current.autoInstall) return;
+    if (updateState.phase !== "available" || !updateState.version) return;
+    if (autoInstallArmedRef.current === updateState.version) return;
+    if (!autoInstallAllowedFor(updateState.version)) return;
+    autoInstallArmedRef.current = updateState.version;
+    recordAutoInstallAttempt(updateState.version);
+    setPendingRestart({ version: updateState.version, secondsLeft: 60 });
+  }, [updateState.phase, updateState.version]);
+
+  useEffect(() => {
+    if (!pendingRestart) return;
+    if (pendingRestart.secondsLeft <= 0) {
+      setPendingRestart(null);
+      void installUpdate();
+      return;
+    }
+    const timer = setTimeout(() => {
+      setPendingRestart((current) => (current ? { ...current, secondsLeft: current.secondsLeft - 1 } : null));
+    }, 1_000);
+    return () => clearTimeout(timer);
+  }, [installUpdate, pendingRestart]);
 
   useEffect(() => () => {
     const pending = pendingUpdateRef.current;
@@ -1174,6 +1286,39 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
         )}
 
         <div className="main-column">
+          {pendingRestart && (
+            <div className="notice" role="status" aria-live="polite">
+              <Download size={15} />
+              <div>
+                <strong>Ayla {pendingRestart.version} will be installed</strong>
+                <span>
+                  Ayla restarts in {pendingRestart.secondsLeft}s and you will need to sign in again. Save anything you typed.
+                </span>
+              </div>
+              <button
+                className="button small"
+                type="button"
+                onClick={() => {
+                  setPendingRestart(null);
+                  void installUpdate();
+                }}
+              >
+                Restart now
+              </button>
+              <button className="button outline small" type="button" onClick={() => setPendingRestart(null)}>
+                Not now
+              </button>
+            </div>
+          )}
+          {(updateState.phase === "downloading" || updateState.phase === "installing" || updateState.phase === "restarting") && (
+            <div className="notice" role="status" aria-live="polite">
+              <LoaderCircle className="is-spinning" size={15} />
+              <div>
+                <strong>{updatePhaseLabels[updateState.phase]}</strong>
+                <span>{updateState.message}</span>
+              </div>
+            </div>
+          )}
           <main className={`content page-${page}`}>
             {(["overview", "modules", "settings"] as const).some((resource) => resource === page && resourcePhases[resource] === "loading") && (
               <div className="notice" role="status">
@@ -2810,6 +2955,7 @@ function Settings({
   const [maxScanFiles, setMaxScanFiles] = useState(settings?.maxScanFiles === null ? 0 : settings?.maxScanFiles ?? DEFAULT_MAX_SCAN_FILES);
   const [scanBudgetMib, setScanBudgetMib] = useState(settings?.scanBudgetMib === null ? 0 : settings?.scanBudgetMib ?? DEFAULT_SCAN_BUDGET_MIB);
   const [autoCheckUpdates, setAutoCheckUpdates] = useState(settings?.autoCheckUpdates ?? true);
+  const [autoInstallUpdates, setAutoInstallUpdates] = useState(settings?.autoInstallUpdates ?? true);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -2823,12 +2969,13 @@ function Settings({
     setMaxScanFiles(settings.maxScanFiles === null ? 0 : settings.maxScanFiles ?? DEFAULT_MAX_SCAN_FILES);
     setScanBudgetMib(settings.scanBudgetMib === null ? 0 : settings.scanBudgetMib ?? DEFAULT_SCAN_BUDGET_MIB);
     setAutoCheckUpdates(settings.autoCheckUpdates ?? true);
+    setAutoInstallUpdates(settings.autoInstallUpdates ?? true);
   }, [settings]);
 
   async function save() {
     if (!settings) return;
     try {
-      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories: maxScanDirectories === 0 ? null : maxScanDirectories, maxScanFiles: maxScanFiles === 0 ? null : maxScanFiles, scanBudgetMib: scanBudgetMib === 0 ? null : scanBudgetMib, autoCheckUpdates } });
+      const saved = await invoke<AppSettings>("save_settings", { settings: { ...settings, threads, moduleThreads, delayMs, timeoutMs, retries, maxScanDirectories: maxScanDirectories === 0 ? null : maxScanDirectories, maxScanFiles: maxScanFiles === 0 ? null : maxScanFiles, scanBudgetMib: scanBudgetMib === 0 ? null : scanBudgetMib, autoCheckUpdates, autoInstallUpdates } });
       onSaved(saved);
       setMessage("Settings saved locally.");
     } catch (reason: unknown) {
@@ -2903,7 +3050,11 @@ function Settings({
             <div className="settings-row">
               <div className="settings-copy">
                 <strong>Automatically check for updates</strong>
-                <small>Checks at startup and always asks before downloading or installing.</small>
+                <small>
+                  {autoCheckUpdates
+                    ? "Looks for a newer signed release when Ayla starts."
+                    : "Ayla never looks for updates on its own."}
+                </small>
               </div>
               <button
                 className={autoCheckUpdates ? "switch-control active" : "switch-control"}
@@ -2912,6 +3063,24 @@ function Settings({
                 aria-checked={autoCheckUpdates}
                 aria-label="Automatically check for updates"
                 onClick={() => setAutoCheckUpdates((current) => !current)}
+                disabled={!settings}
+              >
+                <span />
+              </button>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-copy">
+                <strong>Install updates without asking</strong>
+                <small>No approval needed: Ayla warns you, counts down, then downloads, installs and restarts. You can postpone. A running task or proxy check always finishes first.</small>
+              </div>
+              <button
+                className={autoInstallUpdates ? "switch-control active" : "switch-control"}
+                type="button"
+                role="switch"
+                aria-checked={autoInstallUpdates}
+                aria-label="Install updates without asking"
+                onClick={() => setAutoInstallUpdates((current) => !current)}
                 disabled={!settings}
               >
                 <span />
