@@ -1,6 +1,6 @@
 [package]
 name = "ayla"
-version = "0.3.6"
+version = "0.3.7"
 description = "Ayla desktop application"
 authors = ["Ayla contributors"]
 edition = "2024"

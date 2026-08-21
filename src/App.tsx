@@ -817,8 +817,6 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   // installing it", entao so a checagem automatica instala; e ligar o toggle
   // depois nao pode instalar retroativamente um update ja pendente.
   const lastCheckRef = useRef({ automatic: false, autoInstall: false });
-  // Espelho das settings para ser lido de dentro de callbacks com deps vazias.
-  const settingsRef = useRef<AppSettings | null>(null);
   // Contagem regressiva visivel antes do reinicio, com opcao de adiar.
   const [pendingRestart, setPendingRestart] = useState<{ version: string; secondsLeft: number } | null>(null);
   const [modulePreferences, setModulePreferences] = useState<Record<string, boolean>>(() => {
@@ -862,7 +860,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     setAboutOpen(true);
   };
 
-  const checkForUpdates = useCallback(async (automatic = false) => {
+  const checkForUpdates = useCallback(async (automatic = false, autoInstall = false) => {
     if (updateBusyRef.current) return;
     if (!hasTauriRuntime()) {
       if (!automatic) {
@@ -876,10 +874,7 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
     }
 
     updateBusyRef.current = true;
-    lastCheckRef.current = {
-      automatic,
-      autoInstall: Boolean(settingsRef.current?.autoInstallUpdates),
-    };
+    lastCheckRef.current = { automatic, autoInstall };
     setUpdateState((current) => ({
       ...current,
       phase: "checking",
@@ -1099,12 +1094,13 @@ function WorkspaceApp({ user, onLogout }: { user: AuthUser; onLogout: () => void
   useEffect(() => {
     if (!settings?.autoCheckUpdates || autoCheckAttemptedRef.current) return;
     autoCheckAttemptedRef.current = true;
-    void checkForUpdates(true);
-  }, [checkForUpdates, settings?.autoCheckUpdates]);
-
-  useEffect(() => {
-    settingsRef.current = settings ?? null;
-  }, [settings]);
+    // A preferencia vai por ARGUMENTO, nao por ref. Um ref preenchido em outro
+    // useEffect so estaria pronto se aquele efeito fosse declarado antes deste —
+    // dependencia de ordem silenciosa, e foi exatamente o que quebrou a primeira
+    // versao: o ref ainda era null, autoInstall congelava como false e a
+    // contagem nunca armava.
+    void checkForUpdates(true, Boolean(settings?.autoInstallUpdates));
+  }, [checkForUpdates, settings?.autoCheckUpdates, settings?.autoInstallUpdates]);
 
   // Quando a versao instalada finalmente alcanca a que foi tentada, o registro
   // e limpo. Isso tambem e o detector do release mal etiquetado: se a versao
