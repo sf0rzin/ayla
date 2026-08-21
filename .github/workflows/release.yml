@@ -1,0 +1,1352 @@
+# =============================================================================
+# Ayla - release full-auto (build + assinatura + GitHub Release)
+# =============================================================================
+# Instalar como .github/workflows/release.yml
+#
+# MODELO DE PUBLICACAO (PULL)
+#   A VM de producao (Debian 13, VMID 101 "xyne", publicada em https://yl.xyne.gg
+#   por Cloudflare Tunnel) NAO tem SSH de entrada: fica atras de NAT e so sai por
+#   tunel. Por isso o CI nao empurra nada para o servidor. Ele so produz um
+#   GitHub Release assinado e imutavel; quem puxa, verifica e publica em
+#   /srv/ayla-public/updates e o agente que roda dentro da propria VM.
+#   Este arquivo termina exatamente na criacao do Release.
+#
+# O QUE ESTE WORKFLOW GARANTE
+#   1. A versao do tag bate com package.json, src-tauri/Cargo.toml e
+#      src-tauri/tauri.conf.json (e com a ProductVersion gravada no .exe).
+#   2. O par Ayla_<v>_x64-setup.exe + .sig e criptograficamente verificado por
+#      tools/update-verifier ANTES de qualquer coisa ser publicada.
+#   3. O latest.json anexado sai byte-a-byte no mesmo formato E com a mesma url
+#      publica que o scripts/Publish-AylaSelfHostedRelease.ps1 produz (ver
+#      secao "FORMATO CANONICO DO latest.json" no job de build). O agente da VM
+#      publica esse arquivo como esta - ele valida, nao reescreve.
+#   4. A chave privada de assinatura so existe no ambiente de UM unico passo, e
+#      esse passo esta num job que nao executa a suite de testes nem os
+#      postinstall das dependencias (ver job `validate`).
+#
+# =============================================================================
+# MITIGACOES QUE PRECISAM SER CONFIGURADAS NA UI DO GITHUB (o YAML sozinho nao
+# faz nada disso) - o usuario optou conscientemente por full-auto com a chave
+# privada como secret, entao estas travas sao o que sobra:
+# =============================================================================
+#
+#   a) GitHub Environment `release-signing`
+#      Settings > Environments > New environment > "release-signing".
+#      - Marque "Required reviewers" e adicione o(s) revisor(es). O job `build`
+#        declara esse environment, entao a execucao PARA e espera aprovacao
+#        humana ANTES de a chave privada ser injetada em qualquer processo.
+#      - Marque "Deployment branches and tags" > "Selected branches and tags" e
+#        permita apenas o padrao de tag `v*.*.*`. Isso impede que alguem rode o
+#        workflow a partir de um branch qualquer e alcance o secret.
+#
+#   b) ESCOPO MINIMO DO SECRET (importante)
+#      Cadastre TAURI_SIGNING_PRIVATE_KEY e TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#      como *Environment secrets* do `release-signing`, NAO como Repository
+#      secrets. Repository secrets ficam visiveis para qualquer workflow do
+#      repositorio; Environment secrets so sao entregues a um job que declara o
+#      environment - ou seja, so depois de passar pelo portao de revisao.
+#      E por isso que os testes vivem no job `validate`, que nao declara
+#      environment nenhum: e a separacao em jobs que faz esta trava valer
+#      alguma coisa. Dentro de um unico job, um postinstall que roda antes da
+#      assinatura escreve em $GITHUB_ENV/$GITHUB_PATH e alcanca o passo
+#      assinado do mesmo jeito.
+#
+#   c) Protecao de branch e de tag
+#      - Branch protection em `main`: exigir PR + review, proibir force-push.
+#      - Ruleset de tag para `v*`: "Restrict updates" e "Restrict deletions",
+#        para que um tag ja publicado nao possa ser movido para outro commit.
+#        O workflow ainda assim se defende disso: o job `prepare` resolve o tag
+#        para um commit SHA e todos os jobs seguintes trabalham nesse SHA fixo,
+#        e o job `publish` reconfere o tag antes de publicar.
+#
+#   d) Actions > General
+#      - "Require approval for all external collaborators" (ou mais restrito).
+#      - Deixe o debug logging do repositorio DESLIGADO. Com ACTIONS_STEP_DEBUG
+#        ligado o runner despeja informacao demais no log.
+#
+#   e) RISCO ACEITO, REGISTRADO AQUI POR HONESTIDADE
+#      src-tauri/tauri.conf.json usa `installMode: "passive"`. Todo binario
+#      assinado por esta pipeline instala nas maquinas dos usuarios sem
+#      interacao. Quem controla o que entra em `main` controla, na pratica,
+#      aquelas maquinas. As travas (a)-(d) existem para que isso exija um
+#      humano aprovando, e nao apenas um push.
+#
+# =============================================================================
+
+name: Release
+
+on:
+  # Gatilho normal: empurrar o tag publica a versao.
+  push:
+    tags:
+      - 'v*.*.*'
+
+  # Gatilho manual: re-executar a publicacao de um tag QUE JA EXISTE.
+  # De proposito este workflow nunca cria tags. Um release full-auto que tambem
+  # inventa o proprio tag apaga a unica evidencia independente de qual commit
+  # foi publicado.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer estavel a publicar, ex.: 0.3.3 (o tag v<version> ja precisa existir)'
+        required: true
+        type: string
+
+# Nada por padrao. Cada job pede so o que usa; apenas `publish` recebe
+# contents: write, e so no momento de criar o Release.
+permissions: {}
+
+# Um release por vez no repositorio inteiro (nao por ref): duas versoes
+# publicando em paralelo poderiam trocar de ordem na frente do updater.
+# cancel-in-progress: false porque cancelar um release no meio deixa um
+# rastro pior do que esperar.
+concurrency:
+  group: ayla-release
+  cancel-in-progress: false
+
+# Pinos da toolchain nativa. Moram no nivel do workflow porque agora DOIS jobs
+# Windows os consomem (`validate` e `build`), e uma versao fixada so pode
+# existir num lugar: se as duas copias divergissem, o job que valida deixaria
+# de validar exatamente o que o job que assina compila.
+# CARGO_TARGET_DIR continua por job de proposito - os dois nao podem
+# compartilhar diretorio de saida (ver o job `validate`).
+env:
+  TOOLCHAIN_ROOT: 'C:\ayla-toolchain'
+
+  # Baseline exigido pelo README. Fixado por download direto do fornecedor +
+  # SHA-256, e nao por choco/winget: o feed community do Chocolatey purga
+  # versoes antigas (um --version que funciona hoje vira "package version
+  # not found" sem aviso) e o winget nao e confiavel num runner que roda
+  # como servico sem sessao interativa.
+  CMAKE_VERSION: '4.4.2'
+  CMAKE_SHA256: 'e8139d85b3813bc38833142ae1940472e9a587e9b5d2718ac1804c60f4e57a64'
+
+  NASM_VERSION: '2.16.03'
+  NASM_SHA256: '3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6'
+
+  LLVM_VERSION: '22.1.8'
+  LLVM_SHA256: '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+
+  NPM_VERSION: '11.17.0'
+
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  # ===========================================================================
+  # JOB 1 - prepare
+  # ---------------------------------------------------------------------------
+  # Barato e sem segredo nenhum. Roda em ubuntu porque so le arquivos de texto:
+  # nao faz sentido acordar um runner Windows (e o portao de revisao humana) so
+  # para descobrir que alguem esqueceu de bumpar o Cargo.toml.
+  # Resolve tag -> commit SHA. Todos os jobs seguintes usam esse SHA, nunca o
+  # nome do tag, entao mover o tag depois nao muda o que foi compilado.
+  # ===========================================================================
+  prepare:
+    name: Resolve and validate the release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Impede que um fork rode a pipeline de release (e que um fork sequer
+    # apresente o prompt do environment).
+    # O slug e MINUSCULO (`sf0rzin/ayla`, como em AYLA_RELEASE_REPOSITORY do
+    # ayla-update-sync.service): `github.repository` preserva a caixa real do
+    # repositorio, entao a comparacao e sensivel a maiusculas e um
+    # 'sf0rzin/Ayla' aqui faria o workflow inteiro virar no-op silencioso.
+    if: github.repository == 'sf0rzin/ayla'
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.commit.outputs.sha }}
+      installer_name: ${{ steps.resolve.outputs.installer_name }}
+      signature_name: ${{ steps.resolve.outputs.signature_name }}
+
+    steps:
+      # SEGURANCA: `github.ref_name` e `inputs.version` sao texto controlavel por
+      # quem dispara o workflow. Nunca sao interpolados com ${{ }} dentro do
+      # corpo de um `run:` (isso e substituicao textual antes do shell existir,
+      # ou seja, injecao de comando). Entram por `env:` e sao lidos como
+      # variaveis, aqui e em todos os passos deste arquivo.
+      - name: Resolve and validate the release version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_REF_NAME: ${{ github.ref_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = 'push' ]; then
+            raw="$PUSH_REF_NAME"
+          else
+            raw="$DISPATCH_VERSION"
+          fi
+          raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+
+          # Mesma gramatica do ConvertTo-StableSemVer em
+          # scripts/Publish-AylaSelfHostedRelease.ps1: SemVer estavel, sem
+          # pre-release, sem build metadata, sem zero a esquerda. Um 'v' na
+          # ENTRADA e aceito e descartado; o filtro 'v*.*.*' do gatilho e um
+          # glob frouxo (deixa passar v1.2.3-rc1, v01.2.3) e nao substitui esta
+          # checagem.
+          if ! printf '%s' "$raw" | grep -Eq '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::Versao invalida: '${raw}'. Use SemVer estavel, ex.: 0.3.3 ou v0.3.3." >&2
+            exit 1
+          fi
+
+          version="${raw#v}"
+          tag="v${version}"
+
+          # Nomes derivados da versao, identicos aos de
+          # scripts/Publish-AylaSelfHostedRelease.ps1 e .remote.sh e ao par
+          # exigido por docs/self-hosted-updater.md.
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "installer_name=Ayla_${version}_x64-setup.exe"
+            echo "signature_name=Ayla_${version}_x64-setup.exe.sig"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Versao resolvida: ${version} (tag ${tag})"
+
+      # Checkout pelo tag. Se o tag nao existir (dispatch com versao errada),
+      # esta acao falha aqui, antes de qualquer coisa cara.
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.resolve.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin the tagged commit
+        id: commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse 'HEAD^{commit}')"
+
+          # Num push de tag, GITHUB_SHA ja e o commit apontado pelo tag. Se os
+          # dois divergirem, o tag foi movido entre o disparo e o checkout.
+          if [ "$EVENT_NAME" = 'push' ] && [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::O tag mudou de commit durante a execucao (evento ${GITHUB_SHA}, checkout ${sha})." >&2
+            exit 1
+          fi
+
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Commit fixado: ${sha}"
+
+      # Porteiro barato: as tres fontes de versao do repositorio tem de
+      # concordar entre si E com o tag. O publisher self-hosted faz a mesma
+      # checagem; fazemos aqui tambem para falhar em 30 segundos em vez de
+      # depois de 40 minutos de build.
+      - name: Validate every manifest version against the tag
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          assert_version() {
+            local label="$1" value="$2"
+            if ! printf '%s' "$value" | grep -Eq "$semver_re"; then
+              echo "::error::${label} nao contem um SemVer estavel: '${value}'." >&2
+              exit 1
+            fi
+            if [ "$value" != "$RELEASE_VERSION" ]; then
+              echo "::error::${label} esta em '${value}', mas o release pedido e '${RELEASE_VERSION}'." >&2
+              exit 1
+            fi
+            printf 'ok  %-28s -> %s\n' "$label" "$value"
+          }
+
+          package_version="$(jq -r '.version // ""' package.json)"
+          tauri_version="$(jq -r '.version // ""' src-tauri/tauri.conf.json)"
+
+          # Mesma logica do Get-CargoPackageVersion do publisher: le SOMENTE a
+          # primeira secao [package] e exige exatamente uma chave `version` ali
+          # dentro. Um `version` de [dependencies] nao pode ser confundido com o
+          # da crate.
+          cargo_version="$(
+            awk '
+              /^[[:space:]]*\[/ {
+                if (in_package) { exit }
+                in_package = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/) ? 1 : 0
+                next
+              }
+              in_package && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*(#.*)?$/ {
+                value = $0
+                sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", value)
+                sub(/".*$/, "", value)
+                count += 1
+                found = value
+              }
+              END { if (count != 1) { exit 1 } print found }
+            ' src-tauri/Cargo.toml
+          )" || {
+            echo '::error::Nao foi possivel identificar exatamente uma versao [package] em src-tauri/Cargo.toml.' >&2
+            exit 1
+          }
+
+          assert_version 'package.json'               "$package_version"
+          assert_version 'src-tauri/tauri.conf.json'  "$tauri_version"
+          assert_version 'src-tauri/Cargo.toml'       "$cargo_version"
+
+          # O bundler so emite o .sig quando createUpdaterArtifacts esta ligado.
+          # Esse override mora em tauri.release.conf.json de proposito, para que
+          # builds normais nunca precisem da chave de assinatura.
+          updater_artifacts="$(jq -r '.bundle.createUpdaterArtifacts' src-tauri/tauri.release.conf.json)"
+          if [ "$updater_artifacts" != 'true' ]; then
+            echo '::error::src-tauri/tauri.release.conf.json precisa manter bundle.createUpdaterArtifacts = true.' >&2
+            exit 1
+          fi
+          echo 'ok  src-tauri/tauri.release.conf.json -> createUpdaterArtifacts = true'
+
+          # Sem pubkey no tauri.conf.json o updater instalado nao valida nada.
+          pubkey="$(jq -r '.plugins.updater.pubkey // ""' src-tauri/tauri.conf.json)"
+          if [ -z "$pubkey" ]; then
+            echo '::error::src-tauri/tauri.conf.json nao declara plugins.updater.pubkey.' >&2
+            exit 1
+          fi
+          echo 'ok  src-tauri/tauri.conf.json -> plugins.updater.pubkey presente'
+
+  # ===========================================================================
+  # JOB 2 - validate
+  # ---------------------------------------------------------------------------
+  # Aqui roda TODO o codigo de terceiros do repositorio: os postinstall do
+  # `npm ci`, o tsc/vite, os testes de API e extensao, e o `cargo test` com os
+  # build scripts das crates de teste. Este job NAO declara `environment:`,
+  # entao o runner nao lhe entrega os Environment secrets do `release-signing`:
+  # a chave privada nao existe em lugar nenhum desta maquina.
+  #
+  # POR QUE UM JOB SEPARADO, e nao apenas passos anteriores dentro do `build`:
+  # dentro de um mesmo job, qualquer processo disparado por `npm ci` ou
+  # `npm run check` pode acrescentar linhas ao arquivo apontado por
+  # $GITHUB_ENV / $GITHUB_PATH - que o runner aplica aos passos SEGUINTES, ou
+  # seja, ao passo que assina -, sobrescrever `node_modules\.bin\tauri` e o
+  # proprio @tauri-apps/cli, ou deixar executaveis de build script no
+  # CARGO_TARGET_DIR para o cargo reaproveitar sem recompilar. Nada disso
+  # atravessa a fronteira de um job: o runner e outro, o workspace e outro, e
+  # so os outputs declarados passam. O portao humano do environment tambem nao
+  # resolveria esse caso - a aprovacao libera o job inteiro de uma vez, isto e,
+  # ANTES de o `npm ci` rodar.
+  # ===========================================================================
+  validate:
+    name: Validate frontend, API and Rust suites
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 120
+    # SEM `environment:` DE PROPOSITO - nao adicione um aqui. E o unico motivo
+    # de este job existir.
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      # Target dir proprio, distinto do `C:\ts` do job `build`: o que for
+      # compilado por `cargo test` nunca e reaproveitado pelo build assinado.
+      CARGO_TARGET_DIR: 'C:\tv'
+
+    steps:
+      # Mesmo commit fixo que o job `build` vai compilar - validar outro codigo
+      # nao validaria nada.
+      - name: Check out the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # -----------------------------------------------------------------------
+      # Toolchain nativa, identica a do job `build` (os pinos de versao/hash sao
+      # os mesmos, do `env:` do workflow). O porque de cada passo - NASM 2.x,
+      # LLVM em diretorio separado, LIBCLANG_PATH - esta comentado uma unica vez,
+      # no job `build`.
+      # -----------------------------------------------------------------------
+      - name: Pin Node from .node-version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Pin CMake ${{ env.CMAKE_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:TOOLCHAIN_ROOT "cmake-$env:CMAKE_VERSION"
+          $zip  = Join-Path $env:RUNNER_TEMP 'cmake.zip'
+          $url  = "https://github.com/Kitware/CMake/releases/download/v$env:CMAKE_VERSION/cmake-$env:CMAKE_VERSION-windows-x86_64.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 10 -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:CMAKE_SHA256) { throw "CMake SHA256 mismatch: got $hash expected $env:CMAKE_SHA256" }
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $bin = Join-Path $dest "cmake-$env:CMAKE_VERSION-windows-x86_64\bin"
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'cmake.exe'))) { throw "cmake.exe nao encontrado em $bin" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      - name: Pin NASM ${{ env.NASM_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:TOOLCHAIN_ROOT "nasm-$env:NASM_VERSION"
+          $zip  = Join-Path $env:RUNNER_TEMP 'nasm.zip'
+          $url  = "https://www.nasm.us/pub/nasm/releasebuilds/$env:NASM_VERSION/win64/nasm-$env:NASM_VERSION-win64.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 10 -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:NASM_SHA256) { throw "NASM SHA256 mismatch: got $hash expected $env:NASM_SHA256" }
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $bin = Join-Path $dest "nasm-$env:NASM_VERSION"
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'nasm.exe'))) { throw "nasm.exe nao encontrado em $bin" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      - name: Cache the LLVM installer
+        id: llvm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\llvm-installer
+          key: llvm-installer-${{ env.LLVM_VERSION }}-${{ env.LLVM_SHA256 }}
+
+      - name: Pin LLVM/libclang ${{ env.LLVM_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cacheDir = Join-Path $env:RUNNER_TEMP 'llvm-installer'
+          $exe      = Join-Path $cacheDir "LLVM-$env:LLVM_VERSION-win64.exe"
+          $dest     = Join-Path $env:TOOLCHAIN_ROOT "llvm-$env:LLVM_VERSION"
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+
+          if (-not (Test-Path -LiteralPath $exe)) {
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+            Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRetryCount 5 -RetryIntervalSec 15 -UseBasicParsing
+          }
+
+          # Hash conferido inclusive quando o arquivo veio do cache: cache do
+          # Actions e fonte nao confiavel.
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:LLVM_SHA256) {
+            [System.IO.File]::Delete($exe)
+            throw "LLVM SHA256 mismatch: got $hash expected $env:LLVM_SHA256"
+          }
+
+          $proc = Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dest" -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "Instalador LLVM saiu com codigo $($proc.ExitCode)" }
+
+          $bin = Join-Path $dest 'bin'
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'libclang.dll'))) { throw "libclang.dll nao encontrado em $bin" }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV  -Value "LIBCLANG_PATH=$bin"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      - name: Materialize the Rust toolchain from rust-toolchain.toml
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install
+          rustup show active-toolchain
+
+      # Este job PODE cachear o target dir: nao ha segredo nenhum nesta maquina,
+      # e e aqui que o cache de build compensa (cargo test compila a arvore
+      # inteira do BoringSSL). A chave e propria - `cargo-validate-` -, nunca a
+      # do job `build`: o actions/cache restaura o arquivo salvo INTEIRO, entao
+      # uma chave compartilhada devolveria este target dir dentro do runner que
+      # assina, que e exatamente o que a separacao evita.
+      - name: Cache cargo registry and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~\.cargo\registry\index
+            ~\.cargo\registry\cache
+            ~\.cargo\git\db
+            C:\tv
+          key: cargo-validate-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-validate-${{ runner.os }}-
+
+      # Mesmo porteiro barato do job `build`: falhar aqui em vez de falhar 20
+      # min depois dentro do build.rs do btls-sys.
+      - name: Verify the pinned baseline
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-Version($label, $actual, $expected) {
+            if ($actual -notmatch [regex]::Escape($expected)) {
+              throw "$label divergente: esperado '$expected', obtido '$actual'"
+            }
+            Write-Host "ok  $label -> $actual"
+          }
+
+          $expectedNode = (Get-Content -LiteralPath '.node-version' -Raw).Trim()
+          $rustToolchain = Get-Content -LiteralPath 'rust-toolchain.toml' -Raw
+          $rustMatch = [regex]::Match($rustToolchain, '(?m)^\s*channel\s*=\s*"(?<channel>[^"]+)"')
+          if (-not $rustMatch.Success) { throw 'rust-toolchain.toml nao declara um channel.' }
+          $expectedRust = $rustMatch.Groups['channel'].Value
+
+          $cmakeLine = @(cmake --version)
+          $nasmLine  = @(nasm -v)
+          $clangLine = @(clang --version)
+
+          Assert-Version 'cmake' $cmakeLine[0]     "cmake version $env:CMAKE_VERSION"
+          Assert-Version 'nasm'  $nasmLine[0]      "NASM version $env:NASM_VERSION"
+          Assert-Version 'clang' $clangLine[0]     "clang version $env:LLVM_VERSION"
+          Assert-Version 'node'  (node --version)  "v$expectedNode"
+          Assert-Version 'npm'   (npm --version)   "$env:NPM_VERSION"
+          Assert-Version 'rustc' (rustc --version) "rustc $expectedRust"
+
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            throw "LIBCLANG_PATH invalido: $env:LIBCLANG_PATH"
+          }
+          Write-Host "ok  LIBCLANG_PATH -> $env:LIBCLANG_PATH"
+
+      # `npm ci` COM scripts (postinstall roda) e `npm run check` inteiro: e o
+      # lugar certo para executa-los, porque aqui eles nao tem o que atacar.
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Validate frontend, API and Rust suites
+        run: npm run check
+
+  # ===========================================================================
+  # JOB 3 - build
+  # ---------------------------------------------------------------------------
+  # Runner efemero GitHub-hosted. NAO usar self-hosted: o Forge foi
+  # desmontado, e um runner persistente com a chave de assinatura passando por
+  # ele e um alvo permanente. Cada execucao aqui comeca de uma VM limpa e
+  # descartada no fim.
+  #
+  # `environment: release-signing` esta NESTE job, e nao no `publish`, porque e
+  # aqui que a chave privada entra em memoria. O portao de revisao tem de
+  # fechar ANTES do segredo, nao depois.
+  # (Se quiser um segundo portao no momento da publicacao, basta adicionar o
+  # mesmo `environment:` ao job `publish` - custa uma segunda aprovacao.)
+  #
+  # Este job NAO roda testes nem `npm run check`: isso e o job `validate`, num
+  # runner sem acesso ao secret. Aqui so entra o minimo necessario para produzir
+  # e assinar o instalador. Nao acrescente passos que executem codigo de
+  # terceiros antes do passo de assinatura.
+  # ===========================================================================
+  build:
+    name: Build, sign and verify on windows-latest
+    # `validate` como pre-requisito: o build assinado so comeca depois de a
+    # suite inteira passar, mas noutro runner.
+    needs: [prepare, validate]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    environment: release-signing
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: pwsh
+
+    outputs:
+      installer_sha256: ${{ steps.artifacts.outputs.installer_sha256 }}
+      installer_size: ${{ steps.artifacts.outputs.installer_size }}
+      signature_sha256: ${{ steps.metadata.outputs.signature_sha256 }}
+      signature_size: ${{ steps.metadata.outputs.signature_size }}
+      metadata_sha256: ${{ steps.metadata.outputs.metadata_sha256 }}
+      metadata_size: ${{ steps.metadata.outputs.metadata_size }}
+      artifact_name: ayla-release-${{ needs.prepare.outputs.version }}
+
+    # Os pinos da toolchain (CMAKE_*, NASM_*, LLVM_*, NPM_VERSION,
+    # TOOLCHAIN_ROOT) vem do `env:` do workflow, compartilhados com `validate`.
+    env:
+      # Caminho curto de proposito: a arvore do BoringSSL + Tauri estoura
+      # MAX_PATH com o default D:\a\Ayla\Ayla\src-tauri\target\...
+      # Diretorio EXCLUSIVO deste job e nunca restaurado de cache: o cargo
+      # reexecuta build scripts a partir do que encontra no target dir, entao um
+      # target dir vindo de fora seria execucao de codigo dentro do passo que
+      # tem a chave privada no ambiente. Comeca vazio, toda vez.
+      CARGO_TARGET_DIR: 'C:\ts'
+
+    steps:
+      # Commit fixo resolvido pelo job `prepare`. Nao usamos o nome do tag aqui:
+      # se o tag for movido durante a execucao, este checkout continua trazendo
+      # exatamente o codigo que passou pela validacao de versao.
+      - name: Check out the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # -----------------------------------------------------------------------
+      # Toolchain nativo. Quem consome: btls-sys 0.5.6 (BoringSSL, via
+      # wreq 6.0.0-rc.29) -> crate `cmake` precisa de cmake.exe, o asm x86_64 do
+      # BoringSSL precisa de nasm.exe, e bindgen 0.72.1 / clang-sys 1.8.1
+      # precisam de libclang.dll.
+      # -----------------------------------------------------------------------
+
+      # Node 24.19.0 ja esta no tool cache do runner -> resolve em segundos.
+      # npm 11.17.0 vem embutido no Node 24.19.0; NAO instalar npm global.
+      - name: Pin Node from .node-version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Pin CMake ${{ env.CMAKE_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:TOOLCHAIN_ROOT "cmake-$env:CMAKE_VERSION"
+          $zip  = Join-Path $env:RUNNER_TEMP 'cmake.zip'
+          $url  = "https://github.com/Kitware/CMake/releases/download/v$env:CMAKE_VERSION/cmake-$env:CMAKE_VERSION-windows-x86_64.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 10 -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:CMAKE_SHA256) { throw "CMake SHA256 mismatch: got $hash expected $env:CMAKE_SHA256" }
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          # O zip carrega um diretorio raiz cmake-<ver>-windows-x86_64\
+          $bin = Join-Path $dest "cmake-$env:CMAKE_VERSION-windows-x86_64\bin"
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'cmake.exe'))) { throw "cmake.exe nao encontrado em $bin" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      # PASSO MAIS PERIGOSO DO ARQUIVO: a release corrente do NASM e a serie 3.x
+      # (3.02 em 2026-08). Qualquer instalacao sem versao fixa traz 3.x e quebra
+      # o btls-sys. O zip win64 oficial nao tem instalador - so descompactar.
+      - name: Pin NASM ${{ env.NASM_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:TOOLCHAIN_ROOT "nasm-$env:NASM_VERSION"
+          $zip  = Join-Path $env:RUNNER_TEMP 'nasm.zip'
+          $url  = "https://www.nasm.us/pub/nasm/releasebuilds/$env:NASM_VERSION/win64/nasm-$env:NASM_VERSION-win64.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 10 -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:NASM_SHA256) { throw "NASM SHA256 mismatch: got $hash expected $env:NASM_SHA256" }
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          # Layout do zip: nasm-2.16.03\nasm.exe, ndisasm.exe, LICENSE
+          $bin = Join-Path $dest "nasm-$env:NASM_VERSION"
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'nasm.exe'))) { throw "nasm.exe nao encontrado em $bin" }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      # A imagem traz LLVM 20.1.8 em C:\Program Files\LLVM - versao ERRADA para
+      # o bindgen 0.72.1. Instalamos o 22.1.8 num diretorio SEPARADO em vez de
+      # sobrescrever, e LIBCLANG_PATH decide quem o clang-sys carrega
+      # (LIBCLANG_PATH tem prioridade sobre o PATH na busca do clang-sys).
+      - name: Cache the LLVM installer
+        id: llvm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\llvm-installer
+          key: llvm-installer-${{ env.LLVM_VERSION }}-${{ env.LLVM_SHA256 }}
+
+      - name: Pin LLVM/libclang ${{ env.LLVM_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cacheDir = Join-Path $env:RUNNER_TEMP 'llvm-installer'
+          $exe      = Join-Path $cacheDir "LLVM-$env:LLVM_VERSION-win64.exe"
+          # Sem espacos no caminho: exigencia do /D= do NSIS.
+          $dest     = Join-Path $env:TOOLCHAIN_ROOT "llvm-$env:LLVM_VERSION"
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+
+          if (-not (Test-Path -LiteralPath $exe)) {
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+            Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRetryCount 5 -RetryIntervalSec 15 -UseBasicParsing
+          }
+
+          # O hash e conferido inclusive quando o arquivo veio do cache: um cache
+          # do Actions e gravavel por qualquer workflow do repositorio, entao
+          # tratamos o cache como fonte nao confiavel.
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:LLVM_SHA256) {
+            [System.IO.File]::Delete($exe)
+            throw "LLVM SHA256 mismatch: got $hash expected $env:LLVM_SHA256"
+          }
+
+          # Instalador NSIS: /S silencioso, /D= POR ULTIMO, sem aspas, sem barra
+          # final. E GUI-subsystem, entao chamar com & retornaria na hora - tem
+          # de ser Start-Process -Wait -PassThru e checar o ExitCode.
+          $proc = Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dest" -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "Instalador LLVM saiu com codigo $($proc.ExitCode)" }
+
+          $bin = Join-Path $dest 'bin'
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'libclang.dll'))) { throw "libclang.dll nao encontrado em $bin" }
+
+          # LIBCLANG_PATH aponta para o DIRETORIO do libclang.dll, nunca para o
+          # arquivo.
+          Add-Content -LiteralPath $env:GITHUB_ENV  -Value "LIBCLANG_PATH=$bin"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
+
+      # `rustup toolchain install` SEM argumento instala "the active toolchain":
+      # le o rust-toolchain.toml e materializa channel + profile + components
+      # (rustfmt) + targets. A versao 1.97.1 nao fica duplicada neste YAML.
+      - name: Materialize the Rust toolchain from rust-toolchain.toml
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install
+          rustup show active-toolchain
+
+      # SO o registry, NUNCA o CARGO_TARGET_DIR. O que o cargo baixa para o
+      # registry ele confere contra os checksums do Cargo.lock antes de usar; um
+      # target dir, nao - ele contem executaveis de build script ja compilados e
+      # os fingerprints que decidem se o cargo os recompila, ou seja, um cache
+      # envenenado viraria execucao de codigo DENTRO do passo que carrega a
+      # chave privada, sem aparecer no diff que o revisor do environment
+      # aprovou. Mesmo tratamento que o cache do LLVM ja recebia acima.
+      #
+      # Sem `restore-keys:` tambem de proposito: um prefixo frouxo aceita
+      # qualquer entrada de cache com aquele inicio, inclusive gravada por outro
+      # workflow ou por um run da branch default. So a chave exata, so a
+      # combinacao Cargo.lock + rust-toolchain.toml deste commit.
+      - name: Cache the cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~\.cargo\registry\index
+            ~\.cargo\registry\cache
+            ~\.cargo\git\db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock', 'rust-toolchain.toml') }}
+
+      # Porteiro: falhar aqui, barato, em vez de falhar 20 min depois dentro do
+      # build.rs do btls-sys com uma mensagem de linker ilegivel.
+      # Node e Rust sao conferidos contra os PROPRIOS arquivos do repositorio,
+      # para que .node-version / rust-toolchain.toml continuem sendo a unica
+      # fonte da verdade.
+      - name: Verify the pinned baseline
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-Version($label, $actual, $expected) {
+            if ($actual -notmatch [regex]::Escape($expected)) {
+              throw "$label divergente: esperado '$expected', obtido '$actual'"
+            }
+            Write-Host "ok  $label -> $actual"
+          }
+
+          $expectedNode = (Get-Content -LiteralPath '.node-version' -Raw).Trim()
+          $rustToolchain = Get-Content -LiteralPath 'rust-toolchain.toml' -Raw
+          $rustMatch = [regex]::Match($rustToolchain, '(?m)^\s*channel\s*=\s*"(?<channel>[^"]+)"')
+          if (-not $rustMatch.Success) { throw 'rust-toolchain.toml nao declara um channel.' }
+          $expectedRust = $rustMatch.Groups['channel'].Value
+
+          $cmakeLine = @(cmake --version)
+          $nasmLine  = @(nasm -v)
+          $clangLine = @(clang --version)
+
+          Assert-Version 'cmake' $cmakeLine[0]     "cmake version $env:CMAKE_VERSION"
+          Assert-Version 'nasm'  $nasmLine[0]      "NASM version $env:NASM_VERSION"
+          Assert-Version 'clang' $clangLine[0]     "clang version $env:LLVM_VERSION"
+          Assert-Version 'node'  (node --version)  "v$expectedNode"
+          Assert-Version 'npm'   (npm --version)   "$env:NPM_VERSION"
+          Assert-Version 'rustc' (rustc --version) "rustc $expectedRust"
+
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            throw "LIBCLANG_PATH invalido: $env:LIBCLANG_PATH"
+          }
+          Write-Host "ok  LIBCLANG_PATH -> $env:LIBCLANG_PATH"
+
+          $installedTargets = rustup target list --installed
+          if ($installedTargets -notcontains 'x86_64-pc-windows-msvc') {
+            throw 'target x86_64-pc-windows-msvc ausente'
+          }
+          Write-Host 'ok  target x86_64-pc-windows-msvc'
+
+          # Confirma que cmake/nasm/clang resolvidos sao os NOSSOS, nao os da imagem.
+          Write-Host "cmake resolvido: $((Get-Command cmake).Source)"
+          Write-Host "nasm  resolvido: $((Get-Command nasm).Source)"
+          Write-Host "clang resolvido: $((Get-Command clang).Source)"
+
+          # LLVM extraido (~3 GB) + target do BoringSSL apertam o C:.
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $null -ne $_.Used } |
+            Select-Object Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } } |
+            Format-Table | Out-String | Write-Host
+
+      # -----------------------------------------------------------------------
+      # A suite de testes JA RODOU, no job `validate`, noutro runner e sem o
+      # secret. Aqui instalamos as dependencias so porque o bundler precisa
+      # delas, e com `--ignore-scripts`: nenhum postinstall de dependencia
+      # executa neste runner, e portanto nada pode escrever em $GITHUB_ENV /
+      # $GITHUB_PATH nem trocar `node_modules\.bin\tauri` antes do passo que
+      # carrega a chave.
+      #
+      # `--ignore-scripts` e seguro para esta arvore: no package-lock.json os
+      # unicos pacotes com script de instalacao sao o esbuild (que resolve o
+      # binario pela optionalDependency @esbuild/win32-x64, e o vite usa a API
+      # JS, nao o CLI) e o fsevents (darwin, optional - nem chega a ser
+      # instalado aqui). O @tauri-apps/cli 2.11.4 nao tem script de instalacao:
+      # o binario vem de @tauri-apps/cli-win32-x64-msvc, tambem uma
+      # optionalDependency. Se algum dia isso mudar, o `npm run tauri` falha
+      # aqui de forma ruidosa - e nao em silencio.
+      # -----------------------------------------------------------------------
+      - name: Install locked frontend dependencies without running scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      # -----------------------------------------------------------------------
+      # UNICO passo do workflow inteiro que enxerga a chave privada.
+      #
+      # `--config src-tauri/tauri.release.conf.json` liga createUpdaterArtifacts,
+      # que e o que faz o bundler emitir o .sig ao lado do .exe. O
+      # tauri.conf.json base deixa isso desligado justamente para que builds
+      # normais nunca precisem da chave.
+      #
+      # LIMITE HONESTO DESTA MITIGACAO: durante este passo, todo build script de
+      # crate compilada aqui roda com a chave no ambiente do processo. Isso e
+      # inerente ao modelo de assinatura do Tauri (o bundler assina, e o bundler
+      # precisa da chave). O que reduz o risco e o Cargo.lock/package-lock.json
+      # fixos, o `--locked`, e o portao humano do environment `release-signing`.
+      # -----------------------------------------------------------------------
+      - name: Build and sign the NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # O runner ja mascara automaticamente qualquer valor vindo de
+          # `secrets.*`. Reforcamos linha a linha porque a chave do Tauri e um
+          # blob multilinha: se algum consumidor imprimir so um pedaco (uma
+          # unica linha do PEM/minisign), esse pedaco tambem sai como ***.
+          # Emitir ::add-mask:: e a forma documentada de registrar um valor no
+          # mascarador e nao imprime nada em claro.
+          foreach ($secret in @($env:TAURI_SIGNING_PRIVATE_KEY, $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            if ([string]::IsNullOrEmpty($secret)) { continue }
+            foreach ($line in $secret -split "`r?`n") {
+              if (-not [string]::IsNullOrWhiteSpace($line)) {
+                Write-Host "::add-mask::$line"
+              }
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'TAURI_SIGNING_PRIVATE_KEY nao chegou ao job. Cadastre-o como Environment secret de release-signing.'
+          }
+
+          # Nunca despeje o ambiente (Get-ChildItem Env:, `printenv`, `set`) em
+          # nenhum passo deste arquivo.
+          npm run tauri -- build --config src-tauri/tauri.release.conf.json --bundles nsis
+          if ($LASTEXITCODE -ne 0) { throw "tauri build falhou com codigo $LASTEXITCODE." }
+
+      # -----------------------------------------------------------------------
+      # Verificacao criptografica ANTES de publicar. Se esta etapa falhar, nada
+      # e anexado a lugar nenhum: o job `publish` nem comeca.
+      # -----------------------------------------------------------------------
+      - name: Verify the signed artifact pair
+        id: artifacts
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          SIGNATURE_NAME: ${{ needs.prepare.outputs.signature_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $bundleDirectory = Join-Path $env:CARGO_TARGET_DIR 'release\bundle\nsis'
+          if (-not (Test-Path -LiteralPath $bundleDirectory -PathType Container)) {
+            throw "Diretorio de bundle nao encontrado: $bundleDirectory"
+          }
+          Write-Host ('bundle/nsis contem: ' + ((Get-ChildItem -LiteralPath $bundleDirectory -File |
+            Select-Object -ExpandProperty Name | Sort-Object) -join ', '))
+
+          $installerPath = Join-Path $bundleDirectory $env:INSTALLER_NAME
+          $signaturePath = Join-Path $bundleDirectory $env:SIGNATURE_NAME
+
+          # docs/self-hosted-updater.md exige EXATAMENTE este par. Se o nome
+          # divergir, o publisher do servidor recusaria depois - melhor recusar
+          # aqui.
+          foreach ($path in @($installerPath, $signaturePath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Artefato obrigatorio ausente: $path"
+            }
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.Length -le 0) { throw "Artefato vazio: $path" }
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Artefato e um reparse point, nao um arquivo regular: $path"
+            }
+          }
+
+          # A ProductVersion e gravada dentro do proprio .exe pelo bundler. E a
+          # unica checagem que prova que o BINARIO produzido corresponde a
+          # versao pedida - as outras checaram apenas arquivos de texto.
+          $productVersion = [string](Get-Item -LiteralPath $installerPath).VersionInfo.ProductVersion
+          $productMatch = [regex]::Match(
+            $productVersion.Trim(),
+            '^(?:v)?(?<normalized>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$',
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+          if (-not $productMatch.Success) {
+            throw "NSIS ProductVersion '$productVersion' nao e um SemVer estavel."
+          }
+          if ($productMatch.Groups['normalized'].Value -ne $env:RELEASE_VERSION) {
+            throw "NSIS ProductVersion '$($productMatch.Groups['normalized'].Value)' nao bate com '$($env:RELEASE_VERSION)'."
+          }
+          Write-Host "ok  NSIS ProductVersion -> $($productMatch.Groups['normalized'].Value)"
+
+          # A pubkey usada na verificacao e a MESMA que vai embarcada no app
+          # instalado (src-tauri/tauri.conf.json), e nao uma copia solta. Assim
+          # esta checagem responde a pergunta certa: "o cliente la na ponta vai
+          # aceitar este .sig?".
+          $tauriConfig = Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          $publicKey = [string]$tauriConfig.plugins.updater.pubkey
+          if ([string]::IsNullOrWhiteSpace($publicKey)) {
+            throw 'src-tauri/tauri.conf.json nao declara plugins.updater.pubkey.'
+          }
+
+          # Contrato de tools/update-verifier: 3 argumentos posicionais
+          # (instalador, .sig, pubkey no envelope Base64 do tauri.conf.json),
+          # stdout literal 'signature verified' e exit 0. Exigimos os dois.
+          $verifierManifest = Join-Path $env:GITHUB_WORKSPACE 'tools\update-verifier\Cargo.toml'
+          $verifierOutput = & cargo run --quiet --locked --manifest-path $verifierManifest -- `
+            $installerPath $signaturePath $publicKey
+          $verdict = ([string]($verifierOutput -join "`n")).Trim()
+          if ($LASTEXITCODE -ne 0 -or $verdict -ne 'signature verified') {
+            throw "A assinatura do updater NAO foi verificada (exit=$LASTEXITCODE, stdout='$verdict')."
+          }
+          Write-Host 'ok  update-verifier -> signature verified'
+
+          # Area de staging: so o que vai virar asset entra aqui. Evita anexar
+          # por engano algo que o bundler tenha deixado no diretorio.
+          $staging = Join-Path $env:RUNNER_TEMP 'ayla-release'
+          if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item -LiteralPath $installerPath -Destination (Join-Path $staging $env:INSTALLER_NAME) -Force
+          Copy-Item -LiteralPath $signaturePath -Destination (Join-Path $staging $env:SIGNATURE_NAME) -Force
+
+          $stagedInstaller = Get-Item -LiteralPath (Join-Path $staging $env:INSTALLER_NAME)
+          $installerHash = (Get-FileHash -LiteralPath $stagedInstaller.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          # Publicados no log e como job outputs de proposito: sao dados
+          # publicos, e o job `publish` reconfere o SHA-256 depois do
+          # download-artifact, fechando a janela entre os dois runners.
+          Write-Host "installer sha256 = $installerHash"
+          Write-Host "installer bytes  = $($stagedInstaller.Length)"
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_sha256=$installerHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "installer_size=$($stagedInstaller.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "staging=$staging"
+
+      # -----------------------------------------------------------------------
+      # FORMATO CANONICO DO latest.json
+      #
+      # `shell: powershell` NAO e descuido: e Windows PowerShell 5.1, o mesmo
+      # runtime de scripts/Publish-AylaSelfHostedRelease.ps1 (#Requires -Version 5.1).
+      # O ConvertTo-Json do 5.1 indenta com 4 espacos e poe DOIS espacos depois
+      # do ':'; o do PowerShell 7 (`pwsh`) usa 2 espacos e um so. O consumidor
+      # no servidor tolera ambos no caminho feliz (o sed usa [[:space:]]*), mas
+      # a comparacao de retry idempotente do
+      # Publish-AylaSelfHostedRelease.remote.sh faz `cmp -s` byte-a-byte: um
+      # latest.json gerado por outro runtime seria recusado com
+      # 'existing immutable release metadata differs from the staged release'.
+      # Por isso este passo unico troca de shell.
+      #
+      # Campos, na ordem exata em que o publisher os monta:
+      #   version   SemVer estavel, sem 'v'
+      #   notes     default literal "Ayla <version> Windows update."
+      #   pub_date  UTC agora, yyyy-MM-ddTHH:mm:ssZ (segundos inteiros)
+      #   platforms { "windows-x86_64": { signature, url } }  -- nessa ordem
+      # A signature e o conteudo BRUTO do .sig via File::ReadAllText: nao e
+      # re-codificada nem trimada.
+      #
+      # SOBRE A URL: ela ja sai aqui na forma FINAL e publica,
+      # https://yl.xyne.gg/updates/releases/<version>/<installer>, identica ao
+      # $immutableInstallerUrl de scripts/Publish-AylaSelfHostedRelease.ps1.
+      # O agente da VM (ayla-publish-update) NAO reescreve este campo: ele
+      # monta a mesma string e EXIGE que o manifesto baixado ja a contenha
+      # ("latest.json da release <tag> e incoerente" quando diverge), e o
+      # caminho de retry idempotente compara o metadata com `cmp -s` byte a
+      # byte - qualquer reescrita do lado de la quebraria essa comparacao.
+      # Nao aponte esta url para o asset do GitHub: o repositorio e privado,
+      # entao a url de asset responde 404 para o cliente instalado.
+      # O download da VM nao depende disso - ela puxa pelo id do asset na API
+      # (/releases/assets/<id>), nunca pela url do manifesto. E a url tambem
+      # nao entra no calculo da assinatura: o .sig cobre so os bytes do
+      # instalador.
+      # -----------------------------------------------------------------------
+      - name: Assemble latest.json in the canonical Windows PowerShell 5.1 format
+        id: metadata
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          SIGNATURE_NAME: ${{ needs.prepare.outputs.signature_name }}
+          STAGING_DIRECTORY: ${{ steps.artifacts.outputs.staging }}
+          # Base publica servida pelo Caddy na VM. Tem de bater exatamente com
+          # "$AYLA_PUBLIC_BASE_URL/releases/$version" do ayla-publish-update
+          # (default https://yl.xyne.gg/updates).
+          ASSET_BASE_URL: https://yl.xyne.gg/updates/releases/${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          # Se o runner algum dia mapear `powershell` para pwsh, o formato muda
+          # em silencio e so quebraria semanas depois, num retry no servidor.
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "Este passo exige Windows PowerShell 5.1; obtido $($PSVersionTable.PSVersion)."
+          }
+
+          $staging = $env:STAGING_DIRECTORY
+          $signaturePath = Join-Path $staging $env:SIGNATURE_NAME
+          $metadataPath = Join-Path $staging 'latest.json'
+
+          # File::ReadAllText, exatamente como o publisher: o blob minisign vai
+          # para o JSON tal e qual, inclusive um eventual newline final.
+          $signature = [System.IO.File]::ReadAllText($signaturePath)
+          if ([string]::IsNullOrWhiteSpace($signature)) { throw "Assinatura vazia: $signaturePath" }
+
+          $metadata = [ordered]@{
+              version = $env:RELEASE_VERSION
+              notes = "Ayla $($env:RELEASE_VERSION) Windows update."
+              pub_date = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+              platforms = [ordered]@{
+                  'windows-x86_64' = [ordered]@{
+                      signature = $signature
+                      url = "$($env:ASSET_BASE_URL)/$($env:INSTALLER_NAME)"
+                  }
+              }
+          }
+
+          # UTF-8 SEM BOM + um [Environment]::NewLine final (CRLF), igual ao
+          # publisher. WriteAllText resolve caminho relativo pelo diretorio
+          # corrente do .NET, que nem sempre e o do PowerShell - por isso
+          # $metadataPath e absoluto.
+          $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText(
+              $metadataPath,
+              (ConvertTo-Json -InputObject $metadata -Depth 6) + [Environment]::NewLine,
+              $utf8WithoutBom)
+
+          $rendered = [System.IO.File]::ReadAllText($metadataPath)
+
+          # Guardas de formato: dois espacos depois do ':' e quebras CRLF sao a
+          # assinatura do ConvertTo-Json do 5.1.
+          if (-not $rendered.Contains('"version":  "')) {
+            throw 'latest.json nao saiu no formato do Windows PowerShell 5.1 (esperado dois espacos apos ":").'
+          }
+          if (-not $rendered.Contains("`r`n")) {
+            throw 'latest.json nao saiu com quebras de linha CRLF.'
+          }
+
+          # Round-trip: o arquivo tem de ser JSON valido e reproduzir os campos.
+          $parsed = ConvertFrom-Json -InputObject $rendered
+          if ($parsed.version -ne $env:RELEASE_VERSION) { throw 'latest.json: campo version divergente.' }
+          if ($parsed.platforms.'windows-x86_64'.signature -ne $signature) { throw 'latest.json: signature divergente.' }
+          $expectedUrl = "$($env:ASSET_BASE_URL)/$($env:INSTALLER_NAME)"
+          if ($parsed.platforms.'windows-x86_64'.url -ne $expectedUrl) {
+            throw 'latest.json: url divergente.'
+          }
+
+          # A url tem de ser a do canal publico servido pela VM. Se alguem
+          # reapontar ASSET_BASE_URL para o asset do GitHub, a falha e AQUI, no
+          # CI, e nao 5 minutos depois no ayla-publish-update - que baixaria o
+          # instalador inteiro para so entao recusar o manifesto por
+          # incoerencia, a cada disparo do timer, para sempre.
+          if (-not $expectedUrl.StartsWith('https://yl.xyne.gg/updates/releases/', [System.StringComparison]::Ordinal)) {
+            throw "latest.json: url '$expectedUrl' nao aponta para o canal publico da VM."
+          }
+
+          # latest.json e o .sig sao dados publicos - imprimir ajuda a auditar o
+          # release depois e nao vaza nada.
+          Write-Host '--- latest.json ---'
+          Write-Host $rendered
+          Write-Host '-------------------'
+
+          $signatureItem = Get-Item -LiteralPath $signaturePath
+          $metadataItem = Get-Item -LiteralPath $metadataPath
+          $signatureHash = (Get-FileHash -LiteralPath $signaturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $metadataHash = (Get-FileHash -LiteralPath $metadataPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "signature_sha256=$signatureHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "signature_size=$($signatureItem.Length)"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "metadata_sha256=$metadataHash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "metadata_size=$($metadataItem.Length)"
+
+      # compression-level: 0 -> o .exe do NSIS ja e comprimido; recomprimir so
+      # gasta minuto de runner. O zip do artifact continua fiel byte-a-byte,
+      # entao o CRLF do latest.json sobrevive ate o job `publish`.
+      - name: Upload the release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ayla-release-${{ needs.prepare.outputs.version }}
+          path: ${{ steps.artifacts.outputs.staging }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ===========================================================================
+  # JOB 4 - publish
+  # ---------------------------------------------------------------------------
+  # UNICO job com contents: write, e ele nao compila nem assina nada: so pega o
+  # que ja foi verificado e cria o Release. Separar assim significa que o token
+  # com permissao de escrita nunca esta presente enquanto codigo de terceiros
+  # (npm ci, cargo build, build scripts) esta rodando.
+  # ===========================================================================
+  publish:
+    name: Publish the GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      # v8 recusa por padrao um download cujo digest nao bata com o do servidor
+      # (digest-mismatch: error), o que ja e uma checagem de integridade a mais
+      # entre os dois runners.
+      - name: Download the verified release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+
+      # Reconfere os SHA-256 calculados no runner Windows. Fecha a janela entre
+      # os dois runners: o que for publicado e, byte a byte, o que passou pelo
+      # tools/update-verifier.
+      - name: Re-verify the artifact digests
+        env:
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          SIGNATURE_NAME: ${{ needs.prepare.outputs.signature_name }}
+          INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
+          INSTALLER_SIZE: ${{ needs.build.outputs.installer_size }}
+          SIGNATURE_SHA256: ${{ needs.build.outputs.signature_sha256 }}
+          SIGNATURE_SIZE: ${{ needs.build.outputs.signature_size }}
+          METADATA_SHA256: ${{ needs.build.outputs.metadata_sha256 }}
+          METADATA_SIZE: ${{ needs.build.outputs.metadata_size }}
+        run: |
+          set -euo pipefail
+
+          check_file() {
+            local name="$1" expected_hash="$2" expected_size="$3"
+            local path="release/${name}"
+
+            if [ ! -f "$path" ] || [ -L "$path" ]; then
+              echo "::error::Asset ausente ou nao e arquivo regular: ${path}" >&2
+              exit 1
+            fi
+
+            local actual_hash actual_size
+            actual_hash="$(sha256sum "$path" | awk '{ print $1 }')"
+            actual_size="$(stat -c %s "$path")"
+
+            if [ "$actual_hash" != "$expected_hash" ] || [ "$actual_size" != "$expected_size" ]; then
+              echo "::error::${name} divergiu do que foi assinado (sha256 ${actual_hash}/${expected_hash}, bytes ${actual_size}/${expected_size})." >&2
+              exit 1
+            fi
+            printf 'ok  %-40s %s (%s bytes)\n' "$name" "$actual_hash" "$actual_size"
+          }
+
+          check_file "$INSTALLER_NAME" "$INSTALLER_SHA256" "$INSTALLER_SIZE"
+          check_file "$SIGNATURE_NAME" "$SIGNATURE_SHA256" "$SIGNATURE_SIZE"
+          check_file 'latest.json'     "$METADATA_SHA256"  "$METADATA_SIZE"
+
+          # Nada alem dos tres assets pode ter entrado no pacote.
+          unexpected="$(find release -mindepth 1 \
+            ! -name "$INSTALLER_NAME" ! -name "$SIGNATURE_NAME" ! -name 'latest.json' -print)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::Arquivos inesperados no candidato: ${unexpected}" >&2
+            exit 1
+          fi
+
+      # Anti-movimentacao de tag: o tag tem de continuar apontando para o commit
+      # que o job `prepare` validou e que o job `build` compilou. Se alguem
+      # moveu o tag durante o build, paramos aqui.
+      - name: Re-verify that the tag still points at the built commit
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # Uma unica leitura da ref: duas chamadas separadas abririam uma janela
+          # em que o tag poderia mudar entre elas.
+          ref_json="$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(printf '%s' "$ref_json" | jq -r '.object.type')"
+          object_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha')"
+
+          # Tag anotado aponta para um objeto tag, que por sua vez aponta para o
+          # commit; tag leve ja aponta para o commit.
+          if [ "$object_type" = 'tag' ]; then
+            object_sha="$(gh api "repos/${GH_REPO}/git/tags/${object_sha}" --jq '.object.sha')"
+          fi
+
+          if [ "$object_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::${RELEASE_TAG} aponta para ${object_sha}, mas o build usou ${EXPECTED_SHA}." >&2
+            exit 1
+          fi
+          echo "ok  ${RELEASE_TAG} -> ${object_sha}"
+
+      # Imutabilidade, na mesma linha do publisher do servidor (que recusa
+      # sobrescrever /releases/<version>): um Release JA PUBLICADO nunca e
+      # tocado por esta pipeline. Um draft remanescente, sim - draft nao e
+      # visivel para ninguem nem alcancavel pelo updater, entao so pode ser
+      # sobra de uma execucao que falhou no meio.
+      - name: Refuse to overwrite an already published release
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          state="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo 'absent')"
+
+          case "$state" in
+            absent)
+              echo "ok  nenhum release existente para ${RELEASE_TAG}"
+              ;;
+            false)
+              echo "::error::O release ${RELEASE_TAG} ja esta publicado. Releases sao imutaveis: publique uma nova versao em vez de sobrescrever." >&2
+              exit 1
+              ;;
+            true)
+              echo "Removendo o draft remanescente de ${RELEASE_TAG} (sobra de uma execucao interrompida)."
+              # Sem --cleanup-tag de proposito: o tag git e a evidencia
+              # independente de qual commit foi publicado e nao pode sumir.
+              gh release delete "$RELEASE_TAG" --yes
+              ;;
+            *)
+              echo "::error::Estado inesperado do release ${RELEASE_TAG}: ${state}" >&2
+              exit 1
+              ;;
+          esac
+
+      # Publicacao em dois tempos (draft -> publicado), pelo mesmo motivo que o
+      # servidor monta um diretorio candidato e so depois faz rename: enquanto
+      # os assets sobem, o release e um draft e ninguem o enxerga. So depois de
+      # os tres assets estarem confirmados no lado do GitHub e que ele vira
+      # publico.
+      - name: Create the draft release with the verified assets
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          SIGNATURE_NAME: ${{ needs.prepare.outputs.signature_name }}
+          INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
+          INSTALLER_SIZE: ${{ needs.build.outputs.installer_size }}
+        run: |
+          set -euo pipefail
+
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<EOF
+          Ayla ${RELEASE_VERSION} - atualizacao Windows (x86_64).
+
+          Commit: ${RELEASE_SHA}
+
+          Instalador: \`${INSTALLER_NAME}\`
+          SHA-256:    \`${INSTALLER_SHA256}\`
+          Bytes:      \`${INSTALLER_SIZE}\`
+
+          O par instalador + \`${SIGNATURE_NAME}\` foi verificado por
+          \`tools/update-verifier\` contra a \`plugins.updater.pubkey\` deste commit
+          antes desta publicacao.
+
+          \`latest.json\` acompanha o release para o publicador self-hosted, ja com
+          \`platforms.windows-x86_64.url\` na forma imutavel e publica
+          \`https://yl.xyne.gg/updates/releases/${RELEASE_VERSION}/${INSTALLER_NAME}\`.
+          A VM publica esse arquivo como esta, sem reescreve-lo.
+          EOF
+
+          # --verify-tag: aborta se o tag ainda nao existir no remoto, em vez de
+          # o gh criar um tag novo silenciosamente a partir do branch default.
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --title "Ayla ${RELEASE_VERSION}" \
+            --notes-file "$notes_file" \
+            "release/${INSTALLER_NAME}" \
+            "release/${SIGNATURE_NAME}" \
+            'release/latest.json'
+
+          rm -f "$notes_file"
+
+      - name: Verify the uploaded assets before publishing
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          SIGNATURE_NAME: ${{ needs.prepare.outputs.signature_name }}
+          INSTALLER_SIZE: ${{ needs.build.outputs.installer_size }}
+          SIGNATURE_SIZE: ${{ needs.build.outputs.signature_size }}
+          METADATA_SIZE: ${{ needs.build.outputs.metadata_size }}
+        run: |
+          set -euo pipefail
+
+          assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)\t\(.state)"')"
+          echo "$assets"
+
+          assert_asset() {
+            local name="$1" expected_size="$2" line
+            line="$(printf '%s\n' "$assets" | awk -F '\t' -v n="$name" '$1 == n { print; exit }')"
+            if [ -z "$line" ]; then
+              echo "::error::O asset ${name} nao chegou ao release." >&2
+              exit 1
+            fi
+            local size state
+            size="$(printf '%s' "$line" | cut -f2)"
+            state="$(printf '%s' "$line" | cut -f3)"
+            if [ "$state" != 'uploaded' ]; then
+              echo "::error::O asset ${name} esta em estado '${state}', nao 'uploaded'." >&2
+              exit 1
+            fi
+            if [ "$size" != "$expected_size" ]; then
+              echo "::error::O asset ${name} subiu com ${size} bytes, esperado ${expected_size}." >&2
+              exit 1
+            fi
+            printf 'ok  %-40s %s bytes, uploaded\n' "$name" "$size"
+          }
+
+          assert_asset "$INSTALLER_NAME" "$INSTALLER_SIZE"
+          assert_asset "$SIGNATURE_NAME" "$SIGNATURE_SIZE"
+          assert_asset 'latest.json'     "$METADATA_SIZE"
+
+          count="$(printf '%s\n' "$assets" | grep -c . || true)"
+          if [ "$count" != '3' ]; then
+            echo "::error::O release tem ${count} assets; esperados exatamente 3." >&2
+            exit 1
+          fi
+
+      # Ponto de nao-retorno: a partir daqui a VM consegue enxergar e puxar esta
+      # versao. Tudo o que podia ser verificado ja foi.
+      - name: Publish the release
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false
+          echo "Release publicado: $(gh release view "$RELEASE_TAG" --json url --jq '.url')"
+
+      - name: Summarize the release
+        if: always()
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          INSTALLER_NAME: ${{ needs.prepare.outputs.installer_name }}
+          INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
+          INSTALLER_SIZE: ${{ needs.build.outputs.installer_size }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Ayla ${RELEASE_VERSION}"
+            echo
+            echo "| campo | valor |"
+            echo "| --- | --- |"
+            echo "| tag | \`${RELEASE_TAG}\` |"
+            echo "| commit | \`${RELEASE_SHA}\` |"
+            echo "| instalador | \`${INSTALLER_NAME}\` |"
+            echo "| sha256 | \`${INSTALLER_SHA256}\` |"
+            echo "| bytes | \`${INSTALLER_SIZE}\` |"
+            echo
+            echo "URL do updater no manifesto anexado:"
+            echo
+            echo "\`https://yl.xyne.gg/updates/releases/${RELEASE_VERSION}/${INSTALLER_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

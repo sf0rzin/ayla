@@ -1,5 +1,5 @@
 const API_BASE_URL = (
-  import.meta.env.VITE_AYLA_API_URL ?? "https://ayla.rindexx.cc/api/v1"
+  import.meta.env.VITE_AYLA_API_URL ?? "https://yl.xyne.gg/api/v1"
 ).replace(/\/+$/, "");
 const REQUEST_TIMEOUT_MS = 12_000;
 

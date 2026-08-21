@@ -1,6 +1,6 @@
 # Ayla authentication API
 
-The development API is served at `https://ayla.rindexx.cc/api/v1`. PostgreSQL and
+The development API is served at `https://yl.xyne.gg/api/v1`. PostgreSQL and
 the API run in Docker on VMID 103. PostgreSQL is attached only to the internal
 Docker network; the API is published on guest loopback at `127.0.0.1:3000`, and
 Caddy exposes only `/api/*` through the existing Ruby ingress.
@@ -58,7 +58,7 @@ also removes that account's sessions.
 Health checks:
 
 ```bash
-curl https://ayla.rindexx.cc/api/v1/health
+curl https://yl.xyne.gg/api/v1/health
 sudo docker compose -f /opt/ayla/compose.yaml --project-directory /opt/ayla ps
 ```
 

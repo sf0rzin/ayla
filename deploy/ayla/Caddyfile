@@ -6,7 +6,7 @@
 	}
 }
 
-ayla.rindexx.cc {
+yl.xyne.gg {
 	encode zstd gzip
 	root * /srv/ayla-public
 
@@ -37,7 +37,9 @@ ayla.rindexx.cc {
 	}
 
 	handle /updates/* {
-		file_server
+		file_server {
+			hide .publish-* .latest.*.tmp .publish.lock
+		}
 	}
 
 	handle /health {

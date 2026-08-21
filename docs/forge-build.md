@@ -54,7 +54,7 @@ Observed on the first fully warm optimized run on 2026-07-22: Forge detected the
 ## Self-hosted updater releases
 
 The active updater channel is hosted at
-`https://ayla.rindexx.cc/updates/stable/latest.json`. Build and publication are
+`https://yl.xyne.gg/updates/stable/latest.json`. Build and publication are
 documented in [Self-hosted Ayla services](self-hosted-updater.md). The updater
 private key remains outside both the repository and the public service VM.
 
