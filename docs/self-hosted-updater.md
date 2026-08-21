@@ -1,6 +1,6 @@
 # Self-hosted Ayla services
 
-The production service is available at `https://ayla.rindexx.cc` and contains
+The production service is available at `https://yl.xyne.gg` and contains
 two independent public surfaces:
 
 - `/api/v1/*` proxies to the Fastify authentication API on guest loopback.
@@ -98,8 +98,8 @@ stable endpoint intentionally returns HTTP `204 No Content`.
 ## Operations
 
 ```bash
-curl https://ayla.rindexx.cc/api/v1/health
-curl -i https://ayla.rindexx.cc/updates/stable/latest.json
+curl https://yl.xyne.gg/api/v1/health
+curl -i https://yl.xyne.gg/updates/stable/latest.json
 sudo docker compose --env-file /opt/ayla/.env -f /opt/ayla/compose.yaml ps
 sudo systemctl status caddy nftables ayla-db-backup.timer
 sudo systemctl start ayla-db-backup.service

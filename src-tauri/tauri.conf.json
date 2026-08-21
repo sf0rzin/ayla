@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://ayla.rindexx.cc"
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://yl.xyne.gg"
     }
   },
   "bundle": {
@@ -39,9 +39,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCMUE3ODFFMUZEMjM1RDcKUldUWE5kSWZIbmdhTzRNYUFkbjdYRUg0c0txSm5HSlRrU3MrMkloTGVhck9EL25pSXZxT09JSTMK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYwRUQ1NzAzRDk3NDM4NEIKUldSTE9IVFpBMWZ0WU5MUVlycjRmWHBLeE9PU005aUhFYVNlWlZWUkMvRGdxTUVDdXF6bjhlOHQK",
       "endpoints": [
-        "https://ayla.rindexx.cc/updates/stable/latest.json"
+        "https://yl.xyne.gg/updates/stable/latest.json"
       ],
       "windows": {
         "installMode": "passive"

@@ -121,7 +121,7 @@ frontend build, authentication API tests, and the Rust test suite.
 ## Account service
 
 The desktop login and registration flow uses the development API at
-`https://ayla.rindexx.cc/api/v1`. New accounts remain pending until an operator
+`https://yl.xyne.gg/api/v1`. New accounts remain pending until an operator
 activates them. The API source, container deployment, endpoint contract, and
 administrator commands are documented in
 [Ayla authentication API](docs/auth-api.md).
@@ -131,5 +131,5 @@ administrator commands are documented in
 Release packages are produced on the dedicated Forge Windows environment. See [Building Ayla on Forge](docs/forge-build.md) for the trusted build and artifact workflow.
 
 Signed application updates and the authentication API are served from
-`ayla.rindexx.cc`; see [Self-hosted Ayla services](docs/self-hosted-updater.md)
+`yl.xyne.gg`; see [Self-hosted Ayla services](docs/self-hosted-updater.md)
 for deployment, backup, and release publication details.

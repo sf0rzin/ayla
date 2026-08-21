@@ -19,7 +19,7 @@ param(
 
     [string]$IdentityFile = "$env:USERPROFILE\.ssh\ayla-vm-ed25519",
 
-    [string]$PublicBaseUrl = 'https://ayla.rindexx.cc/updates',
+    [string]$PublicBaseUrl = 'https://yl.xyne.gg/updates',
 
     [switch]$DryRun
 )
